@@ -97,7 +97,7 @@ class LLMConfig:
     and ``model`` are left empty by default — ``llm.chat`` fills in the
     provider's built-in defaults — but can be overridden per provider.
 
-    Env-var resolution (checked in order, first non-empty wins):
+    Env-var resolution (checked in order, first non-placeholder value wins for keys):
         api_key  -> OPENAI4S_<PROVIDER>_API_KEY then OPENAI4S_LLM_API_KEY
         base_url -> OPENAI4S_<PROVIDER>_BASE_URL then OPENAI4S_LLM_BASE_URL
         model    -> OPENAI4S_<PROVIDER>_MODEL then OPENAI4S_LLM_MODEL
@@ -130,7 +130,18 @@ class LLMConfig:
                 return field_val
             return os.environ.get(specific) or os.environ.get(generic, "")
 
-        self.api_key = _resolve(
+        def _resolve_api_key(field_val: str, specific: str, generic: str) -> str:
+            for raw in (
+                field_val,
+                os.environ.get(specific, ""),
+                os.environ.get(generic, ""),
+            ):
+                val = (raw or "").strip()
+                if not is_placeholder_api_key(val):
+                    return val
+            return ""
+
+        self.api_key = _resolve_api_key(
             self.api_key, f"OPENAI4S_{p}_API_KEY", "OPENAI4S_LLM_API_KEY"
         )
         self.base_url = _resolve(
@@ -138,21 +149,14 @@ class LLMConfig:
         )
         self.model = _resolve(self.model, f"OPENAI4S_{p}_MODEL", "OPENAI4S_LLM_MODEL")
 
-        # Drop obvious placeholder stubs (e.g. a .env copied verbatim from
-        # .env.example) so they aren't mistaken for a real key downstream
-        # (has_api_key, profile seeding, effective_api_key, ...). Must run
-        # BEFORE the native-env fallback so a stubbed .env doesn't shadow a
-        # real OPENAI_API_KEY / ANTHROPIC_API_KEY the user already exported.
-        if self.api_key and is_placeholder_api_key(self.api_key):
-            self.api_key = ""
-
         # Last-resort: fall back to each provider's conventional native env var
         # (so a user who already has OPENAI_API_KEY / ANTHROPIC_API_KEY set — e.g.
         # for the reference demo — gets a working agent with zero extra config).
         if not self.api_key:
             for native in _NATIVE_KEY_ENV.get(self.provider.strip().lower(), ()):
-                if os.environ.get(native):
-                    self.api_key = os.environ[native]
+                val = (os.environ.get(native) or "").strip()
+                if not is_placeholder_api_key(val):
+                    self.api_key = val
                     break
 
         # Fill provider built-in defaults so base_url/model are always concrete

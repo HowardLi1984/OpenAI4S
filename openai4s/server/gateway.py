@@ -1864,8 +1864,8 @@ class SessionRunner:
         so the UI banner matches what `_llm_cfg` actually sends.
         """
         try:
-            v = self.store.get_setting("llm_api_key")
-            if v and not is_placeholder_api_key(v):
+            v = _clean_api_key(self.store.get_setting("llm_api_key"))
+            if v:
                 return v
         except Exception:  # noqa: BLE001
             pass
@@ -1893,8 +1893,9 @@ class SessionRunner:
             s = {}
         model_ov = st.model if (st is not None and st.model) else s.get("llm_model")
         over: dict = {}
-        if s.get("llm_api_key"):
-            over["api_key"] = s["llm_api_key"]
+        api_key = _clean_api_key(s.get("llm_api_key"))
+        if api_key:
+            over["api_key"] = api_key
         if s.get("llm_base_url"):
             over["base_url"] = s["llm_base_url"]
         if model_ov:
@@ -1902,6 +1903,10 @@ class SessionRunner:
         prov = s.get("llm_provider")
         if prov and prov != base.provider:
             over["provider"] = prov
+            # Re-resolve the new provider's key too unless a real runtime key
+            # setting was supplied; otherwise dataclasses.replace would carry
+            # the previous provider's resolved key into the new provider.
+            over.setdefault("api_key", "")
             # force re-resolution of the NEW provider's defaults unless explicitly set
             over.setdefault("base_url", "")
             over.setdefault("model", "")
@@ -3587,6 +3592,12 @@ class GatewayError(Exception):
         self.message = message
 
 
+def _clean_api_key(value: str | None) -> str:
+    """Trim API keys and collapse obvious template stubs to empty."""
+    key = str(value or "").strip()
+    return "" if is_placeholder_api_key(key) else key
+
+
 def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
     store = get_store(cfg.db_path)
     skills = SkillLoader(cfg=cfg)
@@ -3875,7 +3886,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         if field in b and b[field] is not None:
                             store.set_setting(key, str(b[field]).strip())
                     if b.get("api_key"):  # only overwrite when a value is supplied
-                        store.set_setting("llm_api_key", str(b["api_key"]).strip())
+                        store.set_setting("llm_api_key", _clean_api_key(b["api_key"]))
                     if b.get("clear_api_key"):
                         store.set_setting("llm_api_key", "")
                     if b.get("model"):
@@ -3937,7 +3948,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     "provider": (b.get("provider") or "").strip(),
                     "base_url": (b.get("base_url") or "").strip(),
                     "model": (b.get("model") or "").strip(),
-                    "api_key": (b.get("api_key") or "").strip(),
+                    "api_key": _clean_api_key(b.get("api_key")),
                 }
                 store.mutate_model_profiles(lambda ps: ps.append(prof))
                 self._json(self._mask_profile(prof), 201)
@@ -3964,7 +3975,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     "llm_base_url", str(prof.get("base_url") or "").strip()
                 )
                 store.set_setting("llm_model", str(prof.get("model") or "").strip())
-                store.set_setting("llm_api_key", str(prof.get("api_key") or "").strip())
+                store.set_setting("llm_api_key", _clean_api_key(prof.get("api_key")))
                 store.set_setting("active_model_profile", prof["id"])
                 # Promote the newly-active profile to the top of the list so the
                 # configured APIs display it first (others shift down). In-place
@@ -4004,7 +4015,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         if f in b and b[f] is not None:
                             p[f] = str(b[f]).strip()
                     if b.get("api_key"):  # only overwrite when a non-empty key is sent
-                        p["api_key"] = str(b["api_key"]).strip()
+                        p["api_key"] = _clean_api_key(b["api_key"])
                     if b.get("clear_api_key"):
                         p["api_key"] = ""
                     return dict(p)  # snapshot for use after the lock is released
@@ -4018,7 +4029,9 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     store.set_setting("llm_provider", str(prof.get("provider") or ""))
                     store.set_setting("llm_base_url", str(prof.get("base_url") or ""))
                     store.set_setting("llm_model", str(prof.get("model") or ""))
-                    store.set_setting("llm_api_key", str(prof.get("api_key") or ""))
+                    store.set_setting(
+                        "llm_api_key", _clean_api_key(prof.get("api_key"))
+                    )
                     _default_model["id"] = _effective_model_id(
                         prof.get("provider"), prof.get("model")
                     )
@@ -5094,9 +5107,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 "provider": p.get("provider") or "",
                 "base_url": p.get("base_url") or "",
                 "model": p.get("model") or "",
-                # is_placeholder_api_key treats empty/whitespace as placeholder
-                # too, so this alone covers "no key" and "template stub".
-                "has_api_key": not is_placeholder_api_key(p.get("api_key")),
+                "has_api_key": bool(_clean_api_key(p.get("api_key"))),
             }
 
         def _model_profiles_payload(self) -> dict:
@@ -5115,7 +5126,9 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 ark_base = (
                     store.get_setting("llm_base_url") or PROVIDERS["ark"]["base_url"]
                 )
-                ark_key = store.get_setting("llm_api_key") or cfg.llm.api_key or ""
+                ark_key = _clean_api_key(
+                    store.get_setting("llm_api_key")
+                ) or _clean_api_key(cfg.llm.api_key)
                 have = {(p.get("provider"), p.get("model")) for p in ps}
                 for model, label in ARK_PLAN_MODELS:
                     if ("ark", model) in have:

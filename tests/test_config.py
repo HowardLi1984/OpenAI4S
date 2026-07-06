@@ -19,8 +19,27 @@ def test_post_init_drops_placeholder_from_env(monkeypatch):
     assert LLMConfig(provider="deepseek").api_key == ""
 
 
-def test_post_init_drops_placeholder_passed_explicitly():
+def test_post_init_drops_placeholder_passed_explicitly(monkeypatch):
+    monkeypatch.delenv("OPENAI4S_DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI4S_LLM_API_KEY", raising=False)
     assert LLMConfig(provider="deepseek", api_key="your_api_key_here").api_key == ""
+
+
+def test_placeholder_specific_env_falls_through_to_generic(monkeypatch):
+    monkeypatch.setenv("OPENAI4S_ARK_API_KEY", "your-api-key-here")
+    monkeypatch.setenv("OPENAI4S_LLM_API_KEY", "sk-real-generic")
+    monkeypatch.delenv("ARK_API_KEY", raising=False)
+    monkeypatch.delenv("DOUBAO_API_KEY", raising=False)
+    assert LLMConfig(provider="ark").api_key == "sk-real-generic"
+
+
+def test_placeholder_explicit_key_falls_through_to_env(monkeypatch):
+    monkeypatch.delenv("OPENAI4S_ARK_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI4S_LLM_API_KEY", "sk-real-generic")
+    assert (
+        LLMConfig(provider="ark", api_key="your-api-key-here").api_key
+        == "sk-real-generic"
+    )
 
 
 def test_placeholder_env_does_not_shadow_native_key(monkeypatch):
