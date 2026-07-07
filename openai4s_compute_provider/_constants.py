@@ -43,6 +43,37 @@ LINE_CAP = 256 * 1024
 CRED_KEY_RE = re.compile(
     r"(?i)(?:^|_)(?:TOKEN|SECRET|KEY|PASS(?:WORD|WD)?|PWD|PW|PAT|CREDENTIAL|AUTH|BEARER|COOKIE)(?:_|$)"
 )
+# Provider/cloud secret env-var prefixes scrubbed from the process environment
+# BEFORE any provider module is imported (see scrub_secret_env). This is the
+# provider-agnostic baseline; each provider additionally declares its own
+# `secret_env_prefixes`, which the resident prologue folds in. Names matching
+# CRED_KEY_RE (e.g. *_API_KEY, *_TOKEN) are scrubbed regardless of prefix, so
+# this list only needs the secret-bearing prefixes whose var NAMES are not
+# already credential-shaped (e.g. a bare `NGC_` / `INFER_` namespace).
+BASELINE_SECRET_PREFIXES = (
+    "NGC_",
+    "NVIDIA_",
+    "HF_",
+    "HUGGING",
+    "INFER_",
+    "AWS_",
+    "AZURE_",
+    "GCP_",
+    "GOOGLE_APPLICATION",
+    "OPENAI_",
+    "ANTHROPIC_",
+    "GEMINI_",
+    "COHERE_",
+    "REPLICATE_",
+    "MODAL_",
+    "WANDB_",
+    "OPENAI4S_LLM_",
+    "OPENAI4S_ARK_",
+    "OPENAI4S_CLAUDE_",
+    "OPENAI4S_CHATGPT_",
+    "OPENAI4S_GEMINI_",
+    "OPENAI4S_DEEPSEEK_",
+)
 BASE_ERROR_KINDS = frozenset(
     {
         "not_found",

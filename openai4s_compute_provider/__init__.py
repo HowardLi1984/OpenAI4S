@@ -3,9 +3,17 @@ lifecycle every confined provider process runs.
 
 A provider is a ``provider.py`` that exports ``PROVIDER = <ByocProvider impl>``;
 the ``__main__`` entrypoint loads it and runs either the per-op oneshot helper
-(``run_oneshot``) or the long-lived repl kernel (``run_repl``). Both share one
-prologue that scrubs the environment of secrets BEFORE any provider import and
-BEFORE the credential is read, so a leak is impossible by construction.
+(``run_oneshot``) or the long-lived repl kernel (``run_repl``).
+
+Secret scrubbing is two-staged so provider code cannot read credential-shaped
+or known-prefix environment variables (a name-based heuristic — a secret in an
+unrecognized variable name is NOT scrubbed). ``__main__`` calls
+``scrub_secret_env()`` (the provider-agnostic
+baseline) BEFORE it imports provider.py, so the provider's top-level code runs
+with credential-shaped and known-provider-secret env vars already removed. The
+resident prologue then re-scrubs with the loaded provider's own declared
+``secret_env_prefixes`` before the credential is read (from stdin for oneshot,
+fd-3 for repl) — and the credential itself is never placed in the environment.
 
 This package is intentionally split by concern; import from the top level:
 
@@ -25,6 +33,7 @@ from __future__ import annotations
 from ._channel import ScrubWriter, read_auth, write_event, write_ready
 from ._constants import (
     BASE_ERROR_KINDS,
+    BASELINE_SECRET_PREFIXES,
     COMPRESSED_CAP_DEFAULT,
     EXIT_PROTOCOL,
     IDLE_TIMEOUT_S,
@@ -33,7 +42,7 @@ from ._constants import (
     WORK,
 )
 from ._protocol import ByocError, ByocProvider, ExecResult
-from ._resident import ByocResident
+from ._resident import ByocResident, scrub_secret_env
 
 __all__ = [
     "ByocError",
@@ -41,10 +50,12 @@ __all__ = [
     "ByocResident",
     "ExecResult",
     "ScrubWriter",
+    "scrub_secret_env",
     "read_auth",
     "write_event",
     "write_ready",
     "BASE_ERROR_KINDS",
+    "BASELINE_SECRET_PREFIXES",
     "COMPRESSED_CAP_DEFAULT",
     "EXIT_PROTOCOL",
     "IDLE_TIMEOUT_S",
