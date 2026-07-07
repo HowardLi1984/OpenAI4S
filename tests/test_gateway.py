@@ -795,6 +795,199 @@ def test_token_gate_401_and_cookie_redirect(monkeypatch, tmp_path, capsys):
     assert "HttpOnly" in resp["headers"]["Set-Cookie"]
 
 
+def test_gateway_error_maps_to_error_envelope(tmp_path):
+    """A GatewayError(code, message) raised anywhere under /api/* is serialized
+    by _route as {"error": message} with its HTTP code (docs/webapp-api.md §2).
+    Contract test before any extraction of gateway routing."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.headers = {}
+    replies = []
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+
+    def boom(method, sub):
+        raise gateway_mod.GatewayError(418, "teapot")
+
+    handler._api = boom
+    handler.path = "/api/anything"
+    handler._route("GET")
+
+    assert replies[-1] == (418, {"error": "teapot"})
+
+
+def test_unhandled_exception_maps_to_500_error_envelope(tmp_path, capsys):
+    """A non-GatewayError exception under /api/* becomes a 500 with the
+    same {"error": str(e)} envelope (and never a raw traceback body)."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.headers = {}
+    replies = []
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+
+    def boom(method, sub):
+        raise RuntimeError("kaput")
+
+    handler._api = boom
+    handler.path = "/api/anything"
+    handler._route("GET")
+
+    assert replies[-1] == (500, {"error": "kaput"})
+    capsys.readouterr()  # swallow the printed traceback
+
+
+def test_cross_origin_api_write_is_refused(tmp_path):
+    """CSRF guard: a mutating /api request whose Origin host differs from the
+    Host header is rejected 403 with the {"error": ...} envelope BEFORE any
+    route logic runs."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.headers = {
+        "Origin": "http://evil.example",
+        "Host": "127.0.0.1:8760",
+    }
+    replies = []
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._api = lambda method, sub: replies.append(("api-was-called", None))
+    handler.path = "/api/frames"
+    handler._route("POST")
+
+    assert replies == [(403, {"error": "cross-origin request refused"})]
+
+
+def test_execution_log_route_serializer_contract(tmp_path):
+    """GET /api/frames/{fid}/execution-log — the Notebook data contract: each
+    entry carries exactly source/stdout/stderr/error/status/figures/
+    files_written/files_read/cpu_seconds/peak_rss_kb (+ cell_index/kernel_id/
+    language), with code→source and cpu_s→cpu_seconds renames and ""/[] (never
+    null) defaults."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    store = get_store(cfg.db_path)
+    fid = store.new_frame(kind="turn", project_id="default", status="ready")
+
+    store.log_cell(
+        frame_id=fid,
+        root_frame_id=fid,
+        code="print('hi')",
+        result={
+            "id": "cell-1",
+            "stdout": "hi\n",
+            "stderr": "",
+            "error": None,
+            "interrupted": False,
+            "usage": {"wall_s": 0.5, "cpu_s": 0.25, "peak_rss_kb": 2048},
+        },
+        cell_index=1,
+        kernel_id="python",
+        language="python",
+        figures=["fig1.png"],
+        files_read=["in.csv"],
+        files_written=["out.csv"],
+    )
+    store.log_cell(
+        frame_id=fid,
+        root_frame_id=fid,
+        code="1/0",
+        result={
+            "id": "cell-2",
+            "stdout": "",
+            "stderr": "",
+            "error": "ZeroDivisionError",
+        },
+        cell_index=2,
+    )
+
+    replies = []
+    handler._query = lambda: {}
+    handler._body = lambda: {}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._api("GET", f"/frames/{fid}/execution-log")
+
+    code, body = replies[-1]
+    assert code == 200
+    assert body["kernels"] == ["python"]  # deduped, first-seen order
+    assert len(body["entries"]) == 2
+    e1, e2 = body["entries"]
+    assert set(e1) == {
+        "cell_index",
+        "kernel_id",
+        "language",
+        "source",
+        "stdout",
+        "stderr",
+        "error",
+        "status",
+        "figures",
+        "files_written",
+        "files_read",
+        "cpu_seconds",
+        "peak_rss_kb",
+    }
+    assert e1["source"] == "print('hi')"  # code -> source rename
+    assert e1["status"] == "ok"
+    assert e1["cpu_seconds"] == 0.25  # cpu_s -> cpu_seconds rename
+    assert e1["peak_rss_kb"] == 2048
+    assert e1["figures"] == ["fig1.png"]
+    assert e1["files_read"] == ["in.csv"]
+    assert e1["files_written"] == ["out.csv"]
+    assert e1["error"] == ""  # null-free default
+    assert e2["status"] == "error"
+    assert e2["error"] == "ZeroDivisionError"
+    assert e2["figures"] == [] and e2["files_written"] == []
+
+
+def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
+    """The artifact lineage payload (UI provenance view): a produced artifact
+    reports its producing cell interaction + save event, and
+    dependency_mappings.inputs = files_read minus files_written minus itself.
+    An unknown artifact returns the same shape, empty."""
+    cfg, runner, store, fid, st = _runner_frame(tmp_path)
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+
+    store.log_cell(
+        frame_id=fid,
+        root_frame_id=fid,
+        code="plot(df)",
+        result={"id": "cell-7", "stdout": "", "stderr": "", "error": None},
+        cell_index=3,
+        files_read=["raw.csv", "fig.txt"],
+        files_written=["fig.txt"],
+    )
+    f = st.workspace / "fig.txt"
+    f.write_text("bytes")
+    rec = runner._register_file(st, f, "cell-7", lambda e: None)
+
+    lin = handler._lineage(rec["artifact_id"])
+    assert lin["artifact_id"] == rec["artifact_id"]
+    assert lin["filename"] == "fig.txt"
+    kinds = [i["kind"] for i in lin["interactions"]]
+    assert kinds == ["cell", "save"]
+    cell = lin["interactions"][0]
+    assert cell["cell_index"] == 3
+    assert cell["source"] == "plot(df)"
+    assert cell["exit_status"] == "ok"
+    assert cell["files_written"] == ["fig.txt"]
+    # inputs exclude what the cell itself wrote and the artifact's own filename
+    assert lin["dependency_mappings"] == {"inputs": ["raw.csv"]}
+
+    empty = handler._lineage("a-does-not-exist")
+    assert empty == {
+        "artifact_id": "a-does-not-exist",
+        "filename": None,
+        "interactions": [],
+        "dependency_mappings": {"inputs": []},
+    }
+
+
 def test_upload_base64_decode_and_raw_fallback(tmp_path):
     """POST /api/uploads decode reality (docs/webapp-api.md §2): valid base64
     decodes; non-alphabet chars are silently DISCARDED (not an error); only a
