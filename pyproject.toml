@@ -36,4 +36,30 @@ include = ["openai4s*", "openai4s_compute_provider*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# Default run = the offline gate: quiet, strict markers, and every marker that
+# needs live external resources deselected. Opt in explicitly, e.g.:
+#   uv run pytest -m gpu
+# (a command-line -m overrides the one below).
+addopts = '-q --strict-markers -m "not external and not network and not live_llm and not gpu and not ssh and not lab and not docker and not browser"'
+markers = [
+    # Suite-structure markers (informational; all run by default).
+    "unit: fast, isolated unit test",
+    "integration: multi-component test, still offline",
+    "e2e: end-to-end flow through the agent loop, still offline",
+    "security: security/secret-handling regression test",
+    "platforms: compute/endpoint/lab platform test (offline fakes)",
+    "skills: skill catalog/loader test",
+    "slow: slow but still offline test",
+    "golden: golden-trace comparison test",
+    "smoke: minimal smoke test",
+    # Opt-in markers (EXCLUDED from the default run and from default PR CI;
+    # these may require secrets, hardware, or live services).
+    "external: requires any live external resource (umbrella marker)",
+    "network: requires real network access",
+    "live_llm: requires a real LLM provider and API key",
+    "gpu: requires a physical GPU",
+    "ssh: requires a reachable SSH host",
+    "lab: requires lab hardware",
+    "docker: requires a Docker daemon",
+    "browser: requires a real browser session",
+]

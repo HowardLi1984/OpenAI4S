@@ -50,9 +50,12 @@ uv run pre-commit run --all-files   # black · isort --profile black · ruff
 The default test suite is **offline by design**: `tests/conftest.py` redirects
 `~/.openai4s` to a tmp dir and configures a fake LLM provider. Do not add tests
 that require live LLM calls, network access, GPUs, SSH hosts, Docker, lab
-hardware, or real API keys to the default suite. Such tests belong behind
-explicit opt-in markers or manual workflows (see the refactor roadmap in
-[`docs/refactor-plan.md`](docs/refactor-plan.md)).
+hardware, or real API keys to the default suite. Such tests must carry one of
+the opt-in pytest markers registered in `pyproject.toml` (`external`,
+`network`, `live_llm`, `gpu`, `ssh`, `lab`, `docker`, `browser`) — the default
+`uv run pytest` run and PR CI deselect them automatically, and
+`--strict-markers` rejects unregistered markers. Opt in explicitly with e.g.
+`uv run pytest -m gpu`.
 
 ## PR checklist
 
@@ -115,7 +118,8 @@ GitHub settings by an admin:
 
 - Branch protection on `main`: require PR review, require status checks,
   forbid force pushes and deletions.
-- Mark the CI workflow (once added) as a required status check.
+- Mark the CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
+  as a required status check.
 - Replace the placeholder usernames in `.github/CODEOWNERS` with real GitHub
   usernames and enable "Require review from Code Owners".
 - Ensure repository/organization secrets are **not** exposed to workflows

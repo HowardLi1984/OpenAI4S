@@ -83,6 +83,8 @@ def _searched(db_path) -> list[str]:
     return [r[0] for r in rows]
 
 
+@pytest.mark.external
+@pytest.mark.live_llm
 @pytest.mark.skipif(
     not _LIVE, reason="set OPENAI4S_LIVE_LLM=1 to run the live agent loop"
 )
