@@ -128,7 +128,7 @@ GitHub settings by an admin:
   forbid force pushes and deletions.
 - Mark the CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
   as a required status check.
-- Replace the placeholder usernames in `.github/CODEOWNERS` with real GitHub
-  usernames and enable "Require review from Code Owners".
+- Keep `.github/CODEOWNERS` usernames current (owners need write access) and
+  enable "Require review from Code Owners".
 - Ensure repository/organization secrets are **not** exposed to workflows
   triggered by external PRs.

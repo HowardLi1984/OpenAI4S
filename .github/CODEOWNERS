@@ -1,48 +1,50 @@
 # CODEOWNERS for OpenAI4S (github.com/PKU-YuanGroup/OpenAI4S)
 #
-# MAINTAINERS: the @openai4s-* handles below are PLACEHOLDERS, not real GitHub
-# accounts. Replace each one with the real personal GitHub username(s) of the
-# responsible maintainer(s) before enabling "Require review from Code Owners"
-# in branch protection. Do not use org teams here until an org team with the
-# right permissions actually exists.
+# Owners listed here must have write access to the repository, and
+# "Require review from Code Owners" must be enabled in branch protection
+# for these rules to be enforced.
+#
+# Roles: lead + security = @Nobody-Zhang · runtime + platform = @riiiiiiin
+#        web = @difficulttopickaname · science = @Lyu6PosHao @wangyu-sd
 #
 # Later rules override earlier ones; the LAST matching rule wins.
 
 # ---- Default owner for everything not matched below -------------------------
-*                                   @openai4s-lead
+*                                   @Nobody-Zhang
 
 # ---- Runtime core: agent loop, kernel protocol, host API, store -------------
-/openai4s/agent/                    @openai4s-lead @openai4s-runtime-owner
-/openai4s/kernel/                   @openai4s-lead @openai4s-runtime-owner
-/openai4s/sdk/                      @openai4s-lead @openai4s-runtime-owner
-/openai4s/host_dispatch.py          @openai4s-lead @openai4s-runtime-owner @openai4s-security-owner
-/openai4s/store.py                  @openai4s-lead @openai4s-runtime-owner @openai4s-security-owner
-/openai4s/llm.py                    @openai4s-lead @openai4s-runtime-owner
+/openai4s/agent/                    @Nobody-Zhang @riiiiiiin
+/openai4s/kernel/                   @Nobody-Zhang @riiiiiiin
+/openai4s/sdk/                      @Nobody-Zhang @riiiiiiin
+/openai4s/host_dispatch.py          @Nobody-Zhang @riiiiiiin
+/openai4s/store.py                  @Nobody-Zhang @riiiiiiin
+/openai4s/llm.py                    @Nobody-Zhang @riiiiiiin
 
 # ---- Security-sensitive paths: require the security owner -------------------
-/openai4s/security/                 @openai4s-lead @openai4s-security-owner
-/openai4s/permissions.py            @openai4s-lead @openai4s-security-owner
-/openai4s/egress.py                 @openai4s-lead @openai4s-security-owner
-/openai4s_compute_provider/         @openai4s-lead @openai4s-security-owner
-/docs/security.md                   @openai4s-lead @openai4s-security-owner
+/openai4s/security/                 @Nobody-Zhang
+/openai4s/permissions.py            @Nobody-Zhang
+/openai4s/egress.py                 @Nobody-Zhang
+/openai4s_compute_provider/         @Nobody-Zhang
+/openai4s_worker_runtime/           @Nobody-Zhang
+/docs/security.md                   @Nobody-Zhang
 
 # ---- Web app: gateway, REST/WebSocket API, frontend --------------------------
-/openai4s/server/                   @openai4s-lead @openai4s-web-owner
+/openai4s/server/                   @Nobody-Zhang @difficulttopickaname
 
 # ---- Compute / platforms -----------------------------------------------------
-/openai4s/compute/                  @openai4s-lead @openai4s-platform-owner
+/openai4s/compute/                  @Nobody-Zhang @riiiiiiin
 
 # ---- Science skills and kernel environments ----------------------------------
-/skills/                            @openai4s-lead @openai4s-science-owner
-/envs/                              @openai4s-lead @openai4s-science-owner
-/openai4s/skills_loader/            @openai4s-lead @openai4s-science-owner
+/skills/                            @Nobody-Zhang @Lyu6PosHao @wangyu-sd
+/envs/                              @Nobody-Zhang @Lyu6PosHao @wangyu-sd
+/openai4s/skills_loader/            @Nobody-Zhang @Lyu6PosHao @wangyu-sd
 
 # ---- Tests -------------------------------------------------------------------
-/tests/                             @openai4s-lead @openai4s-runtime-owner
+/tests/                             @Nobody-Zhang @riiiiiiin
 
 # ---- Governance and CI: changes to the rules need the lead -------------------
-/.github/                           @openai4s-lead
-/CONTRIBUTING.md                    @openai4s-lead
-/CLAUDE.md                          @openai4s-lead
-/AGENTS.md                          @openai4s-lead
-/pyproject.toml                     @openai4s-lead
+/.github/                           @Nobody-Zhang
+/CONTRIBUTING.md                    @Nobody-Zhang
+/CLAUDE.md                          @Nobody-Zhang
+/AGENTS.md                          @Nobody-Zhang
+/pyproject.toml                     @Nobody-Zhang
