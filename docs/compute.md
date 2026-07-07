@@ -2,6 +2,16 @@
 
 Model-weight-bound work runs its heavy step on a remote GPU, not the local kernel. There are two paths.
 
+> **Where this fits.** `host.compute` is the **ComputeProvider** surface (jobs:
+> stage → run → harvest). It is one of several platform-integration kinds —
+> ComputeProvider, ModelEndpointProvider, LabProvider, Worker Runtime, and
+> Transport — whose boundaries and implementation status are defined in
+> [`docs/package-architecture.md`](package-architecture.md). Only the compute
+> providers below (`byoc:*`, `ssh:*`) are implemented today (model endpoints
+> are partial: the registry exists, the scoped inference kernel is not yet
+> wired); SLURM/Kubernetes/Modal/lab providers are **future** and must not be
+> assumed available.
+
 ## 1 · `host.compute` — general BYOC / SSH job dispatcher
 
 A job is dispatched non-blocking (`create → submit_job → wait → result`): the daemon stages inputs, runs the job in a confined sandbox, and harvests `out.tar.gz` back into the workspace under `hpc/<job_id>/`. Two provider families are built in:
@@ -24,6 +34,8 @@ result = job.result()   # non-blocking once the compute_done notification arrive
 ```
 
 The daemon forwards **only** the keys a provider declares in its `provider.json` `secret_env` into the confined job sandbox (over the helper's stdin) — never your whole environment.
+
+The confined helper that stages, runs, and harvests each job is the **worker runtime** package [`openai4s_compute_provider`](../openai4s_compute_provider) — shared by every `byoc:*` provider. Despite its name it is a worker runtime, not a provider registry; it is kept under that legacy name for import compatibility (see [`docs/package-architecture.md`](package-architecture.md)). Its import-time secret-scrubbing guarantees are documented in [`docs/security.md`](security.md).
 
 ## 2 · `host.fold` / `host.score_mutations` — purpose-built science services over SSH
 
