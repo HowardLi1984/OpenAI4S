@@ -9,6 +9,7 @@ Also keeps regression coverage for the arXiv /abs/ bug where
 """
 import json
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 
@@ -213,7 +214,7 @@ def test_search_routes_doi_to_crossref(monkeypatch):
 
     def handler(url):
         seen["url"] = url
-        if "api.crossref.org" in url:
+        if urlparse(url).hostname == "api.crossref.org":
             return payload
         return "<div class='result'></div>"  # engines would return nothing useful
 
@@ -223,7 +224,7 @@ def test_search_routes_doi_to_crossref(monkeypatch):
     assert out["results"][0]["title"] == "A Great Paper"
     assert "Ada Lovelace" in out["results"][0]["snippet"]
     assert "Nature" in out["results"][0]["snippet"]
-    assert "api.crossref.org" in seen["url"]
+    assert urlparse(seen["url"]).hostname == "api.crossref.org"
 
 
 def test_search_routes_arxiv_id(monkeypatch):
@@ -236,7 +237,7 @@ def test_search_routes_arxiv_id(monkeypatch):
     """
 
     def handler(url):
-        if "export.arxiv.org" in url:
+        if urlparse(url).hostname == "export.arxiv.org":
             return atom
         return None
 
