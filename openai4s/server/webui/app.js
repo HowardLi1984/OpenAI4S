@@ -68,6 +68,10 @@ const iconEl = (name, size, cls) => { const s = el("span", "ic"); s.innerHTML = 
 function paintIcons(root) { (root || document).querySelectorAll("[data-icon]").forEach(e => { if (e._painted) return; e.innerHTML = icon(e.dataset.icon, +e.dataset.iconSize || 16); e._painted = true; }); }
 function setTitle(name) { const ct = $("#conv-title"); if (!ct) return; ct.value = name || t("conv.title.default"); ct.size = Math.max(6, Math.min(40, (name || t("conv.title.default")).length + 1)); }
 const api = async (p, o = {}) => {
+  // `p` must be an internal, same-origin API path: a single leading slash and no
+  // scheme/host. Rejecting "//host" (protocol-relative) and non-string input keeps
+  // an untrusted id interpolated into `p` from redirecting the request off-origin.
+  if (typeof p !== "string" || p[0] !== "/" || p[1] === "/") throw new Error("invalid api path");
   const r = await fetch("/api" + p, { headers: { "content-type": "application/json" }, ...o });
   const t = await r.text(); let j = null; try { j = t ? JSON.parse(t) : null; } catch { j = t; }
   if (!r.ok) throw new Error((j && j.detail) || ("HTTP " + r.status)); return j;
@@ -1736,8 +1740,13 @@ function stepBody(step) {
     if (inp.query) box.appendChild(el("div", "s-q", "“" + inp.query + "”"));
     (out.results || []).forEach(r => {
       const row = el("div", "s-res");
-      const a = el(r.url ? "a" : "div", "s-res-t"); a.textContent = r.title || r.url || t("step.search.emptyResult");
-      if (r.url) { a.href = r.url; a.target = "_blank"; a.rel = "noopener"; }
+      const u = typeof r.url === "string" ? r.url.trim() : "";
+      // Only turn a result into a link when its scheme is safe to navigate to;
+      // a javascript:/data: URL in an href would run on click (XSS). The scheme
+      // test is inlined at the assignment so it acts as the guard on `u`.
+      const a = el(/^https?:\/\//i.test(u) ? "a" : "div", "s-res-t");
+      a.textContent = r.title || r.url || t("step.search.emptyResult");
+      if (/^https?:\/\//i.test(u)) { a.href = u; a.target = "_blank"; a.rel = "noopener noreferrer"; }
       row.appendChild(a);
       if (r.url) row.appendChild(el("div", "s-res-u", r.url));
       if (r.snippet) row.appendChild(el("div", "s-res-s", r.snippet));
@@ -1808,11 +1817,17 @@ function stepBody(step) {
     const arts = out.artifacts || (out.filename ? [{ filename: out.filename, version_id: out.version_id }] : []);
     const files = (inp.files && inp.files.length ? inp.files : arts.map(a => a.filename)).filter(Boolean);
     const env = inp.environment || "python";
-    const kvRow = (label, valNode) => {
+    // Value rendered as text only — el() assigns textContent, never HTML, so an
+    // untrusted string (e.g. the environment label) can't inject markup. The
+    // pre-built files list uses the node variant instead.
+    const kvRow = (label, text) => {
       const r = el("div", "s-kv"); r.appendChild(el("span", "s-k", label));
-      const v = el("div", "s-v");
-      if (typeof valNode === "string") v.textContent = valNode; else v.appendChild(valNode);
-      r.appendChild(v); return r;
+      r.appendChild(el("div", "s-v", text == null ? "" : String(text)));
+      return r;
+    };
+    const kvNodeRow = (label, node) => {
+      const r = el("div", "s-kv"); r.appendChild(el("span", "s-k", label));
+      const v = el("div", "s-v"); v.appendChild(node); r.appendChild(v); return r;
     };
     // files rendered as a clickable JSON-style array (each opens the artifact)
     const fl = el("div", "s-files"); fl.appendChild(el("span", "s-brk", "["));
@@ -1826,7 +1841,7 @@ function stepBody(step) {
       fl.appendChild(line);
     });
     fl.appendChild(el("span", "s-brk", "]"));
-    box.appendChild(kvRow("files", fl));
+    box.appendChild(kvNodeRow("files", fl));
     box.appendChild(kvRow("environment", env));
     if (arts.length && (arts[0].artifact_id || arts[0].checksum)) {
       const wrap = el("div", "s-out");
@@ -1938,7 +1953,7 @@ function permActionLine(m) {
   return { mono: true, text: m.target || "" };
 }
 function renderPermissionCard(m) {
-  S.permCards = S.permCards || {};
+  S.permCards = S.permCards || Object.create(null);  // null-proto: keys like __proto__ can't pollute
   const prev = S.permCards[m.decision_id];
   if (prev && prev.card && prev.card.isConnected) return;  // idempotent (reconnect re-emit)
   let host; try { host = ensure().wrap; } catch (e) { host = null; }
@@ -1987,7 +2002,7 @@ function renderPermissionCard(m) {
     const body = { decision_id: m.decision_id, allow: ok, scope };
     if (scope !== "once") body.pattern = patIn.value.trim() || "*";
     if (!ok && fb.value.trim()) body.message = fb.value.trim();
-    try { await api(`/frames/${m.frame_id}/decision`, { method: "POST", body: JSON.stringify(body) }); }
+    try { await api(`/frames/${encodeURIComponent(m.frame_id)}/decision`, { method: "POST", body: JSON.stringify(body) }); }
     catch (e) { allow.disabled = deny.disabled = false; hint(t("toast.submitFailed", e.message), true); return; }
     markPermCard(m.decision_id, ok, scope);
   };
@@ -2001,7 +2016,9 @@ function renderPermissionCard(m) {
   down();
 }
 function markPermCard(id, allowed, scope) {
-  const h = (S.permCards || {})[id]; if (!h) return; h.resolved = true;
+  const reg = S.permCards || {};
+  if (!Object.prototype.hasOwnProperty.call(reg, id)) return;  // ignore __proto__/constructor keys
+  const h = reg[id]; h.resolved = true;
   if (h.allow) h.allow.disabled = true; if (h.deny) h.deny.disabled = true;
   h.card.classList.add("resolved", allowed ? "allowed" : "denied");
   let st = h.card.querySelector(".perm-status");
@@ -2009,7 +2026,9 @@ function markPermCard(id, allowed, scope) {
   st.textContent = allowed ? ((scope && scope !== "once") ? t("perm.status.allowedScope", permScopeCn(scope)) : t("perm.status.allowed")) : t("perm.status.denied");
 }
 function resolvePermissionCard(m) {
-  const h = (S.permCards || {})[m.decision_id]; if (!h) return;
+  const reg = S.permCards || {};
+  if (!Object.prototype.hasOwnProperty.call(reg, m.decision_id)) return;  // ignore __proto__/constructor keys
+  const h = reg[m.decision_id];
   if (!h.resolved) markPermCard(m.decision_id, !!m.allow, m.scope || null);
 }
 
@@ -2236,7 +2255,7 @@ async function openConversation(fid, pid) {
   S._tbl = {}; invalidateKernelCache();  // drop the prior session's table + kernel-state caches
   S.openTabs = []; S.activeTab = "notebook"; S.provMode = false; S.lineage = null; S._lineageFor = null;
   S.stepEls = {};  // fresh step registry so reopen-then-replay dedupes by step_id
-  S.permCards = {};  // fresh permission-card registry (drop cards from the prior conversation)
+  S.permCards = Object.create(null);  // fresh permission-card registry (null-proto; drop cards from the prior conversation)
   S.planReady = null; S.planStatus = null; S.planPending = false;  // fresh plan state per session
   S.annotations = []; closeAnnotDraft(); closeAnnotPop(); updateAnnotBadge();
   edacTeardown(); S._editing = null;  // stop any live editor autocomplete + clear edit state when switching sessions
@@ -4272,16 +4291,34 @@ function renderMd(src) {
   var fenceRe = /^(\s*)(`{3,}|~{3,})[ \t]*([\w+#.\-]*)[ \t]*$/;
   var listRe = /^(\s*)([-*+]|\d+[.)])[ \t]+/;
   var hrRe = /^\s*([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
-  var delimRe = /^\s*\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-*:?[ \t]*)*\|?\s*$/;
-  var looksTable = function (idx) { return lines[idx].indexOf("|") !== -1 && idx + 1 < n && delimRe.test(lines[idx + 1]) && lines[idx + 1].indexOf("-") !== -1; };
+  // Table delimiter row, matched cell-by-cell so there is no nested-quantifier
+  // regex to catastrophically backtrack (ReDoS-safe). A cell is `:?-+:?` padded.
+  var cellDelimRe = /^[ \t]*:?-+:?[ \t]*$/;
+  var isDelimRow = function (s) {
+    var tr = s.trim();
+    if (tr.indexOf("-") === -1) return false;
+    if (tr.charAt(0) === "|") tr = tr.slice(1);
+    if (tr.charAt(tr.length - 1) === "|") tr = tr.slice(0, -1);
+    var parts = tr.split("|");
+    for (var j = 0; j < parts.length; j++) if (!cellDelimRe.test(parts[j])) return false;
+    return true;
+  };
+  var looksTable = function (idx) { return lines[idx].indexOf("|") !== -1 && idx + 1 < n && isDelimRow(lines[idx + 1]); };
   while (i < n) {
     var line = lines[i];
     var fm = line.match(fenceRe);
     if (fm) {
       var fchar = fm[2][0], flen = fm[2].length, lang = fm[3] || "";
       var code = []; i++;
-      var closeRe = new RegExp("^\\s*" + (fchar === "`" ? "`" : "~") + "{" + flen + ",}[ \\t]*$");
-      while (i < n && !closeRe.test(lines[i])) { code.push(lines[i]); i++; }
+      // Closing fence detected without a dynamically-built RegExp (regex-injection
+      // safe): a line that trims to >= flen of the same fence char and nothing else.
+      var isClose = function (s) {
+        var tr = s.trim();
+        if (tr.length < flen) return false;
+        for (var j = 0; j < tr.length; j++) if (tr.charAt(j) !== fchar) return false;
+        return true;
+      };
+      while (i < n && !isClose(lines[i])) { code.push(lines[i]); i++; }
       if (i < n) i++; // consume the closing fence when it exists (unclosed = stream still open)
       html += mdCodeBlock(code.join("\n"), lang);
       continue;
