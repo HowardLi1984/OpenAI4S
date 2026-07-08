@@ -143,6 +143,8 @@ git clone https://github.com/PKU-YuanGroup/OpenAI4S && cd OpenAI4S
 
 OpenAI4S is a community effort to keep the **Code-as-Action** paradigm open.
 
+Before opening a PR, please read [`CONTRIBUTING.md`](CONTRIBUTING.md) — it defines branch naming, the PR checklist ([`.github/pull_request_template.md`](.github/pull_request_template.md)), code ownership ([`.github/CODEOWNERS`](.github/CODEOWNERS)), review & release policy, and the offline-test policy.
+
 ### Development setup
 
 Requires **Python ≥ 3.10** and [**uv**](https://docs.astral.sh/uv/).
@@ -208,7 +210,7 @@ Released under the **MIT License** — see [`LICENSE`](LICENSE).
 ## 🤝 Community contributors
 
 <a href="https://github.com/PKU-YuanGroup/OpenAI4S/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=PKU-YuanGroup/OpenAI4S" alt="OpenAI4S contributors" />
+  <img src="https://contrib.rocks/image?repo=PKU-YuanGroup/OpenAI4S&v=20260707" alt="OpenAI4S contributors" />
 </a>
 
 ---

@@ -1,4 +1,7 @@
+import base64
+import re
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -499,3 +502,523 @@ def test_model_profile_activate_moves_to_front_and_sanitizes_key(tmp_path):
     assert [p["id"] for p in store.list_model_profiles()] == ["mp-b", "mp-a"]
     assert store.get_setting("active_model_profile") == "mp-b"
     assert store.get_setting("llm_api_key") == ""
+
+
+# --- API contract assertions (documented in docs/webapp-api.md) ------------
+def test_api_unknown_route_returns_error_envelope(tmp_path):
+    """The catch-all error envelope is {"error": ...} — NOT {"detail": ...}.
+    (The frontend api() helper reads j.detail; docs/webapp-api.md records the
+    mismatch. This locks the backend side of the contract.)"""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    replies = []
+    handler._query = lambda: {}
+    handler._body = lambda: {}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+
+    handler._api("GET", "/definitely-not-a-route")
+
+    code, body = replies[-1]
+    assert code == 404
+    assert body["error"] == "not found"
+    assert body["path"] == "/definitely-not-a-route"
+    assert body["method"] == "GET"
+    assert "detail" not in body
+
+
+def test_projects_route_has_no_pagination_semantics(tmp_path):
+    """GET /api/projects ignores ?limit&offset (the frontend sends them):
+    every project is always returned and `total` is just the list length."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    store = get_store(cfg.db_path)
+    for i in range(3):
+        store.create_project(name=f"p{i}", description="", context="")
+    replies = []
+    # limit=1&offset=1 as parse_qs would deliver them — must have no effect
+    handler._query = lambda: {"limit": ["1"], "offset": ["1"]}
+    handler._body = lambda: {}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+
+    handler._api("GET", "/projects")
+
+    code, body = replies[-1]
+    assert code == 200
+    names = {p["name"] for p in body["projects"]}
+    assert {"p0", "p1", "p2"} <= names
+    assert body["total"] == len(body["projects"])
+
+
+def test_serializers_expose_dual_id_keys(tmp_path):
+    """Frontend-compat contract: artifact/project serializers duplicate the
+    typed id under a plain `id` key, and _artifact_json.version_id is the
+    LATEST version id (the UI cache-bust key)."""
+    cfg, runner, store, fid, st = _runner_frame(tmp_path)
+    f = st.workspace / "plot.txt"
+    f.write_text("v1")
+    rec = runner._register_file(st, f, "cell-1", lambda e: None)
+
+    aj = gateway_mod._artifact_json(store.get_artifact(rec["artifact_id"]))
+    assert aj["id"] == aj["artifact_id"] == rec["artifact_id"]
+    assert aj["version_id"] == rec["version_id"]
+    assert aj["root_frame_id"] == fid
+    assert aj["is_user_upload"] is False
+
+    p = store.create_project(name="proj", description="", context="")
+    pj = gateway_mod._project_json(store.get_project(p["project_id"]) or p)
+    assert pj["id"] == pj["project_id"] == p["project_id"]
+
+    fj = gateway_mod._frame_json(store.get_frame(fid), store)
+    assert fj["id"] == fid
+    assert fj["root_frame_id"] == fid
+    assert fj["conversation_type"] == "agent"
+
+
+def test_auto_capture_artifact_created_event_shape(tmp_path):
+    """The auto-capture emit site sends the RICH artifact_created form —
+    a nested `artifact` object with duplicated id/artifact_id and a
+    version_id. Other emit sites send partial/flat/bare forms, so consumers
+    must treat every field as optional (docs/webapp-api.md §3)."""
+    cfg, runner, store, fid, st = _runner_frame(tmp_path)
+    events = []
+    f = st.workspace / "fig.txt"
+    f.write_text("bytes")
+    rec = runner._register_file(st, f, "cell-9", events.append)
+
+    created = [e for e in events if e.get("type") == "artifact_created"]
+    assert created, "auto-capture did not emit artifact_created"
+    art = created[-1]["artifact"]
+    assert art["id"] == art["artifact_id"] == rec["artifact_id"]
+    assert art["version_id"] == rec["version_id"]
+    assert art["filename"] == "fig.txt"
+    assert art["root_frame_id"] == fid
+
+
+def test_edit_rename_upload_artifact_created_shapes(tmp_path):
+    """The PARTIAL artifact_created forms (docs/webapp-api.md §3, shape 2):
+    edit → {id,filename,version_id,root_frame_id}; rename → {id,filename,
+    root_frame_id} (no version_id); upload → {id,filename,content_type,
+    root_frame_id} (no version_id). Consumers must treat every field as
+    optional — this locks each emit site's exact key set."""
+    cfg, runner, store, fid, st = _runner_frame(tmp_path)
+    hub = _Hub()
+    handler_cls = gateway_mod.make_handler(cfg, hub, runner)
+    handler = object.__new__(handler_cls)
+    f = st.workspace / "notes.txt"
+    f.write_text("v1")
+    rec = runner._register_file(st, f, "c1", lambda e: None)
+    aid = rec["artifact_id"]
+
+    def _created():
+        return [e for e in hub.events if e.get("type") == "artifact_created"]
+
+    res = handler._edit_artifact(aid, "v2 content")
+    art = _created()[-1]["artifact"]
+    assert set(art) == {"id", "filename", "version_id", "root_frame_id"}
+    assert art["id"] == aid
+    assert art["version_id"] == res["version_id"]
+    assert art["root_frame_id"] == fid
+
+    handler._rename_artifact(aid, "renamed.txt")
+    art = _created()[-1]["artifact"]
+    assert set(art) == {"id", "filename", "root_frame_id"}  # NO version_id
+    assert art["filename"] == "renamed.txt"
+
+    handler._upload(
+        {
+            "filename": "up.txt",
+            "content_base64": base64.b64encode(b"hello").decode(),
+            "frame_id": fid,
+        }
+    )
+    art = _created()[-1]["artifact"]
+    assert set(art) == {"id", "filename", "content_type", "root_frame_id"}
+    assert art["filename"] == "up.txt"
+    assert art["root_frame_id"] == fid
+
+
+def test_plan_flat_and_bare_artifact_created_shapes(tmp_path):
+    """Shapes 3 and 4 of artifact_created (docs/webapp-api.md §3): the plan
+    artifact emits a FLAT event (no nested `artifact` key), and delete /
+    version-restore emit a BARE {"type","root_frame_id"} refresh signal."""
+    cfg = _cfg(tmp_path)
+    hub = _Hub()
+    runner = gateway_mod.SessionRunner(cfg, hub)
+    store = runner.store
+    fid = store.new_frame(kind="turn", project_id="default", status="ready")
+    st = gateway_mod.SessionState(fid, "default", runner.workspace_for(fid))
+
+    # shape 3: flat plan artifact — no nested `artifact` object at all
+    events = []
+    plan = {"title": "My Plan", "rationale": "r", "confidence": 0.9, "steps": []}
+    rec = runner._write_plan_artifact(st, plan, None, events.append)
+    ev = [e for e in events if e.get("type") == "artifact_created"][-1]
+    assert "artifact" not in ev
+    assert set(ev) == {"type", "frame_id", "artifact_id", "filename"}
+    assert ev["artifact_id"] == rec["artifact_id"]
+    assert ev["filename"].startswith("plan_") and ev["filename"].endswith(".json")
+
+    # shape 4a: version restore — bare refresh signal via runner.hub
+    f = st.workspace / "fig.txt"
+    f.write_text("ALPHA")
+    r1 = runner._register_file(st, f, "c1", lambda e: None)
+    f.write_text("BETA")
+    runner._register_file(st, f, "c2", lambda e: None)
+    hub.events.clear()
+    assert runner.restore_version(r1["artifact_id"], r1["version_id"]).get("ok")
+    ev = [e for e in hub.events if e.get("type") == "artifact_created"][-1]
+    assert set(ev) == {"type", "root_frame_id"}
+    assert ev["root_frame_id"] == fid
+
+    # shape 4b: DELETE /api/artifacts/{aid} — same bare form + {"ok": true}
+    handler_cls = gateway_mod.make_handler(cfg, hub, runner)
+    handler = object.__new__(handler_cls)
+    replies = []
+    handler._query = lambda: {}
+    handler._body = lambda: {}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    hub.events.clear()
+    handler._api("DELETE", f"/artifacts/{r1['artifact_id']}")
+    assert replies[-1] == (200, {"ok": True})
+    ev = [e for e in hub.events if e.get("type") == "artifact_created"][-1]
+    assert set(ev) == {"type", "root_frame_id"}
+    assert store.get_artifact(r1["artifact_id"]) is None
+
+
+def test_frame_update_status_literal_vocabulary(tmp_path):
+    """Source-level lock on the frame_update status vocabulary documented in
+    docs/webapp-api.md §3. Literal statuses in gateway.py emit sites are
+    exactly {processing, titled, failed, success, updated}; the run_message
+    terminal site emits a VARIABLE status ∈ {completed, failed, cancelled}
+    (asserted behaviorally by test_gateway_plain_answer_completes_without_code).
+    If this fails, a status was added/removed — update docs/webapp-api.md."""
+    src = Path(gateway_mod.__file__).read_text(encoding="utf-8")
+    sites = list(re.finditer(r'"type": "frame_update"', src))
+    assert len(sites) >= 7  # the emit sites documented today
+    literals = set()
+    for m in sites:
+        window = src[m.end() : m.end() + 250]
+        s = re.search(r'"status": "([a-z_]+)"', window)
+        if s:
+            literals.add(s.group(1))
+    assert literals == {"processing", "titled", "failed", "success", "updated"}
+
+
+def test_auto_title_broadcasts_titled_frame_update(monkeypatch, tmp_path):
+    """The background auto-title thread emits frame_update status="titled"
+    with an extra task_summary field (the only frame_update variant carrying
+    one) — docs/webapp-api.md §3."""
+    cfg = _cfg(tmp_path)
+    hub = _Hub()
+    runner = gateway_mod.SessionRunner(cfg, hub)
+    store = runner.store
+    fid = store.new_frame(kind="turn", project_id="default", status="ready")
+    placeholder = "analyze the sales da…"
+    store.update_frame(fid, task_summary=placeholder)
+
+    monkeypatch.setattr(
+        gateway_mod,
+        "chat",
+        lambda messages, cfg, **kw: {"content": "Sales data analysis", "usage": {}},
+    )
+    runner._spawn_title_summary(
+        fid, "analyze the sales data please", cfg.llm, placeholder
+    )
+
+    deadline = time.time() + 3
+    titled = []
+    while time.time() < deadline and not titled:
+        titled = [
+            e
+            for e in hub.events
+            if e.get("type") == "frame_update" and e.get("status") == "titled"
+        ]
+        time.sleep(0.01)
+    assert titled, "no frame_update status=titled was broadcast"
+    ev = titled[-1]
+    assert ev["frame_id"] == fid
+    assert ev["task_summary"] == "Sales data analysis"
+    assert store.get_frame(fid)["task_summary"] == "Sales data analysis"
+
+
+def test_token_gate_401_and_cookie_redirect(monkeypatch, tmp_path, capsys):
+    """The token gate (docs/webapp-api.md §1): with OPENAI4S_REQUIRE_TOKEN=1,
+    a request without the token gets a 401 {"error": ...} envelope; a GET
+    carrying a valid ?token= gets 303 Location:/ + Set-Cookie os_token;
+    /health stays exempt."""
+    monkeypatch.setenv("OPENAI4S_REQUIRE_TOKEN", "1")
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    printed = capsys.readouterr().out
+    tok = re.search(r"\?token=([0-9a-f]{32})", printed)
+    assert tok, "gateway did not print the access token"
+    token = tok.group(1)
+
+    handler = object.__new__(handler_cls)
+    handler.headers = {}  # no Cookie, no Origin
+    replies = []
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+
+    # no token → 401 with the {"error": ...} envelope
+    handler.path = "/api/frames"
+    handler._route("GET")
+    code, body = replies[-1]
+    assert code == 401
+    assert body["error"].startswith("unauthorized")
+
+    # wrong token → still 401
+    handler.path = "/api/frames?token=deadbeef"
+    handler._route("GET")
+    assert replies[-1][0] == 401
+
+    # /health is exempt from the gate
+    handler.path = "/health"
+    handler._route("GET")
+    code, body = replies[-1]
+    assert code == 200 and body["status"] == "ok"
+
+    # valid ?token= on a GET → 303 to / with the os_token cookie set
+    resp = {"code": None, "headers": {}}
+    handler.send_response = lambda c: resp.__setitem__("code", c)
+    handler.send_header = lambda k, v: resp["headers"].__setitem__(k, v)
+    handler.end_headers = lambda: None
+    handler.path = f"/?token={token}"
+    handler._route("GET")
+    assert resp["code"] == 303
+    assert resp["headers"]["Location"] == "/"
+    assert resp["headers"]["Set-Cookie"].startswith(f"os_token={token}")
+    assert "HttpOnly" in resp["headers"]["Set-Cookie"]
+
+
+def test_gateway_error_maps_to_error_envelope(tmp_path):
+    """A GatewayError(code, message) raised anywhere under /api/* is serialized
+    by _route as {"error": message} with its HTTP code (docs/webapp-api.md §2).
+    Contract test before any extraction of gateway routing."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.headers = {}
+    replies = []
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+
+    def boom(method, sub):
+        raise gateway_mod.GatewayError(418, "teapot")
+
+    handler._api = boom
+    handler.path = "/api/anything"
+    handler._route("GET")
+
+    assert replies[-1] == (418, {"error": "teapot"})
+
+
+def test_unhandled_exception_maps_to_500_error_envelope(tmp_path, capsys):
+    """A non-GatewayError exception under /api/* becomes a 500 with the
+    same {"error": str(e)} envelope (and never a raw traceback body)."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.headers = {}
+    replies = []
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+
+    def boom(method, sub):
+        raise RuntimeError("kaput")
+
+    handler._api = boom
+    handler.path = "/api/anything"
+    handler._route("GET")
+
+    assert replies[-1] == (500, {"error": "kaput"})
+    capsys.readouterr()  # swallow the printed traceback
+
+
+def test_cross_origin_api_write_is_refused(tmp_path):
+    """CSRF guard: a mutating /api request whose Origin host differs from the
+    Host header is rejected 403 with the {"error": ...} envelope BEFORE any
+    route logic runs."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.headers = {
+        "Origin": "http://evil.example",
+        "Host": "127.0.0.1:8760",
+    }
+    replies = []
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._api = lambda method, sub: replies.append(("api-was-called", None))
+    handler.path = "/api/frames"
+    handler._route("POST")
+
+    assert replies == [(403, {"error": "cross-origin request refused"})]
+
+
+def test_execution_log_route_serializer_contract(tmp_path):
+    """GET /api/frames/{fid}/execution-log — the Notebook data contract: each
+    entry carries exactly source/stdout/stderr/error/status/figures/
+    files_written/files_read/cpu_seconds/peak_rss_kb (+ cell_index/kernel_id/
+    language), with code→source and cpu_s→cpu_seconds renames and ""/[] (never
+    null) defaults."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    store = get_store(cfg.db_path)
+    fid = store.new_frame(kind="turn", project_id="default", status="ready")
+
+    store.log_cell(
+        frame_id=fid,
+        root_frame_id=fid,
+        code="print('hi')",
+        result={
+            "id": "cell-1",
+            "stdout": "hi\n",
+            "stderr": "",
+            "error": None,
+            "interrupted": False,
+            "usage": {"wall_s": 0.5, "cpu_s": 0.25, "peak_rss_kb": 2048},
+        },
+        cell_index=1,
+        kernel_id="python",
+        language="python",
+        figures=["fig1.png"],
+        files_read=["in.csv"],
+        files_written=["out.csv"],
+    )
+    store.log_cell(
+        frame_id=fid,
+        root_frame_id=fid,
+        code="1/0",
+        result={
+            "id": "cell-2",
+            "stdout": "",
+            "stderr": "",
+            "error": "ZeroDivisionError",
+        },
+        cell_index=2,
+    )
+
+    replies = []
+    handler._query = lambda: {}
+    handler._body = lambda: {}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._api("GET", f"/frames/{fid}/execution-log")
+
+    code, body = replies[-1]
+    assert code == 200
+    assert body["kernels"] == ["python"]  # deduped, first-seen order
+    assert len(body["entries"]) == 2
+    e1, e2 = body["entries"]
+    assert set(e1) == {
+        "cell_index",
+        "kernel_id",
+        "language",
+        "source",
+        "stdout",
+        "stderr",
+        "error",
+        "status",
+        "figures",
+        "files_written",
+        "files_read",
+        "cpu_seconds",
+        "peak_rss_kb",
+    }
+    assert e1["source"] == "print('hi')"  # code -> source rename
+    assert e1["status"] == "ok"
+    assert e1["cpu_seconds"] == 0.25  # cpu_s -> cpu_seconds rename
+    assert e1["peak_rss_kb"] == 2048
+    assert e1["figures"] == ["fig1.png"]
+    assert e1["files_read"] == ["in.csv"]
+    assert e1["files_written"] == ["out.csv"]
+    assert e1["error"] == ""  # null-free default
+    assert e2["status"] == "error"
+    assert e2["error"] == "ZeroDivisionError"
+    assert e2["figures"] == [] and e2["files_written"] == []
+
+
+def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
+    """The artifact lineage payload (UI provenance view): a produced artifact
+    reports its producing cell interaction + save event, and
+    dependency_mappings.inputs = files_read minus files_written minus itself.
+    An unknown artifact returns the same shape, empty."""
+    cfg, runner, store, fid, st = _runner_frame(tmp_path)
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+
+    store.log_cell(
+        frame_id=fid,
+        root_frame_id=fid,
+        code="plot(df)",
+        result={"id": "cell-7", "stdout": "", "stderr": "", "error": None},
+        cell_index=3,
+        files_read=["raw.csv", "fig.txt"],
+        files_written=["fig.txt"],
+    )
+    f = st.workspace / "fig.txt"
+    f.write_text("bytes")
+    rec = runner._register_file(st, f, "cell-7", lambda e: None)
+
+    lin = handler._lineage(rec["artifact_id"])
+    assert lin["artifact_id"] == rec["artifact_id"]
+    assert lin["filename"] == "fig.txt"
+    kinds = [i["kind"] for i in lin["interactions"]]
+    assert kinds == ["cell", "save"]
+    cell = lin["interactions"][0]
+    assert cell["cell_index"] == 3
+    assert cell["source"] == "plot(df)"
+    assert cell["exit_status"] == "ok"
+    assert cell["files_written"] == ["fig.txt"]
+    # inputs exclude what the cell itself wrote and the artifact's own filename
+    assert lin["dependency_mappings"] == {"inputs": ["raw.csv"]}
+
+    empty = handler._lineage("a-does-not-exist")
+    assert empty == {
+        "artifact_id": "a-does-not-exist",
+        "filename": None,
+        "interactions": [],
+        "dependency_mappings": {"inputs": []},
+    }
+
+
+def test_upload_base64_decode_and_raw_fallback(tmp_path):
+    """POST /api/uploads decode reality (docs/webapp-api.md §2): valid base64
+    decodes; non-alphabet chars are silently DISCARDED (not an error); only a
+    residual padding/length error falls back to storing the raw UTF-8 text."""
+    cfg, runner, store, fid, st = _runner_frame(tmp_path)
+    hub = _Hub()
+    handler_cls = gateway_mod.make_handler(cfg, hub, runner)
+    handler = object.__new__(handler_cls)
+
+    def _bytes(res):
+        return Path(store.resolve_artifact_path(res["artifact_id"])).read_bytes()
+
+    # valid base64 → decoded bytes stored
+    res = handler._upload(
+        {
+            "filename": "a.bin",
+            "content_base64": base64.b64encode(b"\x00\x01binary").decode(),
+            "frame_id": fid,
+        }
+    )
+    assert res["id"] == res["artifact_id"] and res["filename"] == "a.bin"
+    assert _bytes(res) == b"\x00\x01binary"
+
+    # non-alphabet chars silently dropped, remainder decoded ("Zm9v!YmFy" → foobar)
+    res = handler._upload(
+        {"filename": "b.bin", "content_base64": "Zm9v!YmFy", "frame_id": fid}
+    )
+    assert _bytes(res) == b"foobar"
+
+    # padding/length error → the ORIGINAL string's UTF-8 bytes stored as-is
+    res = handler._upload(
+        {"filename": "c.bin", "content_base64": "%%% not base64 %%%", "frame_id": fid}
+    )
+    assert _bytes(res) == "%%% not base64 %%%".encode("utf-8")

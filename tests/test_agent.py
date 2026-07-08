@@ -62,6 +62,37 @@ def test_no_code_block_nudge(monkeypatch):
     assert result["stop_reason"] == "submitted"
 
 
+def test_submit_output_soft_fail_does_not_complete(monkeypatch):
+    """host.submit_output with invalid completion_bullets soft-fails (the
+    dispatcher returns {'error': ...} → RuntimeError in the cell) and the task
+    does NOT end; a subsequent valid submit_output is what completes it."""
+    scripted = ScriptedLLM(
+        [
+            "```python\n"
+            "try:\n"
+            "    host.submit_output({'a': 1}, [])\n"
+            "except RuntimeError as e:\n"
+            "    print('SOFT-FAIL:', e)\n"
+            "```",
+            "```python\nhost.submit_output({'a': 1}, ['Computed the answer'])\n```",
+        ]
+    )
+    monkeypatch.setattr(loop_mod, "chat", scripted)
+    agent = Agent(use_skills=False, allow_delegate=False, max_turns=4)
+    result = agent.run("submit twice")
+
+    # the invalid submit did not stop the loop — the valid one did
+    assert result["stop_reason"] == "submitted"
+    assert len(scripted.calls) == 2
+    assert result["submitted_output"]["output"] == {"a": 1}
+    assert result["submitted_output"]["completion_bullets"] == ["Computed the answer"]
+    obs = [t["content"] for t in result["transcript"] if t["role"] == "observation"]
+    assert any(
+        "SOFT-FAIL:" in o and "completion_bullets must be a list of 1-4 items" in o
+        for o in obs
+    )
+
+
 def test_max_turns_stop(monkeypatch):
     # never calls submit_output -> should stop at max_turns
     scripted = ScriptedLLM(["```python\nx = 1\n```"] * 10)

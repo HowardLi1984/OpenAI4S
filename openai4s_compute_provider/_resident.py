@@ -6,10 +6,16 @@ Two entrypoints share one prologue:
   - run_repl()    long-lived compute-provider kernel (cell-by-cell,
     idle-timeout), spawned by the host's kernel manager.
 
-The prologue runs BEFORE any provider import and BEFORE reading the credential
-(stdin for oneshot, fd-3 for repl), so the process environment is scrubbed of
-secrets by construction. run_oneshot self-enforces confinement (exit 71) before
-touching stdin; run_repl reports it via {ready, confined} for the host to gate.
+Secret scrubbing is two-staged: ``__main__`` runs the provider-agnostic
+``scrub_secret_env()`` baseline BEFORE it imports provider.py, and the prologue
+here re-scrubs with the provider's own declared ``secret_env_prefixes`` before
+reading the credential (stdin for oneshot, fd-3 for repl). Together they keep
+provider code from reading credential-shaped or known-prefix environment
+variables (a name-based heuristic — a secret in an unrecognized variable name
+is NOT scrubbed), and the credential itself is never placed in the
+environment. run_oneshot self-enforces confinement
+(exit 71) before touching stdin; run_repl reports it via {ready, confined} for
+the host to gate.
 """
 from __future__ import annotations
 
@@ -27,6 +33,7 @@ from typing import Any, NoReturn
 from ._channel import ScrubWriter, fmt_bytes, read_auth, write_event, write_ready
 from ._constants import (
     BASE_ERROR_KINDS,
+    BASELINE_SECRET_PREFIXES,
     CHUNK,
     COMPRESSED_CAP_DEFAULT,
     CRED_KEY_RE,
@@ -39,6 +46,34 @@ from ._constants import (
     WORK,
 )
 from ._protocol import ByocError, ByocProvider
+
+
+def scrub_secret_env(extra_prefixes: tuple[str, ...] = ()) -> None:
+    """Delete secret-bearing environment variables from ``os.environ`` in place.
+
+    Called TWICE, so provider top-level code cannot read credential-shaped or
+    known-prefix environment variables:
+
+      1. From ``__main__`` BEFORE the provider module is imported — with only
+         the provider-agnostic baseline (this is what makes "scrub before any
+         provider import" literally true, since the provider's own declared
+         prefixes are unknowable until its module is loaded).
+      2. From ``ByocResident._prologue`` before the credential is read — with
+         the loaded provider's ``secret_env_prefixes`` folded in.
+
+    A variable is removed when its NAME matches ``CRED_KEY_RE`` (``*_API_KEY``,
+    ``*_TOKEN``, ``*_SECRET`` …) OR starts with a baseline / provider secret
+    prefix. This is a name-based heuristic: a secret stored under a name that
+    matches neither rule is NOT scrubbed. Everything else survives — e.g.
+    ``OPENAI4S_HOST_NETNS_INO`` (the confinement probe's anchor) and
+    ``HTTP_PROXY``/``HTTPS_PROXY``. Note ``NVIDIA_VISIBLE_DEVICES`` IS removed
+    (the ``NVIDIA_`` prefix catches it, deliberately — the confined helper
+    does no GPU work of its own).
+    """
+    prefixes = BASELINE_SECRET_PREFIXES + tuple(extra_prefixes)
+    for k in list(os.environ):
+        if k.startswith(prefixes) or CRED_KEY_RE.search(k):
+            os.environ.pop(k, None)
 
 
 class ByocResident:
@@ -124,8 +159,11 @@ class ByocResident:
 
     def _prologue(self) -> None:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        for k in [k for k in os.environ if k.startswith(self._p.secret_env_prefixes)]:
-            os.environ.pop(k, None)
+        # __main__ already ran the baseline scrub before importing the provider
+        # module; re-run it here with the provider's own declared prefixes so
+        # the credential (read next, from stdin/fd-3) can never coexist with a
+        # provider-namespaced secret in the environment.
+        scrub_secret_env(self._p.secret_env_prefixes)
         if sys.platform == "linux":
             try:
                 ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)
