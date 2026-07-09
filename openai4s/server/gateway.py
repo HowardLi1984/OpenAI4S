@@ -48,8 +48,11 @@ from openai4s.store import Store, get_store
 from openai4s.tools import MAX_TOOL_CALLS_PER_TURN as _MAX_TOOL_CALLS_PER_TURN
 from openai4s.tools import execute_tool_call as _execute_tool_call
 from openai4s.tools import finalize_tool_batch as _finalize_tool_batch
+from openai4s.tools import parse_fence_delimiter as _parse_fence_delimiter
 from openai4s.tools import parse_tool_calls as _parse_tool_calls
 from openai4s.tools import render_tools_prompt as _render_tools_prompt
+from openai4s.tools import scan_fenced_blocks as _scan_fenced_blocks
+from openai4s.tools import strip_fenced_blocks as _strip_fenced_blocks
 
 os.environ.setdefault("MPLBACKEND", "Agg")  # headless matplotlib for figure capture
 
@@ -412,11 +415,13 @@ class SessionState:
         # Explore mode: autonomous deep exploration — larger turn budget and the
         # turn only ends via host.submit_output (prose-only replies are nudged).
         self.explore: bool = False
-        # Which prebuilt environment the kernel runs in (resolved at spawn time
-        # to the default when None). `pending_env` is a switch the agent requested
-        # mid-turn (host.env.use); it is applied between cells so the agent never
-        # restarts the kernel out from under its own running cell.
+        # `env_name` is the environment the current kernel actually runs in;
+        # `desired_env` is the user's/agent's pinned selection. They differ only
+        # during a transient fallback to base when the pin cannot be resolved.
+        # `pending_env` is a switch requested mid-turn (host.env.use); it is
+        # applied between cells so the agent never restarts its running kernel.
         self.env_name: str | None = None
+        self.desired_env: str | None = None
         self.pending_env: str | None = None
 
 
@@ -801,55 +806,61 @@ _EXPLORE_NUDGE = (
     "write report.md), then call host.submit_output(...)."
 )
 
-_STALL_NUDGE = (
-    "[system] You stopped mid-task without an actionable conclusion "
-    "and without calling host.submit_output(...). Continue with the "
-    "next ```python step, or finish properly with "
-    "host.submit_output(...)."
+_SUBMIT_NUDGE = (
+    "[system] Prose is not a completion signal. Continue with the next "
+    "```python step, or, if the task is complete, run one final ```python "
+    "cell that calls host.submit_output(...)."
 )
 
 
 class _ProseStreamer:
-    """Streams a model reply's narration (text OUTSIDE ``` fences) as live
-    text_chunk events, so prose appears token-by-token while the ```python code
-    stays out of the chat bubble (it becomes a tool/activity card instead)."""
+    """Streams narration outside top-level fences as live text chunks.
+
+    Complete lines are scanned with the same nesting rule as the authoritative
+    reply parser. Buffering the current line prevents a literal nested
+    ```tool example inside a Python string from leaking into the chat bubble.
+    """
 
     def __init__(self, emit, root_frame_id: str):
         self.emit = emit
         self.rid = root_frame_id
         self.acc = ""
-        self.sent = 0
-        self.in_code = False
+        self.line_buf = ""
+        self.fence_stack: list[tuple[str, int]] = []
         self.emitted_any = False
         self.emitted = ""  # exact prose text streamed so far (for reconciliation)
 
     def feed(self, delta: str) -> None:
         self.acc += delta
-        self._drain(final=False)
+        self._drain(delta)
 
-    def _drain(self, final: bool) -> None:
-        text = self.acc
-        # hold back a 3-char tail so a forming ``` fence isn't half-emitted
-        limit = len(text) if final else max(self.sent, len(text) - 3)
-        pos = self.sent
-        out = []
-        while pos < limit:
-            fence = text.find("```", pos)
-            if not self.in_code:
-                seg_end = fence if (fence != -1 and fence < limit) else limit
-                out.append(text[pos:seg_end])
-                if fence != -1 and fence < limit:
-                    self.in_code = True
-                    pos = fence + 3
+    def _drain(self, delta: str) -> None:
+        # A delimiter is meaningful only as a full line, so keep the current
+        # partial line buffered until another delta (or final reconciliation).
+        self.line_buf += delta
+        out: list[str] = []
+        while True:
+            newline = self.line_buf.find("\n")
+            if newline < 0:
+                break
+            line = self.line_buf[: newline + 1]
+            self.line_buf = self.line_buf[newline + 1 :]
+            delimiter = _parse_fence_delimiter(line)
+            if delimiter:
+                fence_char, fence_length, info = delimiter
+                if not self.fence_stack:
+                    self.fence_stack.append((fence_char, fence_length))
+                elif (
+                    fence_char != self.fence_stack[-1][0]
+                    or fence_length < self.fence_stack[-1][1]
+                ):
+                    pass  # literal nested delimiter; remain inside the outer fence
+                elif info:
+                    self.fence_stack.append((fence_char, fence_length))
                 else:
-                    pos = seg_end
-            else:
-                if fence != -1 and fence < limit:
-                    self.in_code = False
-                    pos = fence + 3
-                else:
-                    pos = limit  # still inside code; consume without emitting
-        self.sent = pos
+                    self.fence_stack.pop()
+            elif not self.fence_stack:
+                out.append(line)
         chunk = "".join(out)
         if chunk:
             self._emit_prose(chunk)
@@ -869,13 +880,10 @@ class _ProseStreamer:
         self.emitted_any = True
 
     def finalize(self) -> None:
-        self._drain(final=True)
         # Reconcile the live stream with EXACTLY the prose that gets persisted
-        # (all fenced blocks stripped). The live drain toggles on any ``` run, so
-        # a stray/odd fence in narration can strand trailing prose; recompute the
-        # authoritative prose and emit whatever suffix we haven't streamed yet, so
-        # the bubble never diverges from the reloaded message.
-        target = _ANY_FENCE_RE.sub("", self.acc)
+        # (all top-level fenced blocks stripped, including an incomplete final
+        # block). Emit the buffered last prose line, if any, as one suffix.
+        target = _strip_fenced_blocks(self.acc)
         if target.startswith(self.emitted) and len(target) > len(self.emitted):
             self._emit_prose(target[len(self.emitted) :])
 
@@ -1239,7 +1247,8 @@ class SessionRunner:
         from openai4s.kernel import environments as envmod
 
         name = (
-            st.env_name
+            st.desired_env
+            or st.env_name
             or self._persisted_env(st.root_frame_id)
             or envmod.default_env_name()
         )
@@ -1249,8 +1258,10 @@ class SessionRunner:
             # yet discovered after a restart). Run on base for THIS spawn but do
             # NOT overwrite the stored pin — a later spawn, once the env is
             # discoverable again, must still find the original selection.
+            st.desired_env = name
             st.env_name = "base"
             return envmod.get_environment("base")
+        st.desired_env = name
         st.env_name = name
         self._persist_env(st.root_frame_id, name)
         return env
@@ -1405,6 +1416,16 @@ class SessionRunner:
         with st.turn_lock:
             if st.kernel is None:
                 self._ensure_kernel(st)
+            elif st.desired_env and st.desired_env != st.env_name:
+                # The active kernel is a transient base fallback. A full spawn
+                # re-runs environment resolution so a recovered pinned env can
+                # finally take effect; Kernel.restart() would reuse base Python.
+                try:
+                    st.kernel.shutdown()
+                except Exception:  # noqa: BLE001 — respawn is the recovery path
+                    pass
+                st.kernel = None
+                self._spawn_kernel(st)
             else:
                 st.kernel.restart()
                 self._run_bootstrap(st)
@@ -1644,7 +1665,9 @@ class SessionRunner:
                 and st.kernel is not None
                 and st.kernel.is_alive()
             )
+            st.desired_env = env_name
             st.env_name = env_name
+            self._persist_env(root_frame_id, env_name)
             if not already:
                 # respawn into the new interpreter (fresh dispatcher + bootstrap)
                 if st.kernel is not None:
@@ -1682,12 +1705,16 @@ class SessionRunner:
         valid Python env."""
         target = st.pending_env
         st.pending_env = None
-        if not target or target == st.env_name:
+        if not target:
             return
         from openai4s.kernel import environments as envmod
 
         env = envmod.get_environment(target)
         if env is None or env.interpreter is None:
+            return
+        st.desired_env = target
+        if target == st.env_name:
+            self._persist_env(st.root_frame_id, target)
             return
         st.env_name = target
         if st.kernel is not None:
@@ -2228,7 +2255,21 @@ class SessionRunner:
             err_text: str | None = None
             try:
                 st.dispatcher.last_output = None
-                self._loop(st, emit, assistant_visible)
+                loop_reason = self._loop(st, emit, assistant_visible)
+                if loop_reason == "max_turns":
+                    status = "failed"
+                    err_text = (
+                        "Agent reached its configured turn limit without calling "
+                        "host.submit_output(...)."
+                    )
+                    emit(
+                        {
+                            "type": "text_chunk",
+                            "frame_id": root_frame_id,
+                            "block_type": "text",
+                            "chunk": "\n\n" + err_text + "\n",
+                        }
+                    )
             except Exception as e:  # noqa: BLE001
                 status = "failed"
                 err_text = self._friendly_error(e)
@@ -2316,39 +2357,15 @@ class SessionRunner:
             return text
         return text + "\n\n---\n(附:被引用的文件内容)\n\n" + "\n\n".join(blocks)
 
-    def _prose_concludes(self, prose: str, llm_cfg) -> bool:
-        """Anti-stall gate on a prose-only reply mid-task: does it assert an
-        actionable result/conclusion (safe to end the turn), or only narrate
-        process ("let me now check…" — the model stalled)? Uses the
-        `conclusion_gate` micro-prompt; FAILS OPEN (True → end the turn) so a
-        broken/slow gate can never trap a session in nudge loops."""
-        try:
-            from types import SimpleNamespace
-
-            from openai4s import prompts
-
-            verdict = prompts.render(
-                "conclusion_gate",
-                prose[-4000:],
-                SimpleNamespace(llm=llm_cfg),
-                max_tokens=8,
-                temperature=0.0,
-            )
-            return "YES" in (verdict or "").strip().upper()
-        except Exception:  # noqa: BLE001
-            return True
-
-    def _loop(self, st: SessionState, emit, assistant_visible: list[dict]) -> None:
+    def _loop(self, st: SessionState, emit, assistant_visible: list[dict]) -> str:
         rid = st.root_frame_id
         max_turns = self.cfg.max_turns or 12
         if st.explore:
             max_turns = max(max_turns, self.cfg.explore_max_turns or 0)
         llm_cfg = self._llm_cfg(st)  # resolve once per turn (not per iteration)
-        cells_run = 0  # code cells executed this user turn
-        stall_nudges = 0  # consecutive prose-only replies we pushed back on
         for _turn in range(max_turns):
             if st.cancel.is_set():
-                return
+                return "cancelled"
             if should_compact(st.messages, self.cfg):
                 st.messages = compact(
                     st.messages, self.cfg, archive_dir=self.cfg.compaction_dir
@@ -2368,7 +2385,7 @@ class SessionRunner:
             code = _extract_code(reply)
             # strip ALL fenced blocks (matches what the streamer hides live), so
             # the persisted bubble equals the streamed prose and no code leaks in
-            prose = _ANY_FENCE_RE.sub("", reply).strip()
+            prose = _strip_fenced_blocks(reply).strip()
             if prose:
                 # Stamp the block with the moment it was produced (before this
                 # iteration's code runs and emits its steps) so a reopened session
@@ -2402,7 +2419,7 @@ class SessionRunner:
                     self._finalize_plan(st, reply, prose, emit)
                 except Exception:  # noqa: BLE001 — never let plan capture break a turn
                     traceback.print_exc()
-                return
+                return "plan"
             if code is None:
                 # ReAct tool surface: run any top-level ```tool calls
                 # (deterministic ops through the dispatcher — same activity-step
@@ -2426,38 +2443,15 @@ class SessionRunner:
                         self._apply_pending_env(st, emit)
                     obs = _finalize_tool_batch(parts, len(tool_calls), tool_errors)
                     st.messages.append({"role": "user", "content": obs})
-                    cells_run += 1
-                    stall_nudges = 0
                     if st.dispatcher.last_output is not None:
-                        return
+                        return "submitted"
                     continue
                 if st.dispatcher.last_output is not None:
-                    return
+                    return "submitted"
                 if prose:
-                    # Explore mode: prose alone never ends the run — the contract
-                    # is host.submit_output. Push back (bounded, so a model that
-                    # simply won't comply can't ping-pong to max_turns).
-                    if st.explore and stall_nudges < 3:
-                        stall_nudges += 1
-                        st.messages.append({"role": "user", "content": _EXPLORE_NUDGE})
-                        continue
-                    # Mid-task stall guard: the turn already ran cells, then the
-                    # model stopped with prose that concludes nothing actionable
-                    # ("let me now check…"). Gate it and push back once or twice
-                    # instead of silently ending the turn half-done.
-                    if (
-                        not st.explore
-                        and cells_run > 0
-                        and stall_nudges < 2
-                        and not self._prose_concludes(prose, llm_cfg)
-                    ):
-                        stall_nudges += 1
-                        st.messages.append({"role": "user", "content": _STALL_NUDGE})
-                        continue
-                    # Conversation-only answers and plan-mode replies do not need
-                    # a code cell. Treat visible prose as a completed turn instead
-                    # of nudging until max_turns.
-                    return
+                    nudge = _EXPLORE_NUDGE if st.explore else _SUBMIT_NUDGE
+                    st.messages.append({"role": "user", "content": nudge})
+                    continue
                 nudge = (
                     "[system] No python code block found. Reply with a "
                     "```python block to act, and call host.submit_output(...) "
@@ -2470,8 +2464,6 @@ class SessionRunner:
             if st.pending_env:
                 self._apply_pending_env(st, emit)
             info = self._execute_and_log(st, code, "agent", emit, stream=True)
-            cells_run += 1
-            stall_nudges = 0  # real progress resets the stall counter
             obs = _format_observation(info["result"])
             # One cell runs per step: if the model batched SEVERAL ```python
             # blocks into this single reply, only the FIRST one just executed —
@@ -2481,7 +2473,14 @@ class SessionRunner:
             # done and "concludes" the whole task after one cell — the
             # false-completion bug where a deliverable task ends with an empty
             # working dir because cells 2..N never ran.
-            if len(_CODE_BLOCK_RE.findall(reply)) > 1:
+            code_block_count = sum(
+                1
+                for block in _scan_fenced_blocks(reply)
+                if block.closed
+                and block.fence_char == "`"
+                and block.info in ("", "python", "py")
+            )
+            if code_block_count > 1:
                 obs += (
                     "\n[system] NOTE: only the FIRST ```python block in your "
                     "reply was executed — exactly ONE cell runs per step. The "
@@ -2492,7 +2491,8 @@ class SessionRunner:
                 )
             st.messages.append({"role": "user", "content": obs})
             if st.dispatcher.last_output is not None:
-                return
+                return "submitted"
+        return "max_turns"
 
     def _execute_with_watchdog(
         self, st: SessionState, code: str, origin: str, on_chunk
@@ -2659,6 +2659,9 @@ class SessionRunner:
                     "frame_id": rid,
                     "block_type": "tool",
                     "chunk": f"⚙{title}\n",
+                    "cell_index": idx,
+                    "kernel_id": self._kernel_id(st),
+                    "language": self._kernel_language(st),
                 }
             )
             emit(
@@ -3130,12 +3133,6 @@ class SessionRunner:
                     "files_read": [],
                 }
             }
-
-
-_CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*\n.*?```", re.DOTALL)
-# Any fenced block (bash/json/python/…) — matches exactly what _ProseStreamer
-# hides from the live stream, so the persisted prose can never diverge from it.
-_ANY_FENCE_RE = re.compile(r"```[\s\S]*?```")
 
 
 # --------------------------------------------------------------------------- #

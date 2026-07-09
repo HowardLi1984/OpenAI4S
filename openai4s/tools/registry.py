@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from openai4s.tools.base import Tool
@@ -54,12 +55,121 @@ def all_tools() -> list[Tool]:
 
 # --- parsing model replies -------------------------------------------------
 
-# A fenced-code delimiter line: ``` optionally indented, with an optional info
-# string (the language/tag). We PAIR delimiters so a ```tool token that appears
-# INSIDE another fence (e.g. quoted inside a ```python cell that writes a README
-# documenting this very syntax) is treated as that fence's content/closer, never
-# as a tool call. Only a top-level ```tool fence is honored.
-_FENCE_RE = re.compile(r"^[ \t]*```([^\n`]*?)[ \t]*$")
+# A CommonMark-style fenced-code delimiter line (backticks or tildes), optionally
+# indented, with an optional info string. The action protocol itself only honors
+# backtick `python` / `tool` blocks; recognizing tildes and longer outer fences
+# prevents a triple-backtick example nested inside them from becoming an action.
+_FENCE_RE = re.compile(r"^[ \t]*(?P<fence>`{3,}|~{3,})(?P<info>[^\n]*?)[ \t]*$")
+
+
+@dataclass(frozen=True)
+class FencedBlock:
+    """One top-level fenced block found in a model reply.
+
+    `body` preserves nested fenced examples verbatim. `closed=False` marks a
+    streaming/incomplete block; callers may hide it from prose, but must never
+    execute it as code or a tool call.
+    """
+
+    info: str
+    fence_char: str
+    fence_length: int
+    body: str
+    start: int
+    end: int
+    closed: bool
+
+
+def parse_fence_delimiter(line: str) -> tuple[str, int, str] | None:
+    """Return `(character, run length, normalized info)` for a fence line."""
+    m = _FENCE_RE.match(line.rstrip("\r\n"))
+    if not m:
+        return None
+    fence = m.group("fence")
+    return fence[0], len(fence), (m.group("info") or "").strip().lower()
+
+
+def scan_fenced_blocks(text: str) -> list[FencedBlock]:
+    """Return top-level fenced blocks using a small, nesting-aware scanner.
+
+    An info-bearing delimiter inside another block opens a nested example and
+    a bare delimiter closes it. This is deliberately a little more permissive
+    than CommonMark: models often place a literal ```tool example inside a
+    ```python triple-quoted string, and the outer Python cell must remain whole.
+    Only blocks whose outer delimiter reaches a matching close are executable.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+
+    blocks: list[FencedBlock] = []
+    stack: list[tuple[str, int]] = []
+    top_info = ""
+    top_char = "`"
+    top_length = 3
+    top_start = 0
+    body_start = 0
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        delimiter = parse_fence_delimiter(line)
+        if delimiter is not None:
+            fence_char, fence_length, info = delimiter
+            if not stack:
+                stack.append((fence_char, fence_length))
+                top_info = info
+                top_char = fence_char
+                top_length = fence_length
+                top_start = offset
+                body_start = offset + len(line)
+            elif fence_char != stack[-1][0] or fence_length < stack[-1][1]:
+                # A shorter or alternate-character delimiter is literal body
+                # (e.g. ```tool inside a ````python documentation cell).
+                pass
+            elif info:
+                # A labelled fence inside an outer fence is a quoted/nested
+                # example, not the outer closer.
+                stack.append((fence_char, fence_length))
+            else:
+                stack.pop()
+                if not stack:
+                    blocks.append(
+                        FencedBlock(
+                            info=top_info,
+                            fence_char=top_char,
+                            fence_length=top_length,
+                            body=text[body_start:offset],
+                            start=top_start,
+                            end=offset + len(line),
+                            closed=True,
+                        )
+                    )
+        offset += len(line)
+
+    if stack:
+        blocks.append(
+            FencedBlock(
+                info=top_info,
+                fence_char=top_char,
+                fence_length=top_length,
+                body=text[body_start:],
+                start=top_start,
+                end=len(text),
+                closed=False,
+            )
+        )
+    return blocks
+
+
+def strip_fenced_blocks(text: str) -> str:
+    """Remove complete and incomplete top-level fences from visible prose."""
+    if not isinstance(text, str) or not text:
+        return text if isinstance(text, str) else ""
+    out: list[str] = []
+    pos = 0
+    for block in scan_fenced_blocks(text):
+        out.append(text[pos : block.start])
+        pos = block.end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _coerce_call(obj: Any) -> tuple[dict | None, str | None]:
@@ -92,7 +202,7 @@ def _parse_tool_body(body: str, calls: list[dict], errors: list[str]) -> None:
         return
     try:
         decoded = json.loads(body)
-    except (ValueError, TypeError) as e:
+    except Exception as e:  # noqa: BLE001 — decoder recursion is an observation
         errors.append(f"invalid JSON in ```tool block: {e}")
         return
     items = decoded if isinstance(decoded, list) else [decoded]
@@ -110,10 +220,11 @@ def _parse_tool_body(body: str, calls: list[dict], errors: list[str]) -> None:
 def parse_tool_calls(reply: str) -> tuple[list[dict], list[str]]:
     """Scan `reply` for TOP-LEVEL ```tool blocks and return (calls, errors).
 
-    Fences are paired top-to-bottom: every ``` line opens or closes a block, so
-    a ```tool token nested inside another fence (e.g. quoted inside a ```python
-    cell) is that fence's content, never a tool call. Each honored block body is
-    JSON: a single call object, or a list of call objects. Both
+    Fences are paired by character and run length, so a ```tool token nested
+    inside another fence (e.g. quoted inside a ```python cell or a longer
+    ```` block) is content, never a tool call. Only complete, top-level backtick
+    tool blocks are honored. Each body is JSON: a single call object or list.
+    Both
     {"name","arguments"} and {"tool","args"} shapes are accepted. Malformed JSON
     and unknown tool names become `errors` entries (fed back to the model) and
     are dropped from `calls`. Order preserved. Never raises on bad input.
@@ -122,23 +233,17 @@ def parse_tool_calls(reply: str) -> tuple[list[dict], list[str]]:
     errors: list[str] = []
     if not isinstance(reply, str):
         return calls, errors
-    lines = reply.split("\n")
-    i, n = 0, len(lines)
-    while i < n:
-        m = _FENCE_RE.match(lines[i])
-        if not m:
-            i += 1
+    try:
+        blocks = scan_fenced_blocks(reply)
+    except Exception as e:  # noqa: BLE001 — malformed output never breaks the loop
+        return calls, [f"could not scan tool fences: {e}"]
+    for block in blocks:
+        if block.fence_char != "`" or block.info != "tool":
             continue
-        info = (m.group(1) or "").strip().lower()
-        # Collect the block body up to the next fence delimiter (its closer).
-        j = i + 1
-        body: list[str] = []
-        while j < n and not _FENCE_RE.match(lines[j]):
-            body.append(lines[j])
-            j += 1
-        if info == "tool":
-            _parse_tool_body("\n".join(body), calls, errors)
-        i = j + 1  # skip past the closing fence
+        if not block.closed:
+            errors.append("unclosed ```tool block")
+            continue
+        _parse_tool_body(block.body, calls, errors)
     return calls, errors
 
 
@@ -229,16 +334,25 @@ def _render_result_body(result: Any) -> str:
     return "\n".join(parts)
 
 
+def _truncate_with_marker(text: str, limit: int, marker: str) -> str:
+    """Truncate to a strict character limit while keeping a visible marker."""
+    if len(text) <= limit:
+        return text
+    if limit <= 0:
+        return ""
+    if len(marker) >= limit:
+        return marker[:limit]
+    return text[: limit - len(marker)] + marker
+
+
 def format_tool_result(tool: Tool, result: Any) -> str:
     """Produce a readable "[Tool: <name>]\\n<compact result>" string, bounded
     to `tool.output_limit` characters."""
     text = f"[Tool: {tool.name}]\n{_render_result_body(result)}"
-    if len(text) > tool.output_limit:
-        text = text[: tool.output_limit] + "\n… [truncated]"
-    return text
+    return _truncate_with_marker(text, tool.output_limit, "\n… [truncated]")
 
 
-def execute_tool_call(dispatcher: Any, call: dict) -> tuple[str, bool]:
+def execute_tool_call(dispatcher: Any, call: Any) -> tuple[str, bool]:
     """Run one parsed tool call through `dispatcher` and return
     (observation_text, ok).
 
@@ -250,32 +364,50 @@ def execute_tool_call(dispatcher: Any, call: dict) -> tuple[str, bool]:
     first and short-circuit without dispatching. Any exception is turned into
     an error observation — this never raises.
     """
-    name = call.get("name") if isinstance(call, dict) else None
-    tool = get_tool(name) if isinstance(name, str) else None
-    if tool is None:
-        return f"[Tool error] unknown tool: {name!r}", False
+    name: Any = "unknown"
+    tool: Tool | None = None
+    try:
+        if not isinstance(call, dict):
+            return "[Tool error] tool call must be a JSON object", False
+        raw_name = call.get("name")
+        name = raw_name if type(raw_name) is str else "unknown"
+        tool = get_tool(name)
+        if tool is None:
+            return f"[Tool error] unknown tool: {name!r}", False
 
-    spec = dict(call.get("arguments") or {})
-
-    if tool.dangerous and tool.host_method == "bash":
-        reason = precheck_command(spec.get("command", ""))
-        if reason:
+        raw_spec = call.get("arguments")
+        if raw_spec is None:
+            raw_spec = {}
+        if not isinstance(raw_spec, dict):
             return (
-                f"[Tool: {tool.name}] blocked by static safety precheck: {reason}",
+                f"[Tool error] {tool.name}: 'arguments' must be a JSON object",
                 False,
             )
-    if tool.host_method == "edit_file":
-        err = static_edit_precheck(spec)
-        if err:
-            return f"[Tool: {tool.name}] {err}", False
+        spec = dict(raw_spec)
 
-    try:
+        if tool.dangerous and tool.host_method == "bash":
+            reason = precheck_command(spec.get("command", ""))
+            if reason:
+                return (
+                    f"[Tool: {tool.name}] blocked by static safety precheck: {reason}",
+                    False,
+                )
+        if tool.host_method == "edit_file":
+            err = static_edit_precheck(spec)
+            if err:
+                return f"[Tool: {tool.name}] {err}", False
+
         result = dispatcher(tool.host_method, [spec])
+        ok = not (isinstance(result, dict) and set(result.keys()) == {"error"})
+        return format_tool_result(tool, result), ok
     except Exception as e:  # noqa: BLE001 — a tool error must not crash the loop
-        return f"[Tool error] {tool.name}: {e}", False
-
-    ok = not (isinstance(result, dict) and set(result.keys()) == {"error"})
-    return format_tool_result(tool, result), ok
+        try:
+            detail = str(e)
+        except Exception:  # noqa: BLE001 — even a broken exception is observable
+            detail = type(e).__name__
+        text = f"[Tool error] {name}: {detail}"
+        limit = tool.output_limit if tool is not None else 20_000
+        return _truncate_with_marker(text, limit, "\n… [truncated]"), False
 
 
 # --- batching --------------------------------------------------------------
@@ -291,19 +423,24 @@ MAX_TOOL_OBS_CHARS = 60000
 def finalize_tool_batch(parts: list[str], n_total: int, errors: list[str]) -> str:
     """Assemble a bounded "[Tool Results]" observation from result strings +
     parse errors, appending a skipped-calls note when the batch was capped."""
-    parts = list(parts)
+    notices: list[str] = []
     if n_total > MAX_TOOL_CALLS_PER_TURN:
-        parts.append(
+        notices.append(
             f"[Tool note] {n_total - MAX_TOOL_CALLS_PER_TURN} further tool "
             f"call(s) in this reply were NOT run — emit at most "
             f"{MAX_TOOL_CALLS_PER_TURN} tool calls per turn."
         )
     for err in errors:
-        parts.append(f"[Tool error] {err}")
-    obs = "[Tool Results]\n" + ("\n\n".join(parts) if parts else "(no tool output)")
-    if len(obs) > MAX_TOOL_OBS_CHARS:
-        obs = obs[:MAX_TOOL_OBS_CHARS] + "\n… [tool results truncated]"
-    return obs
+        notices.append(f"[Tool error] {err}")
+    # Control-plane notices come first so a large result cannot hide the fact
+    # that later calls were skipped or malformed.
+    sections = notices + list(parts)
+    obs = "[Tool Results]\n" + (
+        "\n\n".join(sections) if sections else "(no tool output)"
+    )
+    return _truncate_with_marker(
+        obs, MAX_TOOL_OBS_CHARS, "\n… [tool results truncated]"
+    )
 
 
 def run_tool_calls(dispatcher: Any, calls: list[dict], errors: list[str]) -> str:

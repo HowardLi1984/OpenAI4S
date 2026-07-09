@@ -146,7 +146,7 @@ success response body. Serializer shapes are in §4.
 | `DELETE /frames/{fid}` | `{"ok":true}`. |
 | `GET /frames/{fid}/messages?from=&limit=` | `{"messages":[{role,content,created_at}…]}`. `from` (default 0) and `limit` (default 300) are real slice parameters here. |
 | `GET /frames/{fid}/steps` | `{"steps":[…]}` (persisted semantic steps). |
-| `POST /frames/{fid}/message` | Starts a turn. Body `{request}` (or `{input_data:{request}}`), optional `model`, `plan`, `explore`, `annotation_ids` (folds pinned image annotations into the prompt). With `wait:false` → `202 {"status":"accepted","frame_id","job_id"}`; default (`wait` omitted/true) **blocks until the turn ends** and returns the turn result `{"status","frame_id","error"?,"job_id"}` where status ∈ `completed|failed|cancelled`. Progress streams over the WebSocket either way. |
+| `POST /frames/{fid}/message` | Starts a turn. Body `{request}` (or `{input_data:{request}}`), optional `model`, `plan`, `explore`, `annotation_ids` (folds pinned image annotations into the prompt). With `wait:false` → `202 {"status":"accepted","frame_id","job_id"}`; default (`wait` omitted/true) **blocks until the turn ends** and returns the turn result `{"status","frame_id","error"?,"job_id"}` where status ∈ `completed|failed|cancelled`. Outside plan mode, only `host.submit_output(...)` completes successfully; exhausting the turn limit without it returns `failed`. Progress streams over the WebSocket either way. |
 | `POST /frames/{fid}/cancel` | `{"ok":true}` (idempotent). |
 | `GET /frames/{fid}/status` | `{"frame_id","running",kernel:{…kernel status…}}`. |
 | `POST /frames/{fid}/feedback` | Body `{key,rating}` → `{"ok":true}`. |
@@ -190,16 +190,17 @@ success response body. Serializer shapes are in §4.
 | `POST /frames/{fid}/kernel/stop` | → `{"ok":true,"state":"stopped"|"none","frame_id"}`. |
 | `POST /frames/{fid}/kernel/start` | → `{"ok":true,"state":"running","generation","frame_id",…}`. |
 | `POST /frames/{fid}/kernel/interrupt` | Best-effort SIGINT → always `{"ok":true}`. |
-| `GET /frames/{fid}/kernel` | Kernel status: `{frame_id,state("none"|"running"|"stopped"),alive,generation,turn_running,cell_count,manual_stop,repl_enabled,env:{name,language,python_version,pending}}`. `repl_enabled` mirrors `OPENAI4S_NOTEBOOK_REPL` (see below). |
+| `GET /frames/{fid}/kernel` | Kernel status: `{frame_id,state("none"|"running"|"stopped"),alive,generation,turn_running,cell_count,manual_stop,repl_enabled,env:{name,language,python_version,pending,kernel_id}}`. `repl_enabled` mirrors `OPENAI4S_NOTEBOOK_REPL` (see below). |
 | `POST /frames/{fid}/kernel/install` | Body `{packages:[…]}` or `{package}` (+`restart`, default true) → pip-install report (`{ok,installed,…,restarted}`). |
 | `GET /frames/{fid}/environments` | `{"environments":[…],"current","default","pending"}`. |
 | `POST /frames/{fid}/kernel/env` | Body `{env}` (or `{name}`) — switches the kernel to a prebuilt env (restart) → `{"ok":true,"state","env","generation","language","python_version","frame_id"}`. |
 
 **Notebook REPL gate:** the Notebook is a **read-only execution trace** by
 default. The mutating `kernel/*` routes — `execute`, `env`, `restart`, `stop`,
-`start`, `interrupt`, `install` — return `403 {"error":…}` unless
-`OPENAI4S_NOTEBOOK_REPL` is set; only the read-only `GET
-/frames/{fid}/kernel` and `GET /frames/{fid}/execution-log` stay available.
+`start`, `interrupt` — return `403 {"error":…}` unless
+`OPENAI4S_NOTEBOOK_REPL` is set. `kernel/install` is intentionally not gated:
+it backs Customize → Compute rather than arbitrary Notebook execution. The
+read-only `GET /frames/{fid}/kernel` and `GET /frames/{fid}/execution-log` stay available.
 `GET /frames/{fid}/kernel` reports the current state in `repl_enabled`.
 
 **`kernel_id` runtime segment:** the `kernel_id` returned by the kernel and
@@ -313,7 +314,7 @@ m.frame_id`.
 | --- | --- | --- |
 | `replay_begin` / `replay_end` | — | Bracket the buffered-event replay after `view_session` mid-turn. |
 | `text_reset` | `frame_id` | Start of a fresh streamed assistant message (clears the live bubble). |
-| `text_chunk` | `frame_id`, `block_type` (`"text"` for prose, `"tool"` for code-cell echo/stdout/errors), `chunk` | Incremental stream. |
+| `text_chunk` | `frame_id`, `block_type` (`"text"` for prose, `"tool"` for code-cell echo/stdout/errors), `chunk`; a code-cell start also carries `cell_index`, canonical `kernel_id`, and `language` | Incremental stream. The frontend uses the start metadata directly so live Notebook grouping matches the persisted execution log without a status-cache race. |
 | `step` | `frame_id`, `step_id`, `kind`, `title`, `input`, `status:"running"` | A semantic step began (host call, artifact save, …). |
 | `step_update` | `frame_id`, `step_id`, `status`, `output`, `summary` | Step finished/patched. Artifact-save steps emit `step`+`step_update` back-to-back. |
 | `plan_ready` | `frame_id`, `plan_id`, `status`, `plan`, `artifact_id` | A plan-mode turn produced a structured plan. |
