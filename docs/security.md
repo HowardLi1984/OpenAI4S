@@ -2,7 +2,7 @@
 
 > ⚠️ Read this before exposing the daemon beyond `localhost`.
 
-The daemon runs agent-authored code with **no OS-level sandbox** (no Seatbelt / bubblewrap) — `kernel/execute`, `compute/jobs`, and `host.bash` are equivalent to a shell on the host. This is fine for a single-user local tool bound to `127.0.0.1` (the default). On top of that, [`openai4s.security`](../openai4s/security) adds defense-in-depth software layers — all **opt-out via env**, all **fail-open** when no base model is set:
+The daemon runs agent-authored code with **no OS-level sandbox** (no Seatbelt / bubblewrap) — `kernel/execute` and `compute/jobs` are equivalent to a shell on the machine (`host.bash` runs *inside* the kernel worker; the host process itself executes only python/R cells). This is fine for a single-user local tool bound to `127.0.0.1` (the default). On top of that, [`openai4s.security`](../openai4s/security) adds defense-in-depth software layers — all **opt-out via env**, all **fail-open** when no base model is set:
 
 | layer | env (default) | what it does |
 |---|---|---|
@@ -10,7 +10,7 @@ The daemon runs agent-authored code with **no OS-level sandbox** (no Seatbelt / 
 | **`dlopen` audit hook** | `OPENAI4S_SAFETY_AUDIT_HOOK` (on) | `sys.addaudithook` refuses `ctypes.dlopen` of a `.so` from an agent-writable path |
 | **Biosecurity screener** | `OPENAI4S_BIOSECURITY` (on) | trajectory screener (ALLOW / ESCALATE / BLOCK) on biosecurity-relevant content |
 | **Injection detector** | `OPENAI4S_INJECTION_SCAN` (on) | annotates tool-returned content (web / PDF / MCP) so the model treats it as **data, not instructions** |
-| **Egress allowlist** | `OPENAI4S_EGRESS` (`off`) | fences `web_fetch` / `web_search` / `bash` to science APIs & package indexes; blocked domains recover via `host.request_network_access(domain=…)`, which **you** approve |
+| **Egress allowlist** | `OPENAI4S_EGRESS` (`off`) | fences `web_fetch` / `web_search` / the kernel-local `host.bash` to science APIs & package indexes; blocked domains recover via `host.request_network_access(domain=…)`, which **you** approve |
 
 Additional enforcement: an opencode-style **permission broker** gates risk-bearing tools, a **secret-file guard** blocks `.env` / `*.key` / `id_rsa` from all file tools, and every file/shell op is **workspace-jailed**.
 
@@ -18,7 +18,7 @@ Additional enforcement: an opencode-style **permission broker** gates risk-beari
 
 The web UI's right-hand Notebook is a **read-only execution trace** by default. The developer REPL — arbitrary kernel code execution from the right panel — is **disabled** and only comes back when you set `OPENAI4S_NOTEBOOK_REPL=1`. With it off, the mutating `kernel/*` routes (`execute`, `env`, `restart`, `stop`, `start`, `interrupt`) return `403`; the classifier note above about "your own Notebook cells" applies only once you have opted the REPL back in. `kernel/install` remains available because it backs Customize → Compute rather than the Notebook REPL.
 
-ReAct **tool calls** — the deterministic `list` / `read` / `glob` / `grep` / `web` / `env` / `edit` / `write` / `bash` ops the model can invoke as ` ```tool ` JSON — route through the **same** `HostDispatcher` as `host.*` cell calls, so they pass the same permission broker, egress fence, injection screen, and pre-exec (dangerous-command) static gate. The ReAct surface adds no bypass around any of these layers.
+ReAct **tool calls** — the deterministic `list` / `read` / `glob` / `grep` / `web` / `env` / `edit` / `write` ops the model can invoke as ` ```tool ` JSON — route through the **same** `HostDispatcher` as `host.*` cell calls, so they pass the same permission broker, egress fence, and injection screen. There is **no shell tool**: shell commands run only inside the kernel via the kernel-local `host.bash`, where the static dangerous-command precheck ([`openai4s/security/shellcheck.py`](../openai4s/security/shellcheck.py)) and the egress scan still apply — on top of the pre-exec classifier that screens the whole cell. The ReAct surface adds no bypass around any of these layers.
 
 ### Secret reads and secret logs
 
