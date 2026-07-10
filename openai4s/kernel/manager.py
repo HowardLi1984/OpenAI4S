@@ -177,6 +177,18 @@ class Kernel:
         except (ProcessLookupError, OSError):
             pass
 
+    def kill_worker(self) -> None:
+        """Kill this exact worker process without spawning or reading frames.
+
+        This is the watchdog's last-resort escape hatch.  Keeping it on the
+        manager avoids callers reaching through the private ``_proc`` field;
+        recovery or abandonment remains the owner's responsibility.
+        """
+        try:
+            self._proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
     def _service_host_call(self, frame: dict) -> None:
         call_id = frame.get("id")
         method = frame.get("method", "")

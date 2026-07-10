@@ -28,7 +28,7 @@ _PACKAGE_EXPORTS = {
     },
     "openai4s.cli": {"main"},
     "openai4s.compute": {"ComputeError", "ComputeManager"},
-    "openai4s.kernel": {"Kernel"},
+    "openai4s.kernel": {"Kernel", "KernelLease", "KernelSupervisor"},
     "openai4s.sdk": {"build_host"},
     "openai4s.security": {
         "Verdict",
