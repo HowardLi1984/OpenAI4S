@@ -60,6 +60,15 @@ from openai4s.server.agent_run import ProseStreamer as _ProseStreamer
 from openai4s.server.agent_run import WebActionExecutor, WebEventSink
 from openai4s.server.artifacts import ArtifactManager
 from openai4s.server.cell_run import CellExecutionPorts, CellExecutionService
+
+# Keep the former gateway helper names as compatibility aliases; plan behavior
+# itself now lives together in PlanService.
+from openai4s.server.plans import PlanService
+from openai4s.server.plans import extract_plan_json as _extract_plan_json
+from openai4s.server.plans import normalize_plan as _normalize_plan
+from openai4s.server.plans import public_plan as _plan_public
+from openai4s.server.plans import short_hash as _short_hash
+from openai4s.server.plans import slugify as _slugify
 from openai4s.skills_loader import SkillLoader
 from openai4s.store import Store, get_store
 from openai4s.tools import control_tool_specs
@@ -888,6 +897,11 @@ class SessionRunner:
             environment_snapshot=_environment_snapshot,
             guess_content_type=_guess_ctype,
             checksum=_sha256,
+        )
+        self.plans = PlanService(
+            store=self.store,
+            emitter_for=lambda root_frame_id: self.hub.emitter(root_frame_id),
+            run_message=lambda *args, **kwargs: self.run_message(*args, **kwargs),
         )
         self.cells = CellExecutionService(
             CellExecutionPorts(
@@ -2989,201 +3003,29 @@ class SessionRunner:
 
     # -- structured plan: capture / persist / approve / revise / discard ----
     def _finalize_plan(self, st: SessionState, reply: str, prose: str, emit) -> None:
-        """Called at the end of a plan-mode turn: extract the structured plan
-        from the model reply, upsert the plan row (+ a plan_*.json artifact) and
-        emit `plan_ready`."""
-        rid = st.root_frame_id
-        raw = _extract_plan_json(reply)
-        task_hint = ""
-        for m in reversed(st.messages):
-            if m.get("role") == "user":
-                task_hint = re.sub(r"\s+", " ", str(m.get("content") or "")).strip()
-                break
-        plan = _normalize_plan(raw, prose, task_hint)
-        if not plan["steps"]:
-            # nothing parseable — leave the prose plan as-is (legacy fallback card)
-            return
-        prev = self.store.get_plan_by_frame(rid)
-        reuse = prev if (prev and prev.get("status") == "draft") else None
-        art = self._write_plan_artifact(
-            st, plan, reuse.get("artifact_id") if reuse else None, emit
-        )
-        art_id = (
-            art.get("artifact_id")
-            if art
-            else (reuse.get("artifact_id") if reuse else None)
-        )
-        if reuse:
-            self.store.update_plan(
-                reuse["plan_id"],
-                title=plan["title"],
-                rationale=plan["rationale"],
-                confidence=plan["confidence"],
-                steps=plan["steps"],
-                status="draft",
-                step_status={},
-                artifact_id=art_id,
-            )
-            row = self.store.get_plan(reuse["plan_id"])
-        else:
-            row = self.store.create_plan(
-                frame_id=rid,
-                project_id=st.project_id,
-                title=plan["title"],
-                rationale=plan["rationale"],
-                confidence=plan["confidence"],
-                steps=plan["steps"],
-                artifact_id=art_id,
-                status="draft",
-            )
-        self._emit_plan_ready(emit, rid, row)
+        self.plans.finalize(st, reply, prose, emit)
 
     def _write_plan_artifact(
         self, st: SessionState, plan: dict, artifact_id: str | None, emit
     ) -> dict | None:
-        """Write the plan as plan_<slug>_<id>.json into the workspace and record
-        it as a (versioned) artifact so it shows up in Files, like the reference."""
-        try:
-            if artifact_id:
-                existing = self.store.get_artifact(artifact_id) or {}
-                filename = existing.get("filename") or (
-                    f"plan_{_slugify(plan['title'])}_{_short_hash(st.root_frame_id)}.json"
-                )
-            else:
-                filename = f"plan_{_slugify(plan['title'])}_{_short_hash(st.root_frame_id)}.json"
-            body = json.dumps(
-                {
-                    "title": plan["title"],
-                    "rationale": plan["rationale"],
-                    "confidence": plan["confidence"],
-                    "steps": plan["steps"],
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            path = st.workspace / filename
-            path.write_text(body, encoding="utf-8")
-            data = body.encode("utf-8")
-            rec = self.store.save_artifact(
-                path=str(path),
-                filename=filename,
-                content_type="application/json",
-                size_bytes=len(data),
-                checksum=hashlib.sha256(data).hexdigest(),
-                frame_id=st.root_frame_id,
-                project_id=st.project_id,
-                artifact_id=artifact_id,
-            )
-            emit(
-                {
-                    "type": "artifact_created",
-                    "frame_id": st.root_frame_id,
-                    "artifact_id": rec.get("artifact_id"),
-                    "filename": filename,
-                }
-            )
-            return rec
-        except Exception:  # noqa: BLE001 — the artifact is a nicety, not required
-            traceback.print_exc()
-            return None
+        return self.plans.write_artifact(st, plan, artifact_id, emit)
 
     def _emit_plan_ready(self, emit, rid: str, plan: dict | None) -> None:
-        pub = _plan_public(plan)
-        if pub is None:
-            return
-        emit(
-            {
-                "type": "plan_ready",
-                "frame_id": rid,
-                "plan_id": pub.get("plan_id"),
-                "status": pub.get("status"),
-                "plan": pub,
-                "artifact_id": pub.get("artifact_id"),
-            }
-        )
+        self.plans.emit_ready(emit, rid, plan)
 
     def get_plan_state(self, root_frame_id: str) -> dict:
-        plan = self.store.get_plan_by_frame(root_frame_id)
-        pub = _plan_public(plan)
-        return {
-            "frame_id": root_frame_id,
-            "plan_id": pub.get("plan_id") if pub else None,
-            "status": pub.get("status") if pub else None,
-            "plan": pub,
-        }
+        return self.plans.get_state(root_frame_id)
 
     def discard_plan(self, root_frame_id: str) -> dict:
-        plan = self.store.get_plan_by_frame(root_frame_id)
-        if not plan:
-            return {"ok": False, "error": "no plan for this session"}
-        self.store.update_plan(plan["plan_id"], status="discarded")
-        emit = self.hub.emitter(root_frame_id)
-        self._emit_plan_ready(emit, root_frame_id, self.store.get_plan(plan["plan_id"]))
-        return {"ok": True, "plan_id": plan["plan_id"], "status": "discarded"}
+        return self.plans.discard(root_frame_id)
 
     def _plan_exec_seed(self, plan: dict) -> str:
-        lines = []
-        for i, s in enumerate(plan.get("steps") or []):
-            deliv = "、".join(s.get("deliverables") or []) or "（无指定文件）"
-            lines.append(
-                f"- [{s.get('id') or ('s' + str(i + 1))}] {s.get('title', '')}"
-                f"：{s.get('detail', '')}  → 产出：{deliv}"
-            )
-        steps_txt = "\n".join(lines)
-        return (
-            f"已批准计划「{plan.get('title', '')}」，现在开始自动执行。\n\n"
-            "请严格按下面的步骤顺序推进：\n" + steps_txt + "\n\n"
-            "执行规则：\n"
-            '1. 每开始一个步骤前，先调用 host.plan_update("<step_id>", '
-            '"in_progress")（这会把计划卡上的该步标记为进行中）。\n'
-            "2. 该步骤列出的产物文件全部写好后，调用 "
-            'host.plan_update("<step_id>", "completed")。若某步确实无法完成，'
-            '调用 host.plan_update("<step_id>", "failed", note="原因") 后继续下一步。\n'
-            "3. 按顺序逐步推进，把每一步的结果文件写到工作目录（会自动成为产物）。\n"
-            "4. 严格遵守我在原始任务中提出的所有约束（例如：最终总结里不要对大于约 "
-            "1MB 的原始数据文件使用 Markdown 链接，只按文件名引用）。\n"
-            "5. 全部完成后写一段简洁的最终总结，并调用 host.submit_output(...)。"
-        )
+        return self.plans.execution_seed(plan)
 
     def run_plan_execution(
         self, root_frame_id: str, project_id: str, model: str | None = None
     ) -> dict:
-        """Approve → auto-execute: work the plan's steps in order (the agent ticks
-        each via host.plan_update). Runs a normal execution turn seeded with the
-        approved plan; marks the plan completed/failed at the end."""
-        plan = self.store.get_plan_by_frame(root_frame_id)
-        if not plan:
-            return {
-                "status": "failed",
-                "frame_id": root_frame_id,
-                "error": "no plan to approve",
-            }
-        if plan.get("status") in ("executing", "completed"):
-            return {
-                "status": "failed",
-                "frame_id": root_frame_id,
-                "error": f"plan already {plan['status']}",
-            }
-        emit = self.hub.emitter(root_frame_id)
-        self.store.update_plan(plan["plan_id"], status="executing")
-        self._emit_plan_ready(emit, root_frame_id, self.store.get_plan(plan["plan_id"]))
-        seed = self._plan_exec_seed(plan)
-        result = self.run_message(root_frame_id, project_id, seed, model, plan=False)
-        final = (
-            "completed"
-            if result.get("status") == "completed"
-            else (
-                "failed"
-                if result.get("status") == "failed"
-                else self.store.get_plan(plan["plan_id"]).get("status") or "completed"
-            )
-        )
-        if final in ("completed", "failed"):
-            self.store.update_plan(plan["plan_id"], status=final)
-        self._emit_plan_ready(emit, root_frame_id, self.store.get_plan(plan["plan_id"]))
-        result["plan_id"] = plan["plan_id"]
-        result["plan_status"] = final
-        return result
+        return self.plans.run_execution(root_frame_id, project_id, model)
 
     def run_plan_revision(
         self,
@@ -3192,15 +3034,7 @@ class SessionRunner:
         changes: str,
         model: str | None = None,
     ) -> dict:
-        """Describe-changes → regenerate the plan (a fresh plan-mode turn seeded
-        with the user's feedback). Emits a new plan_ready(draft)."""
-        seed = (
-            "请根据下面的修改意见，重新拟定上面的执行计划，并再次只输出："
-            "一段简短的方案说明（散文）＋ 一个 ```json 代码块（"
-            "{title, rationale, confidence, steps:[{id,title,detail,deliverables}]} "
-            "结构，与之前一致）。不要执行、不要调用任何工具。\n\n修改意见：" + changes
-        )
-        return self.run_message(root_frame_id, project_id, seed, model, plan=True)
+        return self.plans.run_revision(root_frame_id, project_id, changes, model)
 
     def submit_plan_approval(
         self, root_frame_id: str, project_id: str, model: str | None = None
@@ -3290,175 +3124,6 @@ class SessionRunner:
                     "files_read": [],
                 }
             }
-
-
-# --------------------------------------------------------------------------- #
-#  Structured plan helpers (plan mode → review card → auto-execute)
-# --------------------------------------------------------------------------- #
-def _short_hash(text: str) -> str:
-    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:8]
-
-
-def _slugify(text: str, maxlen: int = 44) -> str:
-    s = re.sub(r"[^\w\s-]", "", (text or "").lower())
-    s = re.sub(r"[\s_-]+", "-", s).strip("-")
-    return s[:maxlen].strip("-") or "plan"
-
-
-def _try_json(s: str):
-    try:
-        return json.loads((s or "").strip())
-    except (ValueError, TypeError):
-        return None
-
-
-def _first_json_object(text: str):
-    """Return the first balanced {...} object in `text` that parses, else None."""
-    start = (text or "").find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        c = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-            continue
-        if c == '"':
-            in_str = True
-        elif c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return _try_json(text[start : i + 1])
-    return None
-
-
-def _extract_plan_json(reply: str):
-    """Pull a structured plan object out of a plan-mode reply. Prefers a ```json
-    fenced block; falls back to any plan-shaped fenced block, then a bare {...}."""
-    if not reply:
-        return None
-    for m in re.finditer(r"```json\s*\n(.*?)```", reply, re.DOTALL | re.IGNORECASE):
-        obj = _try_json(m.group(1))
-        if isinstance(obj, dict) and ("steps" in obj or "title" in obj):
-            return obj
-    for m in re.finditer(r"```[a-zA-Z0-9]*\s*\n(.*?)```", reply, re.DOTALL):
-        obj = _try_json(m.group(1))
-        if isinstance(obj, dict) and "steps" in obj:
-            return obj
-    obj = _first_json_object(reply)
-    if isinstance(obj, dict) and "steps" in obj:
-        return obj
-    return None
-
-
-_PLAN_NUM_LINE_RE = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+(.*)$")
-
-
-def _steps_from_prose(prose: str) -> list[dict]:
-    """Last-resort: turn a numbered/bulleted prose list into plan steps."""
-    steps: list[dict] = []
-    for line in (prose or "").splitlines():
-        m = _PLAN_NUM_LINE_RE.match(line)
-        if not m:
-            continue
-        txt = m.group(1).strip()
-        txt = re.sub(r"^\*\*(.+?)\*\*", r"\1", txt)  # drop leading bold
-        if not txt:
-            continue
-        head = re.split(r"\s[—:：-]\s", txt, maxsplit=1)
-        steps.append(
-            {
-                "id": f"s{len(steps) + 1}",
-                "title": head[0].strip()[:120],
-                "detail": (head[1].strip() if len(head) > 1 else ""),
-                "deliverables": [],
-            }
-        )
-        if len(steps) >= 24:
-            break
-    return steps
-
-
-def _normalize_plan(raw, prose: str = "", task_hint: str = "") -> dict:
-    """Coerce a loose/extracted plan into the canonical shape."""
-    raw = raw if isinstance(raw, dict) else {}
-    steps: list[dict] = []
-    src = raw.get("steps")
-    if isinstance(src, list):
-        for i, s in enumerate(src):
-            if isinstance(s, str):
-                s = {"title": s}
-            if not isinstance(s, dict):
-                continue
-            deliv = s.get("deliverables") or s.get("outputs") or s.get("files") or []
-            if isinstance(deliv, str):
-                deliv = [deliv]
-            steps.append(
-                {
-                    "id": str(s.get("id") or f"s{i + 1}"),
-                    "title": (
-                        str(
-                            s.get("title") or s.get("content") or s.get("name") or ""
-                        ).strip()
-                        or f"Step {i + 1}"
-                    ),
-                    "detail": str(
-                        s.get("detail")
-                        or s.get("description")
-                        or s.get("summary")
-                        or ""
-                    ).strip(),
-                    "deliverables": [str(d) for d in deliv if d],
-                }
-            )
-    if not steps:
-        steps = _steps_from_prose(prose)
-    conf = raw.get("confidence")
-    if isinstance(conf, (int, float)):
-        conf = "high" if conf >= 0.75 else "low" if conf < 0.4 else "medium"
-    conf = (str(conf).strip() or None) if conf is not None else None
-    return {
-        "title": (
-            str(raw.get("title") or "").strip()
-            or (task_hint[:80] if task_hint else "")
-            or "执行计划"
-        ),
-        "rationale": str(raw.get("rationale") or raw.get("reasoning") or "").strip(),
-        "confidence": conf,
-        "steps": steps,
-    }
-
-
-def _plan_public(plan) -> dict | None:
-    """Public view of a stored plan: fold live step_status into steps[].status."""
-    if not plan:
-        return None
-    ss = plan.get("step_status") or {}
-    steps = []
-    for s in plan.get("steps") or []:
-        d = dict(s)
-        d["status"] = (
-            (ss.get(s.get("id")) or {}).get("status") or s.get("status") or "pending"
-        )
-        steps.append(d)
-    return {
-        "plan_id": plan.get("plan_id"),
-        "title": plan.get("title"),
-        "rationale": plan.get("rationale"),
-        "confidence": plan.get("confidence"),
-        "steps": steps,
-        "status": plan.get("status"),
-        "artifact_id": plan.get("artifact_id"),
-    }
 
 
 # --------------------------------------------------------------------------- #
