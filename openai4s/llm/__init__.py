@@ -11,6 +11,25 @@ from typing import Any
 import openai4s.llm.transport as transport
 from openai4s.config import LLMConfig
 
+from .capabilities import (
+    CapabilityCacheInfo,
+    CapabilityError,
+    CostMetadata,
+    ModelCapabilities,
+    ProviderCapabilities,
+    UsageMapping,
+    bind_provider_registry,
+    capability_cache_info,
+    clear_capability_cache,
+    clear_capability_overrides,
+    get_model_capabilities,
+    get_provider_capabilities,
+    model_capabilities,
+    normalize_usage,
+    provider_capabilities,
+    set_capability_override,
+    validate_model_request,
+)
 from .client import ARK_PLAN_MODELS, PROVIDERS
 from .client import chat as _client_chat
 from .client import provider_spec, supports_vision
@@ -21,11 +40,28 @@ ANTHROPIC_VERSION = _ANTHROPIC_VERSION
 
 __all__ = [
     "ARK_PLAN_MODELS",
+    "CapabilityCacheInfo",
+    "CapabilityError",
+    "CostMetadata",
     "LLMError",
+    "ModelCapabilities",
     "PROVIDERS",
+    "ProviderCapabilities",
+    "UsageMapping",
+    "bind_provider_registry",
+    "capability_cache_info",
     "chat",
+    "clear_capability_cache",
+    "clear_capability_overrides",
+    "get_model_capabilities",
+    "get_provider_capabilities",
+    "model_capabilities",
+    "normalize_usage",
     "provider_spec",
+    "provider_capabilities",
+    "set_capability_override",
     "supports_vision",
+    "validate_model_request",
 ]
 
 

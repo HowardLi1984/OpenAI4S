@@ -132,13 +132,10 @@ def _chat_responses(
             if isinstance(response.get("output"), list):
                 state["completed_output"] = response["output"]
             u = response.get("usage") or {}
-            state["usage"] = {
-                "prompt_tokens": u.get("input_tokens"),
-                "completion_tokens": u.get("output_tokens"),
-                "total_tokens": u.get("total_tokens"),
-                "input_tokens": u.get("input_tokens"),
-                "output_tokens": u.get("output_tokens"),
-            }
+            # Preserve the native detail objects here; the provider-neutral
+            # client maps them after the wire call.  Flattening at this layer
+            # would discard cached/reasoning counters before normalization.
+            state["usage"] = dict(u)
         elif t == "response.incomplete":
             response = evt.get("response") or {}
             details = response.get("incomplete_details") or {}

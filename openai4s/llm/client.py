@@ -6,49 +6,21 @@ from typing import Any
 
 from openai4s.config import LLMConfig
 
+from .capabilities import (
+    bind_provider_registry,
+    get_model_capabilities,
+    legacy_provider_specs,
+    normalize_usage,
+)
 from .messages import _is_parts
 from .models import LLMError
 from .providers import _WIRE_DISPATCH
 from .tooling import _canonical_tool_specs
 
-PROVIDERS: dict[str, dict[str, Any]] = {
-    # Volcengine Ark "plan" gateway (火山方舟) — one OpenAI-compatible endpoint that
-    # fronts many model families (doubao / glm / kimi / deepseek / minimax). Pick
-    # the concrete model per config/profile; the key + endpoint are shared.
-    "ark": {
-        "wire": "openai",
-        "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
-        "model": "doubao-seed-2.0-pro",
-        "vision": True,
-    },
-    # Official first-party endpoints for the frontier labs.
-    "chatgpt": {
-        "wire": "openai",
-        "base_url": "https://api.openai.com/v1",
-        "model": "gpt-5",
-        "vision": True,
-    },
-    "openai_responses": {
-        "wire": "responses",
-        "base_url": "https://api.openai.com/v1",
-        "model": "gpt-5",
-        # The Responses wire is currently text/tool only. Marking this false
-        # prevents the adapter from silently flattening image parts.
-        "vision": False,
-    },
-    "claude": {
-        "wire": "anthropic",
-        "base_url": "https://api.anthropic.com",
-        "model": "claude-sonnet-4-5",
-        "vision": True,
-    },
-    "gemini": {
-        "wire": "gemini",
-        "base_url": "https://generativelanguage.googleapis.com",
-        "model": "gemini-2.5-flash",
-        "vision": True,
-    },
-}
+# Keep the original mutable registry shape as a compatibility facade.  The
+# immutable, queryable source of truth lives in ``llm.capabilities``.
+PROVIDERS: dict[str, dict[str, Any]] = legacy_provider_specs()
+bind_provider_registry(PROVIDERS)
 
 # Model ids served by the Ark plan/v3 gateway (all share the `ark` provider's
 # endpoint + key). Surfaced as ready-to-pick model profiles in Customize → Models.
@@ -77,12 +49,17 @@ def provider_spec(name: str) -> dict[str, Any]:
 
 
 def supports_vision(provider: str) -> bool:
-    return bool(provider_spec(provider).get("vision"))
+    # Resolve through the capability layer so a deployment override is honored;
+    # keep provider_spec's historical LLMError for unknown names.
+    provider_spec(provider)
+    return get_model_capabilities(provider).vision
 
 
-def _guard_vision(provider: str, messages: list[dict]) -> None:
+def _guard_vision(
+    provider: str, messages: list[dict], *, capabilities=None
+) -> None:
     """Raise a clear error if image parts are sent to a text-only provider."""
-    if supports_vision(provider):
+    if (capabilities or get_model_capabilities(provider)).vision:
         return
     for message in messages:
         if _is_parts(message.get("content")) and any(
@@ -118,9 +95,12 @@ def chat(
             f"See .env.example."
         )
     spec = provider_spec(cfg.provider)
-    _guard_vision(cfg.provider, messages)
     base = cfg.base_url or spec["base_url"]
     model = cfg.model or spec["model"]
+    capabilities = get_model_capabilities(
+        cfg.provider, model, base_url=base
+    )
+    _guard_vision(cfg.provider, messages, capabilities=capabilities)
     wire = spec["wire"]
     caller = _WIRE_DISPATCH[wire]
     canonical_tools = _canonical_tool_specs(tools)
@@ -129,7 +109,7 @@ def chat(
         transport_args["post_json"] = post_json
     elif wire in ("anthropic", "gemini"):
         transport_args = {"post_json": post_json}
-    return caller(
+    reply = caller(
         messages,
         cfg,
         base,
@@ -143,3 +123,7 @@ def chat(
         parallel_tool_calls=parallel_tool_calls,
         **transport_args,
     )
+    reply["usage"] = normalize_usage(
+        reply.get("usage"), capabilities.usage_mapping
+    )
+    return reply

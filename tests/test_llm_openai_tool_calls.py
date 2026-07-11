@@ -341,7 +341,16 @@ def test_openai_chat_sse_aggregates_interleaved_calls_losslessly(monkeypatch):
         "role": "assistant", "content": "Checking now.", "tool_calls": raw_calls
     }})
     assert result["reasoning"] is None
-    assert result["usage"] == {"prompt_tokens": 20, "completion_tokens": 9}
+    assert result["usage"] == {
+        "input_tokens": 20,
+        "output_tokens": 9,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning_tokens": 0,
+        "prompt_tokens": 20,
+        "completion_tokens": 9,
+        "total_tokens": 29,
+    }
     assert result["finish_reason"] == "tool_calls" and result["raw"] is None
 
 
