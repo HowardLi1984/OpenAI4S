@@ -221,7 +221,12 @@ def test_stop_child_interrupts_exact_foreground_kernel_and_engine_cancels(monkey
     assert engine_results[0]["stop_reason"] == "cancelled"
     assert len(_FakeKernel.instances) == 1
     assert _FakeKernel.instances[0].interrupt_calls == 1
-    assert len(_FakeKernel.instances[0].action_codes) == 1
+    model_cells = [
+        code
+        for code in _FakeKernel.instances[0].action_codes
+        if "long scientific cell" in code
+    ]
+    assert model_cells == ["print('long scientific cell')\n"]
 
 
 def test_late_model_reply_after_stop_cannot_execute_or_submit(monkeypatch):
@@ -266,12 +271,10 @@ def test_late_model_reply_after_stop_cannot_execute_or_submit(monkeypatch):
     assert result["stop_reason"] == "stopped"
     assert result["output"] is None
     assert model_calls == ["started"]
-    # A capability-scoped skill bootstrap may already have run as a system
-    # cell.  Cancellation must still prevent the late model-authored action.
-    assert not any(
-        "host.submit_output" in code
-        for code in _FakeKernel.instances[0].action_codes
-    )
+    # The CLI/delegation Python worker is lazy: cancellation while the model is
+    # still in flight must not even create a worker, much less run the late
+    # model-authored submit cell.
+    assert _FakeKernel.instances == []
 
 
 def test_parent_stop_propagates_to_running_descendants(monkeypatch):

@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol
 
 from openai4s.agent.compaction import estimate_context
-from openai4s.llm import get_model_capabilities
+from openai4s.llm.capabilities import get_model_capabilities
 
 
 class WorkbenchStore(Protocol):
