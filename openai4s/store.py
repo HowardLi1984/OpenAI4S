@@ -38,6 +38,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from openai4s.storage.annotations import AnnotationRepository
 from openai4s.storage.plans import PlanRepository
 
 _SCHEMA = """
@@ -457,6 +458,11 @@ class Store:
         self._conn.commit()
         self._migrate()
         self._plans = PlanRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._annotations = AnnotationRepository(
             self._conn,
             self._lock,
             clock_ms=lambda: _now_ms(),
@@ -2441,46 +2447,17 @@ class Store:
         rel_y: float,
         body: str,
     ) -> dict:
-        """Pin a comment to a point (rel_x, rel_y ∈ [0,1]) on an image artifact.
-        The pin `number` is the next ordinal within (frame, artifact)."""
-        aid = f"an-{uuid.uuid4().hex[:12]}"
-        now = _now_ms()
-        rel_x = max(0.0, min(1.0, float(rel_x)))
-        rel_y = max(0.0, min(1.0, float(rel_y)))
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COALESCE(MAX(number),0) AS n FROM annotations "
-                "WHERE root_frame_id=? AND artifact_id=?",
-                (root_frame_id, artifact_id),
-            ).fetchone()
-            number = int(row["n"]) + 1
-            self._conn.execute(
-                "INSERT INTO annotations(annotation_id,root_frame_id,artifact_id,"
-                "artifact_name,rel_x,rel_y,number,body,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    aid,
-                    root_frame_id,
-                    artifact_id,
-                    artifact_name,
-                    rel_x,
-                    rel_y,
-                    number,
-                    body,
-                    "open",
-                    now,
-                    now,
-                ),
-            )
-            self._conn.commit()
-        return self.get_annotation(aid)
+        return self._annotations.add(
+            root_frame_id=root_frame_id,
+            artifact_id=artifact_id,
+            artifact_name=artifact_name,
+            rel_x=rel_x,
+            rel_y=rel_y,
+            body=body,
+        )
 
     def get_annotation(self, annotation_id: str) -> dict | None:
-        with self._lock:
-            r = self._conn.execute(
-                "SELECT * FROM annotations WHERE annotation_id=?", (annotation_id,)
-            ).fetchone()
-        return dict(r) if r else None
+        return self._annotations.get(annotation_id)
 
     def list_annotations(
         self,
@@ -2489,53 +2466,26 @@ class Store:
         artifact_id: str | None = None,
         status: str | None = None,
     ) -> list[dict]:
-        sql = "SELECT * FROM annotations WHERE root_frame_id=?"
-        params: list = [root_frame_id]
-        if artifact_id:
-            sql += " AND artifact_id=?"
-            params.append(artifact_id)
-        if status:
-            sql += " AND status=?"
-            params.append(status)
-        sql += " ORDER BY artifact_id, number"
-        with self._lock:
-            rows = self._conn.execute(sql, tuple(params)).fetchall()
-        return [dict(r) for r in rows]
+        return self._annotations.list_for_frame(
+            root_frame_id,
+            artifact_id=artifact_id,
+            status=status,
+        )
 
     def update_annotation(
         self, annotation_id: str, *, body: str | None = None, status: str | None = None
     ) -> dict | None:
-        sets, params = [], []
-        if body is not None:
-            sets.append("body=?")
-            params.append(body)
-        if status is not None:
-            sets.append("status=?")
-            params.append(status)
-        if not sets:
-            return self.get_annotation(annotation_id)
-        sets.append("updated_at=?")
-        params.append(_now_ms())
-        params.append(annotation_id)
-        self._exec(
-            f"UPDATE annotations SET {','.join(sets)} WHERE annotation_id=?",
-            tuple(params),
+        return self._annotations.update(
+            annotation_id,
+            body=body,
+            status=status,
         )
-        return self.get_annotation(annotation_id)
 
     def mark_annotations_sent(self, annotation_ids: list[str]) -> None:
-        ids = [a for a in (annotation_ids or []) if a]
-        if not ids:
-            return
-        qmarks = ",".join("?" * len(ids))
-        self._exec(
-            f"UPDATE annotations SET status='sent', updated_at={_now_ms()} "
-            f"WHERE annotation_id IN ({qmarks}) AND status='open'",
-            tuple(ids),
-        )
+        self._annotations.mark_sent(annotation_ids)
 
     def delete_annotation(self, annotation_id: str) -> None:
-        self._exec("DELETE FROM annotations WHERE annotation_id=?", (annotation_id,))
+        self._annotations.delete(annotation_id)
 
     # --- global search (command palette) --------------------------------
     def search(self, query: str, limit: int = 20) -> dict:
