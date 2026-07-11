@@ -241,6 +241,11 @@ These routes are thin Gateway adapters over `SessionDomainService` and
 | `GET /renderers` | Safe scientific renderer descriptor catalog. |
 | `GET /artifacts/{aid}/renderer?version=&root_frame_id=` | Selects a version-bound renderer descriptor plus immutable checksum/size/provenance metadata; it never executes Artifact content. |
 
+The Timeline UI requests the latest 500 records first. When `has_earlier` is
+true it exposes an explicit control that requests
+`before_ordinal=<first_ordinal>&limit=500`, merges by durable group identity,
+and keeps a maximum of 2,000 records without dropping the latest window.
+
 The Notebook header and provenance execution view link the bundle form of the
 Notebook export route. Language-specific Python/R files remain directly
 available through the query parameter.

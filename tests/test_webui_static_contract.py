@@ -330,13 +330,37 @@ def test_notebook_retry_projection_is_expandable_and_keeps_raw_attempts() -> Non
 
 def test_action_timeline_is_a_safe_allowlisted_projection() -> None:
     sanitizer = _extract_js_function(APP_JS, "sanitizeActionTimeline")
+    merger = _extract_js_function(APP_JS, "mergeActionTimelines")
+    earlier = _extract_js_function(APP_JS, "loadEarlierActionTimeline")
+    loader = _extract_js_function(APP_JS, "loadWorkbenchState")
     card = _extract_js_function(APP_JS, "actionTimelineCard")
     renderer = _extract_js_function(APP_JS, "renderActionTimeline")
     events = _extract_js_function(APP_JS, "onEvent")
 
     assert "dock-timeline" in INDEX_HTML
     assert "action_timeline" in events and "action-timeline" in events
-    assert ".slice(-500)" in sanitizer
+    assert "ACTION_TIMELINE_PAGE_SIZE = 500" in APP_JS
+    assert "ACTION_TIMELINE_MAX_GROUPS = 2000" in APP_JS
+    assert ".slice(-ACTION_TIMELINE_PAGE_SIZE)" in sanitizer
+    for field in ("first_ordinal", "last_ordinal", "has_more_before", "has_more_after"):
+        assert field in sanitizer
+    assert "new Map()" in merger
+    assert "deduped.set(key(group), group)" in merger
+    assert "(incoming.groups || []).concat(current.groups || [])" in merger
+    assert "(current.groups || []).concat(incoming.groups || [])" in merger
+    assert "all.slice(-ACTION_TIMELINE_MAX_GROUPS)" in merger
+    assert 'direction === "before"' in merger
+    assert "currentFirst <= incomingFirst" in merger
+    assert "first_ordinal: groups.length ? groups[0].ordinal : null" in merger
+    assert 'mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(timeline), "latest")' in loader
+    assert 'mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(m), "latest")' in events
+    assert "before_ordinal=${first}&limit=${ACTION_TIMELINE_PAGE_SIZE}" in earlier
+    assert 'mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(page), "before")' in earlier
+    assert "if (timeline.has_more_before)" in renderer
+    assert 'data-action", "load-earlier-timeline"' in renderer
+    assert 't(loading ? "timeline.loadingEarlier" : "timeline.loadEarlier")' in renderer
+    assert "workbenchErrors.timelineHistory" in renderer
+    assert APP_JS.count('"timeline.loadEarlier"') >= 2
     for kind in (
         "native_tool",
         "python",

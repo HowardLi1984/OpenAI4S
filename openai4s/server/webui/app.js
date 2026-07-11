@@ -84,7 +84,7 @@ const S = { projects: [], sessions: [], project: null, currentId: null, ws: null
   // provider wire payloads or raw tool arguments in browser state.
   actionTimeline: null, executionQueue: null, executionIdentity: null, recoveryState: null,
   branchState: null, contextState: null, securityState: null,
-  workbenchErrors: {}, _workbenchReq: 0 };
+  workbenchErrors: {}, _workbenchReq: 0, _timelineHistoryReq: 0, _timelineHistoryLoading: null };
 const ac = { open: false, items: [], idx: 0, trigger: "", start: 0 };
 const TOOL_LABELS = { run_python: "toolLabel.runPython", run_bash: "toolLabel.runBash", search_skills: "toolLabel.searchSkills", read_skill: "toolLabel.readSkill", write_file: "toolLabel.writeFile", read_file: "toolLabel.readFile", list_files: "toolLabel.listFiles", delegate: "toolLabel.delegate" };
 
@@ -528,6 +528,10 @@ Object.assign(I18N.zh, {
   "timeline.subtitle": "来自持久 Action Ledger 的安全投影；不显示原始参数、wire state 或 token。",
   "timeline.refresh": "刷新",
   "timeline.loading": "正在读取行动记录…",
+  "timeline.loadEarlier": "加载更早记录",
+  "timeline.loadingEarlier": "正在加载更早记录…",
+  "timeline.loadEarlierFailed": "无法加载更早记录：{0}",
+  "timeline.historyLimit": "已显示最近 {0} 条记录；为保持页面流畅，不能继续向前加载。",
   "timeline.empty": "还没有可显示的行动。Notebook 仅保留科研 cell，完整控制流程会出现在这里。",
   "timeline.owner": "Owner",
   "timeline.permission": "权限",
@@ -1205,6 +1209,10 @@ Object.assign(I18N.en, {
   "timeline.subtitle": "Safe projection of the durable Action Ledger; raw arguments, wire state and tokens are never shown.",
   "timeline.refresh": "Refresh",
   "timeline.loading": "Loading actions…",
+  "timeline.loadEarlier": "Load earlier actions",
+  "timeline.loadingEarlier": "Loading earlier actions…",
+  "timeline.loadEarlierFailed": "Could not load earlier actions: {0}",
+  "timeline.historyLimit": "Showing the most recent {0} actions; earlier loading is capped to keep this view responsive.",
   "timeline.empty": "No actions to show yet. Notebook keeps scientific cells; the full control flow appears here.",
   "timeline.owner": "Owner",
   "timeline.permission": "Permission",
@@ -1600,11 +1608,16 @@ function publicArtifacts(result) {
   };
   walk(result, 0); return found;
 }
+const ACTION_TIMELINE_PAGE_SIZE = 500;
+const ACTION_TIMELINE_MAX_GROUPS = 2000;
+function timelineOrdinal(value) {
+  return value !== null && value !== "" && Number.isFinite(Number(value)) ? Number(value) : null;
+}
 function sanitizeActionTimeline(payload) {
   const source = payload && (payload.timeline || payload.payload || payload);
-  const groups = ((source && source.groups) || []).slice(-500).map(group => ({
+  const groups = ((source && source.groups) || []).slice(-ACTION_TIMELINE_PAGE_SIZE).map(group => ({
     group_id: publicText(group.group_id, 96), branch_id: publicText(group.branch_id, 96),
-    turn_id: publicText(group.turn_id, 96), ordinal: Number.isFinite(+group.ordinal) ? +group.ordinal : null,
+    turn_id: publicText(group.turn_id, 96), ordinal: timelineOrdinal(group.ordinal),
     kind: publicText(group.kind, 48), language: publicText(group.language, 24), provider: publicText(group.provider, 48), model: publicText(group.model, 96),
     title: publicText(group.title, 260), status: publicText(group.status, 32), owner: publicText(group.owner || group.owner_kind, 80),
     permission: publicText(group.permission || group.permission_state, 80), replay_policy: publicText(group.replay_policy, 48),
@@ -1625,13 +1638,61 @@ function sanitizeActionTimeline(payload) {
       replayed_from_cell_id: publicText(attempt.replayed_from_cell_id, 96)
     }))
   }));
+  const firstOrdinal = timelineOrdinal(source && source.first_ordinal);
+  const lastOrdinal = timelineOrdinal(source && source.last_ordinal);
+  const hasMoreBefore = !!(source && (source.has_more_before || source.has_earlier));
+  const hasMoreAfter = !!(source && (source.has_more_after || source.has_more));
   return {
     root_frame_id: publicText(source && source.root_frame_id, 96),
     branch_id: publicText(source && source.branch_id, 96), groups,
     count: Number.isFinite(+(source && source.count)) ? +(source && source.count) : groups.length,
     total_count: Number.isFinite(+(source && source.total_count)) ? +(source && source.total_count) : groups.length,
-    truncated: !!(source && source.truncated), has_earlier: !!(source && source.has_earlier), has_more: !!(source && source.has_more),
-    last_ordinal: source && source.last_ordinal, running: !!(source && source.running)
+    truncated: !!(source && source.truncated),
+    has_more_before: hasMoreBefore, has_more_after: hasMoreAfter,
+    has_earlier: hasMoreBefore, has_more: hasMoreAfter,
+    first_ordinal: firstOrdinal != null ? firstOrdinal : (groups[0] && groups[0].ordinal),
+    last_ordinal: lastOrdinal != null ? lastOrdinal : (groups[groups.length - 1] && groups[groups.length - 1].ordinal),
+    history_limit_reached: !!(source && source.history_limit_reached),
+    running: !!(source && source.running)
+  };
+}
+function mergeActionTimelines(current, incoming, direction = "latest") {
+  if (!current) return incoming;
+  if (!incoming) return current;
+  if ((current.root_frame_id && incoming.root_frame_id && current.root_frame_id !== incoming.root_frame_id) ||
+      (current.branch_id && incoming.branch_id && current.branch_id !== incoming.branch_id)) return incoming;
+  const key = group => group.group_id ? `id:${group.group_id}` : ["group", group.branch_id, group.ordinal, group.turn_id, group.kind, group.created_at, group.title].join("\u001f");
+  const deduped = new Map();
+  const ordered = direction === "before" ? (incoming.groups || []).concat(current.groups || []) :
+    (current.groups || []).concat(incoming.groups || []);
+  ordered.forEach(group => deduped.set(key(group), group));
+  const all = Array.from(deduped.values()).sort((a, b) => {
+    const left = timelineOrdinal(a.ordinal), right = timelineOrdinal(b.ordinal);
+    if (left != null && right != null && left !== right) return left - right;
+    return (+a.created_at || 0) - (+b.created_at || 0);
+  });
+  const groups = all.slice(-ACTION_TIMELINE_MAX_GROUPS); // always retain the latest research state
+  const hitLimit = !!current.history_limit_reached || all.length > groups.length ||
+    (direction === "before" && groups.length >= ACTION_TIMELINE_MAX_GROUPS && incoming.has_more_before);
+  const currentFirst = timelineOrdinal(current.first_ordinal), incomingFirst = timelineOrdinal(incoming.first_ordinal);
+  const beforeSource = direction === "before" ? incoming :
+    (currentFirst != null && (incomingFirst == null || currentFirst <= incomingFirst) ? current : incoming);
+  const afterSource = direction === "before" ? current : incoming;
+  const hasMoreBefore = !hitLimit && !!beforeSource.has_more_before;
+  const hasMoreAfter = !!afterSource.has_more_after;
+  return {
+    ...afterSource,
+    root_frame_id: incoming.root_frame_id || current.root_frame_id,
+    branch_id: incoming.branch_id || current.branch_id,
+    groups, count: groups.length,
+    total_count: Math.max(+current.total_count || 0, +incoming.total_count || 0, groups.length),
+    truncated: hitLimit || hasMoreBefore || hasMoreAfter,
+    has_more_before: hasMoreBefore, has_more_after: hasMoreAfter,
+    has_earlier: hasMoreBefore, has_more: hasMoreAfter,
+    first_ordinal: groups.length ? groups[0].ordinal : null,
+    last_ordinal: groups.length ? groups[groups.length - 1].ordinal : null,
+    history_limit_reached: hitLimit,
+    running: direction === "before" ? !!current.running : !!incoming.running
   };
 }
 function sanitizeExecutionQueue(payload) {
@@ -1791,6 +1852,28 @@ async function optionalApi(paths) {
   for (const path of paths) { try { return await api(path); } catch {} }
   return null;
 }
+async function loadEarlierActionTimeline() {
+  const id = S.currentId, timeline = S.actionTimeline;
+  if (!id || !timeline || !timeline.has_more_before || S._timelineHistoryLoading === id) return;
+  const first = timelineOrdinal(timeline.first_ordinal);
+  if (first == null || first < 0) return;
+  const request = S._timelineHistoryReq = (S._timelineHistoryReq || 0) + 1;
+  S._timelineHistoryLoading = id;
+  delete S.workbenchErrors.timelineHistory;
+  if (S.activeTab === "timeline") renderActionTimeline();
+  try {
+    const page = await api(`/frames/${encodeURIComponent(id)}/action-timeline?before_ordinal=${first}&limit=${ACTION_TIMELINE_PAGE_SIZE}`);
+    if (request !== S._timelineHistoryReq || id !== S.currentId) return;
+    S.actionTimeline = mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(page), "before");
+  } catch (error) {
+    if (request === S._timelineHistoryReq && id === S.currentId) S.workbenchErrors.timelineHistory = publicText(error && error.message, 240);
+  } finally {
+    if (request === S._timelineHistoryReq && id === S.currentId) {
+      S._timelineHistoryLoading = null;
+      if (S.activeTab === "timeline") renderActionTimeline();
+    }
+  }
+}
 async function loadWorkbenchState(id, force = false) {
   if (!id || id !== S.currentId) return;
   if (!force && S._workbenchLoading === id) return;
@@ -1798,14 +1881,14 @@ async function loadWorkbenchState(id, force = false) {
   S._workbenchLoading = id;
   const base = `/frames/${id}`;
   const [timeline, execution, branches, context, security, recovery] = await Promise.all([
-    optionalApi([base + "/action-timeline"]),
+    optionalApi([base + `/action-timeline?limit=${ACTION_TIMELINE_PAGE_SIZE}`]),
     optionalApi([base + "/execution-queue", base + "/execution"]),
     optionalApi([base + "/branches"]), optionalApi([base + "/context"]), optionalApi([base + "/security"]),
     optionalApi([base + "/recovery"])
   ]);
   if (request !== S._workbenchReq || id !== S.currentId) return;
   S._workbenchLoading = null;
-  if (timeline) S.actionTimeline = sanitizeActionTimeline(timeline);
+  if (timeline) S.actionTimeline = mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(timeline), "latest");
   if (execution) rememberExecutionQueue(execution);
   if (branches) S.branchState = sanitizeBranches(branches);
   if (context) S.contextState = sanitizeContext(context);
@@ -2001,7 +2084,17 @@ function renderActionTimeline() {
   root.appendChild(runtimeSummaryNode(false));
   const layout = el("div", "workbench-layout"), side = el("div", "workbench-side"), actions = el("section", "timeline-actions");
   side.appendChild(renderBranchPanel()); side.appendChild(renderContextPanel()); side.appendChild(renderSecurityPanel()); layout.appendChild(side);
-  const groups = (S.actionTimeline && S.actionTimeline.groups) || [];
+  const timeline = S.actionTimeline || {}, groups = timeline.groups || [];
+  if (timeline.has_more_before) {
+    const controls = el("div", "workbench-controls timeline-history-controls");
+    const loading = S._timelineHistoryLoading === S.currentId;
+    const earlier = el("button", "outline-btn small", t(loading ? "timeline.loadingEarlier" : "timeline.loadEarlier"));
+    earlier.disabled = loading; earlier.setAttribute("data-action", "load-earlier-timeline");
+    earlier.setAttribute("aria-busy", loading ? "true" : "false"); earlier.onclick = loadEarlierActionTimeline;
+    controls.appendChild(earlier); actions.appendChild(controls);
+  }
+  if (S.workbenchErrors.timelineHistory) actions.appendChild(el("div", "timeline-error", t("timeline.loadEarlierFailed", S.workbenchErrors.timelineHistory)));
+  if (timeline.history_limit_reached) actions.appendChild(el("div", "workbench-empty", t("timeline.historyLimit", ACTION_TIMELINE_MAX_GROUPS)));
   if (S.recoveryState && (S.recoveryState.status || (S.recoveryState.log || []).length)) actions.appendChild(recoveryTimelineCard(S.recoveryState));
   if (!groups.length && !actions.children.length) actions.appendChild(el("div", "workbench-empty timeline-empty", S._workbenchLoading ? t("timeline.loading") : t("timeline.empty")));
   else groups.slice().sort((a, b) => (+a.ordinal || 0) - (+b.ordinal || 0)).forEach(group => actions.appendChild(actionTimelineCard(group)));
@@ -2028,7 +2121,7 @@ function onEvent(m) {
   else if (m.type === "notebook_cell_start") { if (mine(fid)) nbCellStart(m); }
   else if (m.type === "notebook_cell_chunk") { if (mine(fid)) nbCellChunk(m); }
   else if (m.type === "notebook_cell_finished") { if (mine(fid)) { nbCellFinished(m); scheduleWorkbenchRefresh(); } }
-  else if (m.type === "action_timeline" || m.type === "action-timeline") { if (mine(fid)) { S.actionTimeline = sanitizeActionTimeline(m); if (S.activeTab === "timeline") renderActionTimeline(); } }
+  else if (m.type === "action_timeline" || m.type === "action-timeline") { if (mine(fid)) { S.actionTimeline = mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(m), "latest"); if (S.activeTab === "timeline") renderActionTimeline(); } }
   else if (m.type === "execution_queue") { if (mine(fid)) { rememberExecutionQueue(m); if (S.activeTab === "timeline") renderActionTimeline(); if (S.activeTab === "notebook") renderNotebook(); } }
   else if (m.type === "execution_state" || m.type === "execution_owner") { if (mine(fid)) {
     // State/owner events are deltas. Paint the safe owner immediately, then
@@ -3023,6 +3116,7 @@ async function openConversation(fid, pid) {
   S.cells = []; S.kernels = []; S.liveCells = []; S._liveCell = null; S.dockArtifact = null; S.kernelFilter = null;
   S.actionTimeline = null; S.executionQueue = null; S.executionIdentity = null; S.recoveryState = null;
   S.branchState = null; S.contextState = null; S.securityState = null;
+  S.workbenchErrors = {}; S._timelineHistoryReq = (S._timelineHistoryReq || 0) + 1; S._timelineHistoryLoading = null;
   clearTimeout(S._workbenchTimer); S._workbenchReq = (S._workbenchReq || 0) + 1; S._workbenchLoading = null;
   S._tbl = {}; invalidateKernelCache();  // drop the prior session's table + kernel-state caches
   S.openTabs = []; S.activeTab = "notebook"; S.provMode = false; S.lineage = null; S._lineageFor = null;

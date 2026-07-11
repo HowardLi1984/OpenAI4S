@@ -34,9 +34,10 @@ HTML/CSS/JavaScript served directly from the working tree.
   native tools (including delegation calls), Python/R Cells, domain mutations,
   and finalization, plus a separate recovery-status card and
   Branch/Context/Sandbox containers. Permission waits still use their existing
-  interactive prompt rather than a persisted Timeline card. The frontend
-  allowlists fields and never renders raw arguments, provider wire state, or
-  tokens.
+  interactive prompt rather than a persisted Timeline card. The frontend starts
+  from the latest 500 actions, can explicitly load earlier 500-action pages,
+  keeps at most 2,000 actions while retaining the latest state, and never renders
+  raw arguments, provider wire state, or tokens.
 - **Customize and research UX** — model profiles, Skills/Specialists,
   connectors, compute, network, memory, permission rules, plan/explore modes,
   voice dictation, uploads/paste/drag-drop, annotations, and bilingual 中文/EN.
@@ -61,7 +62,7 @@ product affordances remain intentionally partial:
 
 | Feature | Status |
 |---|---|
-| Action Ledger and safe Timeline projection | Backend, redacted max-500 latest/older/newer REST windows, and UI cards are implemented. Completed recent history reloads from REST; there is no separate durable per-action WS backlog or visible older-history paging control. |
+| Action Ledger and safe Timeline projection | Backend, redacted max-500 latest/older/newer REST windows, UI cards, and an explicit “load earlier actions” control are implemented. Completed recent history reloads from REST; there is no separate durable per-action WS backlog. |
 | Checkpoint / branch / revert preview | Content-addressed snapshots and public checkpoint/fork/preview/apply/undo routes are implemented. The UI exposes checkpoint creation and revert preview/apply. Fork accepts checkpoints only; fork-from-cell and visible fork/undo/branch-navigation controls are still absent. |
 | Recovery Journal and verified recovery pipeline | Status/actions are public with honest active/partial/failed states. No Gateway action currently runs the full recovery pipeline, so reopen cannot promise complete namespace recovery. |
 | Python/R `.ipynb` export | Deterministic language export/ZIP route and a stable bundle ZIP download in the Notebook header and provenance execution view are implemented. Separate Python/R single-notebook selectors remain API-only. |
