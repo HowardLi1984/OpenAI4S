@@ -51,6 +51,11 @@ flowchart TB
 `AgentEngine` imports no concrete kernel, dispatcher, store, or server. Those
 are ports assembled by entry-point adapters. This keeps terminal states,
 history ordering, and action priority testable without starting infrastructure.
+For Web sessions, tool/cell-only replies receive a deterministic public action
+notice that never exposes hidden reasoning or raw arguments. On successful
+submission, the Gateway projects the structured output, completion bullets,
+and actual Artifact-version delta into the final assistant message before the
+terminal frame event; a provider cannot leave the user with an empty reply.
 
 ## The `host` singleton
 
@@ -102,6 +107,13 @@ Shell runs only inside the Python kernel, and real scientific work continues
 through persistent Python/R cells. The old fenced ` ```tool ` parser remains a
 silent compatibility path for saved prompts and older clients, but it is no
 longer advertised to the refactored agent.
+
+Native `Tool` classes that declare `writes_files=True` are wrapped by the Web
+adapter in a per-call workspace transaction. Every write/edit is diffed and
+registered as a versioned Artifact immediately, including repeated edits to
+the same path. This wrapper exists at the model control-tool boundary—not in
+`HostDispatcher`—so an in-kernel `host.write_file()` is still captured exactly
+once by its scientific Cell transaction and retains Cell provenance.
 
 `HostDispatcher` is the shared orchestration envelope, not the implementation
 home for every capability. It retains wire decoding, permissions and human
@@ -185,6 +197,11 @@ the completion signal. The transaction-allocated cell ID is passed into the
 kernel execute frame, so worker provenance, captured artifacts, and the
 execution log share one identity; background and system cells that are outside
 this transaction continue to receive independent kernel-generated IDs.
+The direct protocol-only `host.submit_output(...)` Cell still executes through
+this complete transaction and remains in the raw audit log. It is not a
+scientific analysis step, so its live source is suppressed and the Notebook
+projection filters it out. A Cell that computes, reads, writes, or prints in
+addition to submitting remains visible.
 
 [`server/artifacts.py`](../openai4s/server/artifacts.py) owns the durable
 workspace side of that transaction: deliverable diffing, Python figure export,
@@ -219,6 +236,6 @@ An ` ```r ` cell runs on a **persistent R kernel** — `kernel/r_worker.R` spawn
 
 ## The Notebook as a read-only execution trace
 
-The web UI's right-hand Notebook is, by default, a **read-only execution trace** of the kernel: it renders each cell the agent ran with its stdout/stderr/artifacts, but there is **no user REPL** — arbitrary in-Notebook code entry is gated behind `OPENAI4S_NOTEBOOK_REPL` (see [Security](security.md)). Runtime segments in the trace are labeled by `kernel_id`: `python` for the default env, `python — struct` / `python — phylo` etc. when the agent switches conda env, so a single session's trace shows which environment each cell ran under.
+The web UI's right-hand Notebook is, by default, a **read-only scientific execution trace** of the kernel: it renders analysis cells with their stdout/stderr/artifacts, but hides a direct protocol-only `host.submit_output(...)` Cell. The raw execution record remains available for auditing. There is **no user REPL** — arbitrary in-Notebook code entry is gated behind `OPENAI4S_NOTEBOOK_REPL` (see [Security](security.md)). Runtime segments in the trace are labeled by `kernel_id`: `python` for the default env, `python — struct` / `python — phylo` etc. when the agent switches conda env, so a single session's trace shows which environment each cell ran under.
 
 The selected conda env is **persisted per-session** in `frames.runtime_env` and **re-seeded on resume** — reopening a session restarts the kernel in the same env. Mind the persistence boundary: **workspace files persist** across a restart, but **in-memory Python variables do not** — a resumed (or restarted) kernel starts with a fresh namespace.

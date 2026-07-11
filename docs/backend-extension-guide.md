@@ -76,6 +76,11 @@ Rules enforced by registration:
 
 Add direct tests for the class behaviour and policy metadata, plus an engine
 test for the provider-neutral call/result group when the wire contract changes.
+If the tool mutates workspace files, declare `writes_files = True`. The Web
+control adapter then snapshots each individual native call and registers every
+changed file/version as an Artifact. Do not add Artifact capture to the
+dispatcher itself: kernel-side `host.write_file()` is already captured by the
+Cell transaction and would otherwise be registered twice.
 
 ## Add an in-kernel `host.*` capability
 
