@@ -91,8 +91,10 @@ def test_execution_log_keeps_order_defaults_and_first_seen_kernels():
     first, second, _third, interrupted = payload["entries"]
     assert set(first) == {
         "cell_index",
+        "producing_cell_id",
         "kernel_id",
         "language",
+        "origin",
         "source",
         "stdout",
         "stderr",
@@ -103,11 +105,18 @@ def test_execution_log_keeps_order_defaults_and_first_seen_kernels():
         "files_read",
         "cpu_seconds",
         "peak_rss_kb",
+        "attempt_group_id",
+        "attempt",
+        "revision_of",
+        "is_latest_attempt",
+        "attempt_count",
     }
     assert first == {
+        "producing_cell_id": "legacy-cell-2",
         "cell_index": 2,
         "kernel_id": "python",
         "language": "python",
+        "origin": None,
         "source": "",
         "stdout": "",
         "stderr": "",
@@ -118,6 +127,11 @@ def test_execution_log_keeps_order_defaults_and_first_seen_kernels():
         "files_read": [],
         "cpu_seconds": None,
         "peak_rss_kb": None,
+        "attempt_group_id": "legacy-cell-2",
+        "attempt": 1,
+        "revision_of": None,
+        "is_latest_attempt": True,
+        "attempt_count": 1,
     }
     assert second["source"] == "mean(x)"
     assert second["cpu_seconds"] == 1.25
@@ -159,6 +173,112 @@ def test_execution_log_hides_protocol_only_completion_but_keeps_mixed_cell():
         "kernels": [],
         "entries": [],
     }
+
+
+def test_execution_log_projects_consecutive_failed_retries_without_dropping_rows():
+    store = _Store()
+    store.cells["frame"] = [
+        {
+            "producing_cell_id": "cell-1",
+            "cell_index": 1,
+            "kernel_id": "python",
+            "language": "python",
+            "origin": "agent",
+            "code": "calculate()",
+            "status": "error",
+            "error": "NameError",
+        },
+        {
+            "producing_cell_id": "cell-2",
+            "cell_index": 2,
+            "kernel_id": "python",
+            "language": "python",
+            "origin": "agent",
+            "code": "repair_and_calculate()",
+            "status": "error",
+            "error": "ValueError",
+        },
+        {
+            "producing_cell_id": "cell-3",
+            "cell_index": 3,
+            "kernel_id": "python",
+            "language": "python",
+            "origin": "agent",
+            "code": "repair_again()",
+            "status": "ok",
+        },
+        {
+            "producing_cell_id": "cell-4",
+            "cell_index": 4,
+            "kernel_id": "python",
+            "language": "python",
+            "origin": "agent",
+            "code": "new_analysis_step()",
+            "status": "ok",
+        },
+    ]
+
+    entries = _service(store).execution_log("frame")["entries"]
+
+    # This endpoint remains a lossless projection of all physical attempts.
+    assert [entry["producing_cell_id"] for entry in entries] == [
+        "cell-1",
+        "cell-2",
+        "cell-3",
+        "cell-4",
+    ]
+    assert [entry["attempt_group_id"] for entry in entries[:3]] == [
+        "cell-1",
+        "cell-1",
+        "cell-1",
+    ]
+    assert [entry["attempt"] for entry in entries[:3]] == [1, 2, 3]
+    assert [entry["revision_of"] for entry in entries[:3]] == [
+        None,
+        "cell-1",
+        "cell-2",
+    ]
+    assert [entry["attempt_count"] for entry in entries[:3]] == [3, 3, 3]
+    assert [entry["is_latest_attempt"] for entry in entries[:3]] == [
+        False,
+        False,
+        True,
+    ]
+    assert entries[3]["attempt_group_id"] == "cell-4"
+    assert entries[3]["attempt_count"] == 1
+
+
+def test_retry_projection_does_not_cross_runtime_or_non_agent_boundaries():
+    store = _Store()
+    store.cells["frame"] = [
+        {
+            "producing_cell_id": "py-error",
+            "kernel_id": "python",
+            "language": "python",
+            "status": "error",
+        },
+        {
+            "producing_cell_id": "r-error",
+            "kernel_id": "r",
+            "language": "r",
+            "status": "error",
+        },
+        {
+            "producing_cell_id": "user-cell",
+            "kernel_id": "r",
+            "language": "r",
+            "origin": "user",
+            "status": "ok",
+        },
+    ]
+
+    entries = _service(store).execution_log("frame")["entries"]
+
+    assert [entry["attempt_group_id"] for entry in entries] == [
+        "py-error",
+        "r-error",
+        "user-cell",
+    ]
 
 
 def test_lineage_merges_reads_deduplicates_and_filters_only_dependency_inputs():

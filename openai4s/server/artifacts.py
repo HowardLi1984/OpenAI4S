@@ -459,6 +459,7 @@ class ArtifactManager:
         emit(
             {
                 "type": "artifact_created",
+                "producing_cell_id": cell_id,
                 "artifact": {
                     "id": record["artifact_id"],
                     "artifact_id": record["artifact_id"],
@@ -468,6 +469,7 @@ class ArtifactManager:
                     "size_bytes": size,
                     "project_id": session.project_id,
                     "root_frame_id": session.root_frame_id,
+                    "producing_cell_id": cell_id,
                 },
             }
         )

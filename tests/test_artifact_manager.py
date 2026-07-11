@@ -126,6 +126,8 @@ def test_capture_finalizes_provenance_version_without_duplicating_it(tmp_path):
 
         assert first_capture.artifacts[0]["version_id"] == provenance_version
         assert events[0]["artifact"]["version_id"] == provenance_version
+        assert events[0]["producing_cell_id"] == "cell-derived-1"
+        assert events[0]["artifact"]["producing_cell_id"] == "cell-derived-1"
         output = harness.store.get_artifact(output["artifact_id"])
         assert output["latest_version_id"] == provenance_version
         assert len(harness.store.list_versions(output["artifact_id"])) == 1

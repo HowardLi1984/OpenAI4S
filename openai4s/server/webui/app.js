@@ -446,6 +446,7 @@ Object.assign(I18N.zh, {
   "msgAction.thumbsUp": "赞",
   "nb.badge.idle": "Idle",
   "nb.badge.live": "Live",
+  "nb.badge.ready": "就绪",
   "nb.cell.statusOk": "ok",
   "nb.cell.statusRunning": "running",
   "nb.kernel.shared": "与 Agent 共享",
@@ -484,6 +485,8 @@ Object.assign(I18N.zh, {
   "nb.status.ended": "{0} · 已结束 — 仅供查看；该内核的内存命名空间已不存在。",
   "nb.status.hint": "发送消息即可继续。你的下一条消息会在此环境中恢复运行 — 工作区文件保留；内存中的变量仅在内核存活时恢复。",
   "nb.status.live": "运行中 · {0}",
+  "nb.status.ready": "就绪 · {0}",
+  "nb.revisions.summary": "共 {0} 次尝试 · 展开查看 {1} 个失败版本",
   "nb.table.rowsHidden": "… {0} 行未显示",
   "notes.empty": "还没有笔记。",
   "notes.emptyNoProject": "在某个项目下可添加笔记。",
@@ -1044,6 +1047,7 @@ Object.assign(I18N.en, {
   "msgAction.thumbsUp": "Like",
   "nb.badge.idle": "Idle",
   "nb.badge.live": "Live",
+  "nb.badge.ready": "Ready",
   "nb.cell.statusOk": "ok",
   "nb.cell.statusRunning": "running",
   "nb.kernel.shared": "shared with the agent",
@@ -1082,6 +1086,8 @@ Object.assign(I18N.en, {
   "nb.status.ended": "{0} · ended — view only; this kernel's in-memory namespace no longer exists.",
   "nb.status.hint": "Send a message to continue. Your next message resumes in this environment — workspace files remain; in-memory variables are restored only while the kernel is alive.",
   "nb.status.live": "Live · {0}",
+  "nb.status.ready": "Ready · {0}",
+  "nb.revisions.summary": "{0} attempts · expand {1} failed revisions",
   "nb.table.rowsHidden": "… {0} rows not shown",
   "notes.empty": "No notes yet.",
   "notes.emptyNoProject": "Notes can be added under a project.",
@@ -1421,6 +1427,9 @@ function onEvent(m) {
   if (m.type === "replay_begin") { if (mine(fid)) { if (S.stream && S.stream.wrap) S.stream.wrap.remove(); S.stream = null; S.liveCells = []; S._liveCell = null; } }
   else if (m.type === "replay_end") { if (mine(fid)) down(); }
   else if (m.type === "text_reset") { if (mine(fid)) startStream(); }
+  else if (m.type === "notebook_cell_start") { if (mine(fid)) nbCellStart(m); }
+  else if (m.type === "notebook_cell_chunk") { if (mine(fid)) nbCellChunk(m); }
+  else if (m.type === "notebook_cell_finished") { if (mine(fid)) nbCellFinished(m); }
   else if (m.type === "text_chunk") { if (mine(fid)) feed(m.block_type || "text", m.chunk || "", m); }
   else if (m.type === "step") { if (mine(fid)) addLiveStep(m); }
   else if (m.type === "step_update") { if (mine(fid)) updateLiveStep(m); }
@@ -1460,7 +1469,8 @@ function onEvent(m) {
     // show up as the agent makes them (not only after the whole turn ends).
     const isImg = /^image\//.test(art.content_type || "") || /\.(png|jpe?g|gif|svg|webp|bmp)$/i.test(fn);
     if (S.running && fn && isImg) {
-      const cell = S._liveCell || (S.liveCells && S.liveCells[S.liveCells.length - 1]);
+      const producer = art.producing_cell_id || m.producing_cell_id;
+      const cell = (producer && nbFindCell(producer)) || S._liveCell || (S.liveCells && S.liveCells[S.liveCells.length - 1]);
       if (cell && !(cell.figures || []).includes(fn)) { (cell.figures = cell.figures || []).push(fn); nbRender(); }
     }
     if (S.currentId) loadArtifacts(S.currentId);
@@ -1533,12 +1543,14 @@ function feed(kind, chunk, event) {
       st.wrap.appendChild(card); st.toolPre = pre; st.toolMeta = meta;
       if (!suba) { st.toolCard = card; card._demoted = false; }
       st.md = el("div", "md"); st.wrap.appendChild(st.md); st.text = "";
-      if (!suba) nbLiveStart(tool, raw, event && event.kernel_id, event && event.cell_index, event && event.language);
+      // Structured notebook_cell_* events own Notebook state on new daemons.
+      // Keep sentinel parsing only as a compatibility fallback for old replays.
+      if (!suba && !(event && event.producing_cell_id)) nbLiveStart(tool, raw, event && event.kernel_id, event && event.cell_index, event && event.language);
     } else if (st.toolPre) {
       const add = chunk.replace(/^↳\s*/, "");
       st.toolPre.textContent += add;
       if (st.toolMeta) { const n = (st.toolPre.textContent.match(/\n/g) || []).length; st.toolMeta.textContent = n > 1 ? (n + (n === 1 ? " line" : " lines")) : "done"; }
-      nbLiveAppend(add);
+      if (!(event && event.producing_cell_id)) nbLiveAppend(add);
     }
   } else { st.text += chunk; st.full += chunk; st.md.classList.add("cursor"); scheduleRender(st); return; }
   down();
@@ -3520,10 +3532,16 @@ function renderTableInto(holder, fname) {
   }).catch(() => {});
 }
 async function loadExecutionLog(id) {
+  const request = S._executionLoadReq = (S._executionLoadReq || 0) + 1;
   let d = null;
   try { d = await api(`/frames/${id}/execution-log`); } catch { d = null; }
-  if (id !== S.currentId) return;  // a newer session was opened while this was in flight
-  S.cells = (d && d.entries) || []; S.kernels = (d && d.kernels) || [];
+  // A slower response for the same session must not roll the Notebook back
+  // after a newer REST response or a structured cell-finished event.
+  if (id !== S.currentId || request !== S._executionLoadReq) return;
+  const serverCells = (d && d.entries) || [];
+  S.cells = mergeNotebookCells(serverCells, S.cells || []);
+  S.kernels = (d && d.kernels) || [];
+  S.cells.forEach(cell => { const k = cell.kernel_id || "python"; if (!S.kernels.includes(k)) S.kernels.push(k); });
   renderNotebook();
   if (S.provMode && S.dockArtifact) {
     S.lineage = null; S._lineageFor = null;
@@ -3531,6 +3549,73 @@ async function loadExecutionLog(id) {
     showProvenance(S.dockArtifact);
   }
 }
+
+function nbCellKey(cell) {
+  if (cell && cell.producing_cell_id) return String(cell.producing_cell_id);
+  return "legacy:" + String(cell && cell.kernel_id || "python") + ":" + String(cell && cell.cell_index != null ? cell.cell_index : "?");
+}
+function mergeNotebookCells(serverCells, localCells) {
+  const merged = new Map();
+  (localCells || []).forEach(cell => merged.set(nbCellKey(cell), cell));
+  // A persisted execution record is authoritative for an identical Cell ID.
+  (serverCells || []).forEach(cell => merged.set(nbCellKey(cell), cell));
+  return Array.from(merged.values()).sort((a, b) => {
+    const ai = Number(a.cell_index), bi = Number(b.cell_index);
+    if (Number.isFinite(ai) && Number.isFinite(bi) && ai !== bi) return ai - bi;
+    return String(nbCellKey(a)).localeCompare(String(nbCellKey(b)));
+  });
+}
+function nbFindCell(producingCellId) {
+  const key = String(producingCellId || "");
+  return (S.liveCells || []).find(cell => nbCellKey(cell) === key)
+    || (S.cells || []).find(cell => nbCellKey(cell) === key)
+    || null;
+}
+function nbCellStart(event) {
+  const id = event && event.producing_cell_id;
+  if (!id) return;
+  const cell = {
+    producing_cell_id: String(id), cell_index: event.cell_index,
+    kernel_id: event.kernel_id || "python", language: event.language || "python",
+    origin: event.origin || null,
+    source: event.source || "", stdout: "", stderr: "", error: "",
+    status: "running", figures: [], files_written: [], files_read: [], live: true
+  };
+  // Replayed starts and reconnects upsert by the server identity; they never
+  // create a duplicate temporary Cell.
+  S.liveCells = mergeNotebookCells([cell], S.liveCells || []);
+  S.cells = (S.cells || []).filter(saved => nbCellKey(saved) !== String(id));
+  S._liveCell = nbFindCell(id);
+  nbRender();
+}
+function nbCellChunk(event) {
+  const cell = event && nbFindCell(event.producing_cell_id);
+  if (!cell) return;
+  const stream = event.stream === "stderr" ? "stderr" : "stdout";
+  cell[stream] = (cell[stream] || "") + (event.chunk || "");
+  nbRender();
+}
+function nbCellFinished(event) {
+  const id = event && event.producing_cell_id;
+  if (!id) return;
+  const active = nbFindCell(id) || {};
+  const cell = {
+    ...active, ...event, producing_cell_id: String(id),
+    source: event.source != null ? event.source : (active.source || ""),
+    stdout: event.stdout != null ? event.stdout : (active.stdout || ""),
+    stderr: event.stderr != null ? event.stderr : (active.stderr || ""),
+    error: event.error || "", status: event.status || (event.error ? "error" : "ok"),
+    figures: event.figures || active.figures || [],
+    files_written: event.files_written || active.files_written || [],
+    files_read: event.files_read || active.files_read || [],
+    live: false
+  };
+  S.liveCells = (S.liveCells || []).filter(candidate => nbCellKey(candidate) !== String(id));
+  S.cells = mergeNotebookCells([cell], S.cells || []);
+  S._liveCell = (S.liveCells || [])[S.liveCells.length - 1] || null;
+  nbRender();
+}
+
 const _NB_DIV = "----- output -----";
 function nbLiveStart(tool, raw, serverKernelId, serverCellIndex, serverLanguage) {
   const codeTools = /^(run_python|python|exec|run_bash|bash)/;
@@ -3590,9 +3675,12 @@ function _paintKernel(els, st) {
   if (title) title.textContent = kernelLabel(kernelIdFromEnv(env)) + " kernel · " + t("nb.kernel.shared")
     + (env.pending ? t("nb.kernel.pendingSwitch", env.pending) : "");
   if (badge && badge.root && badge.label) {
-    const live = !!(st.turn_running || st.alive);
-    badge.root.classList.toggle("live", live); badge.root.classList.toggle("idle", !live);
-    badge.label.textContent = live ? "Live" : "Idle";
+    const live = !!st.turn_running;
+    const ready = !live && !!st.alive;
+    badge.root.classList.toggle("live", live);
+    badge.root.classList.toggle("ready", ready);
+    badge.root.classList.toggle("idle", !live && !ready);
+    badge.label.textContent = live ? t("nb.badge.live") : (ready ? t("nb.badge.ready") : t("nb.badge.idle"));
   }
   if (bStop) bStop.disabled = !st.alive;
   if (bStart) bStart.disabled = st.alive;
@@ -3606,9 +3694,10 @@ function _paintStatusStrip(strip, st) {
   if (!strip || !strip.line) return;
   const env = st.env || {};
   const rt = kernelLabel(kernelIdFromEnv(env)) + (env.python_version ? " " + env.python_version : "");
-  const alive = !!(st.turn_running || st.alive);
-  strip.line.textContent = alive ? t("nb.status.live", rt) : t("nb.status.ended", rt);
-  strip.line.className = "nb-status-line " + (alive ? "live" : "ended");
+  const live = !!st.turn_running;
+  const ready = !live && !!st.alive;
+  strip.line.textContent = live ? t("nb.status.live", rt) : (ready ? t("nb.status.ready", rt) : t("nb.status.ended", rt));
+  strip.line.className = "nb-status-line " + (live ? "live" : (ready ? "ready" : "ended"));
 }
 async function refreshKernelState(els, _b, _c) {
   // Back-compat: old callers passed (stateEl, bStop, bStart).
@@ -3690,6 +3779,44 @@ function kernelIdFromEnv(env) {  // stored kernel_id from a kernel-status env ob
   if (!n || n === "python" || n === "base") return "python";
   return "python — " + n;
 }
+function projectNotebookCells(rawEntries) {
+  const entries = (rawEntries || []).map(cell => ({ ...cell }));
+  let previous = null;
+  entries.forEach(cell => {
+    const previousFailed = previous && ["error", "failed"].includes(previous.status);
+    const agentRetry = previous && previous.origin === "agent" && cell.origin === "agent";
+    const sameRuntime = previous && (previous.kernel_id || "python") === (cell.kernel_id || "python")
+      && (previous.language || "python") === (cell.language || "python");
+    if (!cell.attempt_group_id) {
+      if (previousFailed && sameRuntime && agentRetry) {
+        cell.attempt_group_id = previous.attempt_group_id || nbCellKey(previous);
+        cell.revision_of = nbCellKey(previous);
+        cell.attempt = (previous.attempt || 1) + 1;
+      } else {
+        cell.attempt_group_id = nbCellKey(cell);
+        cell.revision_of = null;
+        cell.attempt = 1;
+      }
+    }
+    previous = cell;
+  });
+  const groups = new Map();
+  entries.forEach(cell => {
+    const group = String(cell.attempt_group_id || nbCellKey(cell));
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(cell);
+  });
+  return Array.from(groups.values()).map(attempts => {
+    const latest = attempts[attempts.length - 1];
+    return {
+      ...latest,
+      attempt: attempts.length,
+      attempt_count: attempts.length,
+      is_latest_attempt: true,
+      _revisions: attempts.slice(0, -1)
+    };
+  });
+}
 function renderNotebook() {
   const nb = $("#dock-notebook"); if (!nb) return;
   // Live-follow: if the user is already parked near the bottom, keep the newest
@@ -3711,14 +3838,17 @@ function renderNotebook() {
   }
   nb.innerHTML = "";
   let entries = (S.cells || []).slice();
-  if (S.running && S.liveCells && S.liveCells.length) entries = entries.concat(S.liveCells);
+  if (S.liveCells && S.liveCells.length) entries = entries.concat(S.liveCells);
+  entries = projectNotebookCells(entries);
   const kernels = []; entries.forEach(e => { const k = e.kernel_id || "python"; if (!kernels.includes(k)) kernels.push(k); });
   const chips = el("div", "kernel-chips");
   const mk = (k, label) => { const c = el("button", "kchip" + (((S.kernelFilter || null) === k) ? " on" : ""), label); c.onclick = () => { S.kernelFilter = k; renderNotebook(); }; return c; };
   chips.appendChild(mk(null, "All")); kernels.forEach(k => chips.appendChild(mk(k, kernelLabel(k))));
-  const cachedAlive = !!(S.running || (_kc.id === S.currentId && _kc.st && _kc.st.alive));
-  const badge = el("div", "nb-live-badge" + (cachedAlive ? " live" : " idle")); badge.appendChild(el("span", "ld"));
-  const badgeLabel = el("span", null, cachedAlive ? "Live" : "Idle"); badge.appendChild(badgeLabel); badge.appendChild(iconEl("chevron-down", 14)); chips.appendChild(badge);
+  const cachedRunning = !!(S.running || (_kc.id === S.currentId && _kc.st && _kc.st.turn_running));
+  const cachedReady = !cachedRunning && !!(_kc.id === S.currentId && _kc.st && _kc.st.alive);
+  const badgeMode = cachedRunning ? "live" : (cachedReady ? "ready" : "idle");
+  const badge = el("div", "nb-live-badge " + badgeMode); badge.appendChild(el("span", "ld"));
+  const badgeLabel = el("span", null, cachedRunning ? t("nb.badge.live") : (cachedReady ? t("nb.badge.ready") : t("nb.badge.idle"))); badge.appendChild(badgeLabel); badge.appendChild(iconEl("chevron-down", 14)); chips.appendChild(badge);
   const badgeEls = { root: badge, label: badgeLabel };
   nb.appendChild(chips);
   let shown = entries; if (S.kernelFilter) shown = entries.filter(e => (e.kernel_id || "python") === S.kernelFilter);
@@ -3845,6 +3975,15 @@ function cellNode(e) {
   const c = el("div", "notebook-cell" + (e.live ? " live" : ""));
   c.setAttribute("data-cell", e.cell_index != null ? e.cell_index : "");
   c.setAttribute("data-kernel", k);
+  c.setAttribute("data-producing-cell", e.producing_cell_id || "");
+  const revisions = e._revisions || [];
+  if (revisions.length) {
+    const history = el("details", "nbc-revisions");
+    history.appendChild(el("summary", null, t("nb.revisions.summary", revisions.length + 1, revisions.length)));
+    const attempts = el("div", "nbc-revision-list");
+    revisions.forEach(revision => attempts.appendChild(cellNode({ ...revision, _revisions: [] })));
+    history.appendChild(attempts); c.appendChild(history);
+  }
   const st = e.status || (e.live ? "running" : "ok");
   const idx = e.cell_index != null ? e.cell_index : "…";
   c.appendChild(codeBlock(e.source || "", {

@@ -416,6 +416,8 @@ body.sidebar-collapsed #sidebar{width:0;min-width:0;padding:0;overflow:hidden;bo
 .nb-live-badge .ld{width:7px;height:7px;border-radius:50%;background:var(--text-400);transition:background .2s ease}
 .nb-live-badge.live{border-color:var(--success);color:var(--success-text)}
 .nb-live-badge.live .ld{background:var(--success);box-shadow:0 0 0 3px var(--success-bg);animation:os-pulse 1.4s ease-in-out infinite}
+.nb-live-badge.ready{border-color:color-mix(in srgb,var(--success) 45%,var(--border-btn));color:var(--success-text)}
+.nb-live-badge.ready .ld{background:var(--success);box-shadow:none}
 .nb-live-badge.idle .ld{background:var(--text-400);opacity:.55}
 .notebook-cell{margin-bottom:14px}
 .notebook-cell.live .os-code{box-shadow:inset 0 0 0 1.5px var(--clay)}
@@ -467,6 +469,7 @@ body.sidebar-collapsed #sidebar{width:0;min-width:0;padding:0;overflow:hidden;bo
 /* read-only Notebook status strip (replaces the REPL when repl_enabled is off) */
 .nb-status{border-top:.5px solid var(--border);margin-top:14px;padding-top:10px;font-size:12px}
 .nb-status-line{font-weight:500;color:var(--text-300)}
+.nb-status-line.ready{color:var(--success-text)}
 .nb-status-line.ended{color:var(--muted,#888)}
 .nb-status-hint{margin-top:4px;font-size:11px;color:var(--muted,#888);line-height:1.5}
 
@@ -1021,6 +1024,14 @@ textarea:focus-visible,input:focus-visible,select:focus-visible{outline:2px soli
   font:600 9px/1 var(--mono);letter-spacing:.12em;color:var(--text-400);opacity:.6;margin-bottom:6px}
 .notebook-cell>.nbc-fig{padding:10px;background:var(--bg-100);border-top:var(--hair)}
 .notebook-cell>.nbc-io{padding:8px 12px;border-top:var(--hair);background:var(--bg-100)}
+.nbc-revisions{border-bottom:var(--hair);background:var(--bg-100)}
+.nbc-revisions>summary{cursor:pointer;list-style:none;padding:9px 12px;color:var(--text-300);font-size:11px;font-weight:600}
+.nbc-revisions>summary::-webkit-details-marker{display:none}
+.nbc-revisions>summary::before{content:"▸";display:inline-block;margin-right:6px;color:var(--text-400)}
+.nbc-revisions[open]>summary::before{content:"▾"}
+.nbc-revision-list{padding:0 10px 10px}
+.nbc-revision-list>.notebook-cell{margin:8px 0 0;box-shadow:none;border-color:color-mix(in srgb,var(--danger) 28%,var(--line));opacity:.88}
+.nbc-revision-list>.notebook-cell .oc-head{background:color-mix(in srgb,var(--danger) 5%,var(--bg-100))}
 .nb-live-badge{border-radius:999px}
 .nb-repl{background:var(--card);border:var(--hair);border-radius:12px;padding:12px;margin-top:16px;box-shadow:var(--shadow-soft)}
 

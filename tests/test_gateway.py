@@ -948,10 +948,9 @@ def test_cross_origin_api_write_is_refused(tmp_path):
 
 def test_execution_log_route_serializer_contract(tmp_path):
     """GET /api/frames/{fid}/execution-log — the Notebook data contract: each
-    entry carries exactly source/stdout/stderr/error/status/figures/
-    files_written/files_read/cpu_seconds/peak_rss_kb (+ cell_index/kernel_id/
-    language), with code→source and cpu_s→cpu_seconds renames and ""/[] (never
-    null) defaults."""
+    entry carries immutable identity plus source/stdout/stderr/error/status,
+    artifacts/resources and retry-projection metadata, with code→source and
+    cpu_s→cpu_seconds renames and ""/[] (never null) defaults."""
     cfg = _cfg(tmp_path)
     runner = gateway_mod.SessionRunner(cfg, _Hub())
     handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
@@ -1003,9 +1002,11 @@ def test_execution_log_route_serializer_contract(tmp_path):
     assert len(body["entries"]) == 2
     e1, e2 = body["entries"]
     assert set(e1) == {
+        "producing_cell_id",
         "cell_index",
         "kernel_id",
         "language",
+        "origin",
         "source",
         "stdout",
         "stderr",
@@ -1016,7 +1017,14 @@ def test_execution_log_route_serializer_contract(tmp_path):
         "files_read",
         "cpu_seconds",
         "peak_rss_kb",
+        "attempt_group_id",
+        "attempt",
+        "revision_of",
+        "is_latest_attempt",
+        "attempt_count",
     }
+    assert e1["producing_cell_id"] == "cell-1"
+    assert e1["attempt_group_id"] == "cell-1"
     assert e1["source"] == "print('hi')"  # code -> source rename
     assert e1["status"] == "ok"
     assert e1["cpu_seconds"] == 0.25  # cpu_s -> cpu_seconds rename

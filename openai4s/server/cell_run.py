@@ -75,7 +75,15 @@ class CellExecutionService:
             and is_completion_only_cell(request.code, request.language)
         )
         on_chunk = (
-            self._start_stream(session, request, emit, index, kernel_id, title)
+            self._start_stream(
+                session,
+                request,
+                emit,
+                index,
+                cell_id,
+                kernel_id,
+                title,
+            )
             if show_in_notebook
             else None
         )
@@ -107,17 +115,33 @@ class CellExecutionService:
         lease = session.kernels.lease("r") if request.language == "r" else None
         try:
             result = self.ports.run(session, request, cell_id, on_chunk, lease)
-        except BaseException:
+        except BaseException as exc:
             # A live R process can still be protocol-desynchronized when its
             # reader exits through a callback/parse error. Close only this lease;
             # watchdog recovery may already have advanced the generation.
             if lease is not None:
                 session.kernels.shutdown_if_current(lease)
+            if show_in_notebook and request.stream:
+                self._emit_finished(
+                    session,
+                    request,
+                    emit,
+                    index,
+                    cell_id,
+                    kernel_id,
+                    _error_result(cell_id, str(exc)),
+                    CaptureResult(),
+                )
             raise
 
         result["id"] = cell_id
         if request.stream and result.get("error"):
-            self._emit_error(emit, session.root_frame_id, str(result["error"]))
+            self._emit_error(
+                emit,
+                session.root_frame_id,
+                str(result["error"]),
+                producing_cell_id=cell_id,
+            )
         capture = self.ports.capture(
             session,
             index,
@@ -138,6 +162,17 @@ class CellExecutionService:
             result,
             capture,
         )
+        if show_in_notebook and request.stream:
+            self._emit_finished(
+                session,
+                request,
+                emit,
+                index,
+                cell_id,
+                kernel_id,
+                result,
+                capture,
+            )
         return CellExecutionResult(result, index, cell_id, capture)
 
     def _start_stream(
@@ -146,6 +181,7 @@ class CellExecutionService:
         request: CellRequest,
         emit: EventSink,
         index: int,
+        cell_id: str,
         kernel_id: str,
         title: str,
     ) -> ChunkSink | None:
@@ -153,10 +189,29 @@ class CellExecutionService:
             return None
         emit(
             {
+                "type": "notebook_cell_start",
+                "frame_id": session.root_frame_id,
+                "root_frame_id": session.root_frame_id,
+                "producing_cell_id": cell_id,
+                "cell_index": index,
+                "kernel_id": kernel_id,
+                "language": request.language,
+                "origin": request.origin,
+                "source": request.code,
+                "title": title,
+                "status": "running",
+            }
+        )
+        # Keep the text activity stream for older clients and for the chat-side
+        # activity card.  ``producing_cell_id`` tells newer clients that the
+        # structured Notebook lifecycle above is authoritative.
+        emit(
+            {
                 "type": "text_chunk",
                 "frame_id": session.root_frame_id,
                 "block_type": "tool",
                 "chunk": f"⚙{title}\n",
+                "producing_cell_id": cell_id,
                 "cell_index": index,
                 "kernel_id": kernel_id,
                 "language": request.language,
@@ -168,16 +223,28 @@ class CellExecutionService:
                 "frame_id": session.root_frame_id,
                 "block_type": "tool",
                 "chunk": request.code + "\n" + NOTEBOOK_DIVIDER + "\n",
+                "producing_cell_id": cell_id,
             }
         )
 
         def on_chunk(text: str) -> None:
             emit(
                 {
+                    "type": "notebook_cell_chunk",
+                    "frame_id": session.root_frame_id,
+                    "root_frame_id": session.root_frame_id,
+                    "producing_cell_id": cell_id,
+                    "stream": "stdout",
+                    "chunk": text,
+                }
+            )
+            emit(
+                {
                     "type": "text_chunk",
                     "frame_id": session.root_frame_id,
                     "block_type": "tool",
                     "chunk": text,
+                    "producing_cell_id": cell_id,
                 }
             )
 
@@ -195,7 +262,12 @@ class CellExecutionService:
     ) -> CellExecutionResult:
         result = _error_result(cell_id, message)
         if request.stream:
-            self._emit_error(emit, session.root_frame_id, message)
+            self._emit_error(
+                emit,
+                session.root_frame_id,
+                message,
+                producing_cell_id=cell_id,
+            )
         capture = CaptureResult()
         self._record(
             session,
@@ -205,7 +277,61 @@ class CellExecutionService:
             result,
             capture,
         )
+        show_in_notebook = not (
+            request.origin == "agent"
+            and is_completion_only_cell(request.code, request.language)
+        )
+        if request.stream and show_in_notebook:
+            self._emit_finished(
+                session,
+                request,
+                emit,
+                index,
+                cell_id,
+                kernel_id,
+                result,
+                capture,
+            )
         return CellExecutionResult(result, index, cell_id, capture)
+
+    @staticmethod
+    def _emit_finished(
+        session: CellSession,
+        request: CellRequest,
+        emit: EventSink,
+        index: int,
+        cell_id: str,
+        kernel_id: str,
+        result: dict[str, Any],
+        capture: CaptureResult,
+    ) -> None:
+        status = (
+            "error"
+            if result.get("error")
+            else ("interrupted" if result.get("interrupted") else "ok")
+        )
+        emit(
+            {
+                "type": "notebook_cell_finished",
+                "frame_id": session.root_frame_id,
+                "root_frame_id": session.root_frame_id,
+                "producing_cell_id": cell_id,
+                "cell_index": index,
+                "kernel_id": kernel_id,
+                "language": request.language,
+                "origin": request.origin,
+                "source": request.code,
+                "stdout": result.get("stdout") or "",
+                "stderr": result.get("stderr") or "",
+                "error": result.get("error") or "",
+                "status": status,
+                "figures": list(capture.figures),
+                "files_written": list(capture.files_written),
+                "files_read": [],
+                "cpu_seconds": (result.get("usage") or {}).get("cpu_s"),
+                "peak_rss_kb": (result.get("usage") or {}).get("peak_rss_kb"),
+            }
+        )
 
     def _record(
         self,
@@ -233,13 +359,24 @@ class CellExecutionService:
         )
 
     @staticmethod
-    def _emit_error(emit: EventSink, frame_id: str, message: str) -> None:
+    def _emit_error(
+        emit: EventSink,
+        frame_id: str,
+        message: str,
+        *,
+        producing_cell_id: str | None = None,
+    ) -> None:
         emit(
             {
                 "type": "text_chunk",
                 "frame_id": frame_id,
                 "block_type": "tool",
                 "chunk": "\n" + message,
+                **(
+                    {"producing_cell_id": producing_cell_id}
+                    if producing_cell_id
+                    else {}
+                ),
             }
         )
 

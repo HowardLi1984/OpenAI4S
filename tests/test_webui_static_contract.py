@@ -279,6 +279,13 @@ def test_context_menus_remain_scrollable_inside_the_viewport() -> None:
 def test_notebook_live_state_and_outputs_follow_the_ui_contract() -> None:
     notebook_source = _extract_js_function(APP_JS, "renderNotebook")
     output_source = _extract_js_function(APP_JS, "notebookOutputBlock")
+    event_source = _extract_js_function(APP_JS, "onEvent")
+    load_source = _extract_js_function(APP_JS, "loadExecutionLog")
+    start_source = _extract_js_function(APP_JS, "nbCellStart")
+    chunk_source = _extract_js_function(APP_JS, "nbCellChunk")
+    finished_source = _extract_js_function(APP_JS, "nbCellFinished")
+    feed_source = _extract_js_function(APP_JS, "feed")
+    status_source = _extract_js_function(APP_JS, "_paintStatusStrip")
 
     assert ".alive" in notebook_source
     assert "Live" in notebook_source
@@ -286,6 +293,38 @@ def test_notebook_live_state_and_outputs_follow_the_ui_contract() -> None:
     assert re.search(r"el\(\s*['\"]details['\"]", output_source)
     assert re.search(r"el\(\s*['\"]summary['\"]", output_source)
     assert "output" in output_source
+    for event_type in (
+        "notebook_cell_start",
+        "notebook_cell_chunk",
+        "notebook_cell_finished",
+    ):
+        assert event_type in event_source
+    assert "producing_cell_id" in start_source
+    assert "event.origin" in start_source
+    assert "mergeNotebookCells" in start_source
+    assert "producing_cell_id" in chunk_source
+    assert "producing_cell_id" in finished_source
+    assert "S.liveCells" in finished_source and "S.cells" in finished_source
+    assert "event.producing_cell_id" in feed_source
+    assert "S._executionLoadReq" in load_source
+    assert "request !== S._executionLoadReq" in load_source
+    assert "mergeNotebookCells" in load_source
+    assert 't("nb.status.ready"' in status_source
+    assert "st.turn_running" in status_source
+    assert ".alive" in status_source
+
+
+def test_notebook_retry_projection_is_expandable_and_keeps_raw_attempts() -> None:
+    projection = _extract_js_function(APP_JS, "projectNotebookCells")
+    cell_source = _extract_js_function(APP_JS, "cellNode")
+
+    assert "attempt_group_id" in projection
+    assert 'previous.origin === "agent"' in projection
+    assert "_revisions" in projection
+    assert "attempts.slice(0, -1)" in projection
+    assert 'el("details", "nbc-revisions")' in cell_source
+    assert "revisions.forEach" in cell_source
+    assert ".nbc-revisions" in STYLE_CSS
 
 
 def test_provenance_caches_follow_artifact_versions_and_refresh_mutations() -> None:

@@ -130,9 +130,39 @@ def test_submit_output_does_not_skip_capture_or_execution_log(tmp_path):
     assert result.capture.files_written == ["result.csv"]
     assert harness.records[0]["result"] is result.result
     assert harness.records[0]["figures"] == ["figure-1.png"]
-    assert events[0]["chunk"] == "⚙Analyze\n"
-    assert events[1]["chunk"].endswith("----- output -----\n")
-    assert events[2]["chunk"] == "live output"
+    assert [event["type"] for event in events] == [
+        "notebook_cell_start",
+        "text_chunk",
+        "text_chunk",
+        "notebook_cell_chunk",
+        "text_chunk",
+        "notebook_cell_finished",
+    ]
+    assert events[0] == {
+        "type": "notebook_cell_start",
+        "frame_id": "frame-1",
+        "root_frame_id": "frame-1",
+        "producing_cell_id": "cell-1",
+        "cell_index": 1,
+        "kernel_id": "python — struct",
+        "language": "python",
+        "origin": "agent",
+        "source": "# Analyze\nprint('ok')",
+        "title": "Analyze",
+        "status": "running",
+    }
+    assert events[1]["chunk"] == "⚙Analyze\n"
+    assert events[2]["chunk"].endswith("----- output -----\n")
+    assert events[3]["chunk"] == "live output"
+    assert events[3]["producing_cell_id"] == "cell-1"
+    assert events[4]["chunk"] == "live output"
+    finished = events[-1]
+    assert finished["producing_cell_id"] == "cell-1"
+    assert finished["status"] == "ok"
+    assert finished["origin"] == "agent"
+    assert finished["stdout"] == "ok"
+    assert finished["figures"] == ["figure-1.png"]
+    assert finished["files_written"] == ["result.csv"]
 
 
 def test_protocol_only_submit_is_audited_without_streaming_a_notebook_cell(tmp_path):
@@ -188,7 +218,12 @@ def test_safety_refusal_is_a_logged_soft_error_without_runtime_or_capture(tmp_pa
     assert result.result["error"] == "blocked by safety policy"
     assert result.capture == CaptureResult()
     assert harness.records[0]["files_written"] == []
-    assert events[-1]["chunk"] == "\nblocked by safety policy"
+    assert events[-2]["chunk"] == "\nblocked by safety policy"
+    assert events[-2]["producing_cell_id"] == "cell-safe"
+    assert events[-1]["type"] == "notebook_cell_finished"
+    assert events[-1]["producing_cell_id"] == "cell-safe"
+    assert events[-1]["status"] == "error"
+    assert events[-1]["error"] == "blocked by safety policy"
 
 
 def test_missing_r_runtime_is_a_logged_soft_error(tmp_path):
@@ -230,17 +265,22 @@ def test_r_protocol_exception_shuts_down_only_the_executing_lease(tmp_path):
     lease = session.kernels.ensure("r", None, lambda: kernel)
     service = CellExecutionService(harness.ports(), id_factory=lambda: "cell-r-bad")
 
+    events = []
     with pytest.raises(RuntimeError, match="malformed R frame"):
         service.execute(
             session,
             CellRequest("bad()", "agent", language="r"),
-            lambda event: None,
+            events.append,
         )
 
     assert session.kernels.current("r") is None
     assert harness.seen_lease == lease
     assert kernel.shutdown_calls == 1
     assert "capture" not in harness.order and "record" not in harness.order
+    assert events[-1]["type"] == "notebook_cell_finished"
+    assert events[-1]["producing_cell_id"] == "cell-r-bad"
+    assert events[-1]["status"] == "error"
+    assert events[-1]["error"] == "malformed R frame"
 
 
 def test_r_exception_from_stale_lease_does_not_close_replacement(tmp_path):

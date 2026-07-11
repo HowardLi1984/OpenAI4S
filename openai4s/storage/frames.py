@@ -645,8 +645,12 @@ class FrameRepository:
             if result.get("error")
             else ("interrupted" if result.get("interrupted") else "ok")
         )
+        # Execution history is an append-only audit record. A duplicate Cell ID
+        # means the caller is attempting to overwrite an already-observed
+        # execution, which must fail loudly instead of silently replacing its
+        # source, output, error, provenance, or timestamp.
         self._execute(
-            "INSERT OR REPLACE INTO execution_log(producing_cell_id,frame_id,"
+            "INSERT INTO execution_log(producing_cell_id,frame_id,"
             "root_frame_id,project_id,cell_seq,cell_index,kernel_id,language,"
             "status,origin,code,stdout,stderr,error,figures,files_read,"
             "files_written,interrupted,wall_s,cpu_s,peak_rss_kb,created_at) "
@@ -682,7 +686,7 @@ class FrameRepository:
         """Return a session's notebook execution log oldest first."""
         with self._lock:
             rows = self._connection.execute(
-                "SELECT producing_cell_id,cell_index,kernel_id,language,status,"
+                "SELECT producing_cell_id,cell_index,kernel_id,language,status,origin,"
                 "code,stdout,stderr,error,figures,files_read,files_written,"
                 "cpu_s,peak_rss_kb,created_at FROM execution_log "
                 "WHERE root_frame_id=? ORDER BY created_at ASC",

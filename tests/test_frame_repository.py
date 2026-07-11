@@ -346,7 +346,7 @@ def test_frame_browse_detail_and_regex_search_contracts(tmp_path):
         repository.search_frames("[")
 
 
-def test_execution_log_status_json_fallback_replace_and_clock(tmp_path):
+def test_execution_log_status_json_fallback_append_only_and_clock(tmp_path):
     store, repository, clock = _repository(tmp_path)
     frame = repository.new_frame(project_id="science")
     first_id = repository.log_cell(
@@ -394,16 +394,17 @@ def test_execution_log_status_json_fallback_replace_and_clock(tmp_path):
     assert malformed["files_read"] == []
     assert malformed["files_written"] == {}
 
-    repository.log_cell(
-        frame_id=frame,
-        root_frame_id=frame,
-        code="replacement()",
-        result={"id": "cell-1"},
-    )
-    replaced = repository.cell_detail("cell-1")
-    assert replaced["code"] == "replacement()"
-    assert replaced["status"] == "ok"
-    assert replaced["created_at"] == 1003
+    with pytest.raises(sqlite3.IntegrityError):
+        repository.log_cell(
+            frame_id=frame,
+            root_frame_id=frame,
+            code="replacement()",
+            result={"id": "cell-1"},
+        )
+    original = repository.cell_detail("cell-1")
+    assert original["code"] == "compute()"
+    assert original["status"] == "interrupted"
+    assert original["created_at"] == 1001
     assert clock.calls == [1000, 1001, 1002, 1003]
 
     with pytest.raises(TypeError):
