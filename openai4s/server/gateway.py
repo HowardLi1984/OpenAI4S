@@ -58,7 +58,6 @@ from openai4s.server.agent_run import EventCancellation
 from openai4s.server.agent_run import ProseStreamer as _ProseStreamer
 from openai4s.server.agent_run import WebActionExecutor, WebEventSink
 from openai4s.server.artifacts import ArtifactManager, ArtifactOperationError
-from openai4s.server.artifacts import is_text_editable as _is_text_editable
 from openai4s.server.cell_run import CellExecutionPorts, CellExecutionService
 from openai4s.server.execution_views import ExecutionViewService
 
@@ -70,6 +69,7 @@ from openai4s.server.plans import normalize_plan as _normalize_plan
 from openai4s.server.plans import public_plan as _plan_public
 from openai4s.server.plans import short_hash as _short_hash
 from openai4s.server.plans import slugify as _slugify
+from openai4s.server.reviews import ReviewPorts, ReviewService
 from openai4s.server.skills import SkillCustomizationService
 from openai4s.server.titles import SessionTitleService
 from openai4s.skills_loader import SkillLoader
@@ -829,9 +829,37 @@ class SessionRunner:
         self.skills = SkillLoader(cfg=cfg)
         self._sessions: dict[str, SessionState] = {}
         self._jobs: dict[str, MessageJob] = {}
-        self._review_ops: dict[str, threading.Event] = {}
-        self._review_calls: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
+        self.reviews = ReviewService(
+            store=lambda: self.store,
+            lock=self._lock,
+            jobs=self._jobs,
+            ports=ReviewPorts(
+                state_for=lambda root_frame_id, project_id: self._state(
+                    root_frame_id, project_id
+                ),
+                emitter_for=lambda root_frame_id: self.hub.emitter(root_frame_id),
+                llm_config_for=lambda state: self._llm_cfg(state),
+                review_evidence=lambda evidence, config: review_evidence(
+                    evidence, config
+                ),
+                providers=lambda: PROVIDERS,
+                clean_api_key=lambda value: _clean_api_key(value),
+                job_factory=lambda job_id, root_frame_id: MessageJob(
+                    job_id, root_frame_id
+                ),
+                busy_error=lambda code, message: GatewayError(code, message),
+                run_reviewer=lambda *args, **kwargs: self._run_reviewer(
+                    *args, **kwargs
+                ),
+                review_config_for=lambda state: self._review_llm_cfg(state),
+                artifact_excerpt=lambda artifact: self._review_artifact_excerpt(
+                    artifact
+                ),
+            ),
+        )
+        self._review_ops = self.reviews.operations
+        self._review_calls = self.reviews.provider_calls
         self._ws_root = cfg.data_dir / "agent-workspaces"
         self._ws_root.mkdir(parents=True, exist_ok=True)
         self.artifacts = ArtifactManager(
@@ -1292,9 +1320,7 @@ class SessionRunner:
 
     def cancel(self, root_frame_id: str) -> None:
         with self._lock:
-            pending_review = self._review_ops.get(root_frame_id)
-            if pending_review is not None:
-                pending_review.set()
+            self.reviews.cancel_locked(root_frame_id)
             st = self._sessions.get(root_frame_id)
         if st is None:
             return
@@ -1760,129 +1786,7 @@ class SessionRunner:
         return job
 
     def submit_review(self, root_frame_id: str, project_id: str) -> MessageJob:
-        """Run an on-demand Reviewer without adding a user/assistant message."""
-        job = MessageJob(f"review-job-{uuid.uuid4().hex[:12]}", root_frame_id)
-        operation_cancel = threading.Event()
-        with self._lock:
-            provider_call = self._review_calls.get(root_frame_id)
-            if root_frame_id in self._review_ops or (
-                provider_call is not None and not provider_call.is_set()
-            ):
-                raise GatewayError(409, "a previous review call is still finishing")
-            done = [
-                jid
-                for jid, existing in self._jobs.items()
-                if existing.done.is_set()
-                and (time.time() - (existing.finished_at or 0)) > 300
-            ]
-            for jid in done:
-                self._jobs.pop(jid, None)
-            self._review_ops[root_frame_id] = operation_cancel
-            self._jobs[job.job_id] = job
-
-        def _target() -> None:
-            emit = self.hub.emitter(root_frame_id)
-            frame_status = "ready"
-            job_result: dict | None = None
-            job_error: str | None = None
-            try:
-                st = self._state(root_frame_id, project_id)
-                with st.execution_barrier():
-                    # Capture after acquiring the turn lock. If the user requested
-                    # a review while a turn was still running, that turn gets to
-                    # publish its real terminal status before we temporarily show
-                    # the Reviewer as processing.
-                    current_frame = self.store.get_frame(root_frame_id) or {}
-                    frame_status = str(current_frame.get("status") or "ready")
-                    if frame_status not in {
-                        "ready",
-                        "done",
-                        "failed",
-                        "cancelled",
-                        "completed",
-                        "success",
-                    }:
-                        # Acquiring the turn lock proves there is no active turn.
-                        # Repair a stale processing/running status left by a prior
-                        # daemon crash before temporarily showing the Reviewer.
-                        frame_status = "ready"
-                        self.store.update_frame(root_frame_id, status=frame_status)
-                    if operation_cancel.is_set():
-                        st.cancel.set()
-                    emit(
-                        {
-                            "type": "frame_update",
-                            "frame_id": root_frame_id,
-                            "status": "processing",
-                        }
-                    )
-                    message_count = self.store.message_count(root_frame_id)
-                    messages = self.store.list_messages(
-                        root_frame_id, start=max(0, message_count - 1000), limit=1000
-                    )
-                    last_user = max(
-                        (i for i, m in enumerate(messages) if m.get("role") == "user"),
-                        default=-1,
-                    )
-                    user_text = (
-                        str(messages[last_user].get("content") or "")
-                        if last_user >= 0
-                        else ""
-                    )
-                    assistant_text = "\n\n".join(
-                        str(m.get("content") or "")
-                        for m in messages[last_user + 1 :]
-                        if m.get("role") == "assistant"
-                    ).strip()
-                    result = self._run_reviewer(
-                        st,
-                        emit,
-                        user_text=user_text,
-                        assistant_text=assistant_text,
-                        artifact_versions_before={},
-                        cell_count_before=0,
-                        step_count_before=0,
-                        mode="manual",
-                    )
-                    job_status = "cancelled" if st.cancel.is_set() else "completed"
-                    job_result = {
-                        "status": job_status,
-                        "frame_id": root_frame_id,
-                        "review": result,
-                    }
-            except Exception as exc:  # noqa: BLE001
-                job_error = str(exc)
-            finally:
-                try:
-                    emit(
-                        {
-                            "type": "frame_update",
-                            "frame_id": root_frame_id,
-                            "status": frame_status,
-                        }
-                    )
-                except Exception:
-                    pass
-                with self._lock:
-                    if self._review_ops.get(root_frame_id) is operation_cancel:
-                        self._review_ops.pop(root_frame_id, None)
-                job.finish(result=job_result, error=job_error)
-
-        thread = threading.Thread(
-            target=_target,
-            name=f"openai4s-review-{root_frame_id}",
-            daemon=True,
-        )
-        job.thread = thread
-        try:
-            thread.start()
-        except Exception:
-            with self._lock:
-                if self._review_ops.get(root_frame_id) is operation_cancel:
-                    self._review_ops.pop(root_frame_id, None)
-                self._jobs.pop(job.job_id, None)
-            raise
-        return job
+        return self.reviews.submit(root_frame_id, project_id)
 
     # -- capture figures + written files after a cell -> artifacts ---------
     def _snapshot(self, ws: Path) -> dict[str, int]:
@@ -2065,83 +1969,14 @@ class SessionRunner:
         return f"**这一轮出错了。** {msg[:300]}"
 
     def _auto_review_enabled(self, root_frame_id: str) -> bool:
-        value = self.store.get_setting(f"review:auto:{root_frame_id}")
-        if value is None:
-            value = self.store.get_setting("auto_review_enabled", "0")
-        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+        return self.reviews.auto_enabled(root_frame_id)
 
     def _review_llm_cfg(self, st: SessionState):
-        import dataclasses
-
-        cfg = self._llm_cfg(st)
-        local_model = self.store.get_setting(f"review:model:{st.root_frame_id}")
-        if local_model == "__agent__":
-            model = None
-        else:
-            model = local_model
-        if local_model is None and not model:
-            model = self.store.get_setting("reviewer_model")
-        overrides: dict = {"timeout_s": min(float(cfg.timeout_s), 45.0)}
-        model = (model or "").strip()
-        if model:
-            profile = next(
-                (
-                    p
-                    for p in self.store.list_model_profiles()
-                    if str(p.get("model") or "").strip() == model
-                ),
-                None,
-            )
-            provider = str((profile or {}).get("provider") or "").strip()
-            if not provider:
-                provider = next(
-                    (
-                        name
-                        for name, spec in PROVIDERS.items()
-                        if str(spec.get("model") or "").strip() == model
-                    ),
-                    "",
-                )
-            overrides["model"] = model
-            if provider and provider != cfg.provider:
-                overrides["provider"] = provider
-                overrides["base_url"] = str(
-                    (profile or {}).get("base_url") or ""
-                ).strip()
-                overrides["api_key"] = _clean_api_key((profile or {}).get("api_key"))
-            elif profile and profile.get("base_url"):
-                overrides["base_url"] = str(profile["base_url"]).strip()
-            if profile and _clean_api_key(profile.get("api_key")):
-                overrides["api_key"] = _clean_api_key(profile.get("api_key"))
-        try:
-            return dataclasses.replace(cfg, **overrides)
-        except Exception:  # noqa: BLE001
-            return cfg
+        return self.reviews.llm_config(st)
 
     @staticmethod
     def _review_artifact_excerpt(artifact: dict) -> str | None:
-        path = artifact.get("path")
-        if not path or not Path(path).is_file():
-            return None
-        filename = str(artifact.get("filename") or path).lower()
-        content_type = str(artifact.get("content_type") or "").lower()
-        readable = (
-            content_type.startswith("text/")
-            or content_type
-            in {
-                "application/json",
-                "application/xml",
-                "application/javascript",
-            }
-            or filename.endswith((".md", ".txt", ".csv", ".tsv", ".json", ".py", ".r"))
-        )
-        if not readable:
-            return None
-        try:
-            data = Path(path).read_bytes()[:8_000]
-        except OSError:
-            return None
-        return data.decode("utf-8", errors="replace")
+        return ReviewService.artifact_excerpt(artifact)
 
     def _run_reviewer(
         self,
@@ -2155,255 +1990,19 @@ class SessionRunner:
         step_count_before: int = 0,
         mode: str = "auto",
     ) -> dict | None:
-        """Persist and stream one constrained Reviewer step; never fail the turn."""
-        rid = st.root_frame_id
-        step_id = f"review-{uuid.uuid4().hex[:12]}"
-        cfg = self._review_llm_cfg(st)
-        self.store.add_step(
-            step_id=step_id,
-            frame_id=rid,
-            kind="review",
-            title="Reviewer",
-            input={"mode": mode, "model": cfg.model or None},
-            status="running",
+        return self.reviews.run(
+            st,
+            emit,
+            user_text=user_text,
+            assistant_text=assistant_text,
+            artifact_versions_before=artifact_versions_before,
+            cell_count_before=cell_count_before,
+            step_count_before=step_count_before,
+            mode=mode,
         )
-        emit(
-            {
-                "type": "step",
-                "frame_id": rid,
-                "step_id": step_id,
-                "kind": "review",
-                "title": "Reviewer",
-                "input": {"mode": mode, "model": cfg.model or None},
-                "status": "running",
-            }
-        )
-        try:
-            artifacts = self.store.list_artifacts({"root_frame_id": rid})
-            changed = []
-            changed_total = 0
-            for artifact in artifacts:
-                aid = artifact.get("artifact_id") or artifact.get("id")
-                if not aid:
-                    continue
-                latest = artifact.get("latest_version_id")
-                if (
-                    aid in artifact_versions_before
-                    and artifact_versions_before[aid] == latest
-                ):
-                    continue
-                changed_total += 1
-                if len(changed) >= 64:
-                    continue
-                resolved_path = artifact.get(
-                    "path"
-                ) or self.store.resolve_artifact_path(aid)
-                artifact_with_path = {**artifact, "path": resolved_path}
-                item = {
-                    "artifact_id": aid,
-                    "filename": artifact.get("filename"),
-                    "content_type": artifact.get("content_type"),
-                    "size_bytes": artifact.get("size_bytes"),
-                    "latest_version_id": latest,
-                    "exists": bool(resolved_path and Path(resolved_path).is_file()),
-                }
-                excerpt = (
-                    self._review_artifact_excerpt(artifact_with_path)
-                    if len(changed) < 12
-                    else None
-                )
-                if excerpt:
-                    item["excerpt"] = excerpt
-                changed.append(item)
-            cells = self.store.list_cells(rid)[cell_count_before:]
-            execution = []
-            for cell in cells[-24:]:
-                execution.append(
-                    {
-                        "cell_index": cell.get("cell_index"),
-                        "source": str(cell.get("code") or "")[:5_000],
-                        "stdout": str(cell.get("stdout") or "")[:4_000],
-                        "stderr": str(cell.get("stderr") or "")[:2_000],
-                        "error": str(cell.get("error") or "")[:2_000],
-                        "status": cell.get("status"),
-                        "files_written": cell.get("files_written") or [],
-                        "files_read": cell.get("files_read") or [],
-                    }
-                )
-            tool_evidence = []
-            tool_start = max(step_count_before, self.store.step_count(rid) - 200)
-            for step in self.store.list_steps(rid, start=tool_start, limit=200)[-32:]:
-                if step.get("kind") == "review":
-                    continue
-                tool_evidence.append(
-                    {
-                        "kind": step.get("kind"),
-                        "title": step.get("title"),
-                        "status": step.get("status"),
-                        "summary": step.get("summary"),
-                        "input": step.get("input"),
-                        "output": step.get("output"),
-                    }
-                )
-            evidence = {
-                "user_request": user_text[:16_000],
-                "final_answer": assistant_text[:24_000],
-                "submitted_output": getattr(
-                    getattr(st, "dispatcher", None), "last_output", None
-                ),
-                "execution": execution,
-                "tool_evidence": tool_evidence,
-                "changed_artifacts": changed,
-                "changed_artifact_count": changed_total,
-                "omitted_artifact_count": max(0, changed_total - len(changed)),
-            }
-            if st.cancel.is_set():
-                output = {
-                    "verdict": "cancelled",
-                    "provider_call": "not_started",
-                }
-                self.store.update_step(
-                    step_id,
-                    status="cancelled",
-                    output=output,
-                    summary="Review cancelled",
-                )
-                emit(
-                    {
-                        "type": "step_update",
-                        "frame_id": rid,
-                        "step_id": step_id,
-                        "status": "cancelled",
-                        "output": output,
-                        "summary": "Review cancelled",
-                    }
-                )
-                return None
-            review_done = threading.Event()
-            review_cancelled = threading.Event()
-            review_box: dict = {}
-            with self._lock:
-                previous = self._review_calls.get(rid)
-                if previous is not None and not previous.is_set():
-                    raise RuntimeError("a previous review call is still finishing")
-                self._review_calls[rid] = review_done
-
-            def invoke_review() -> None:
-                try:
-                    review_box["result"] = review_evidence(evidence, cfg)
-                except Exception as review_exc:  # noqa: BLE001
-                    review_box["error"] = review_exc
-                finally:
-                    review_done.set()
-                    with self._lock:
-                        if self._review_calls.get(rid) is review_done:
-                            self._review_calls.pop(rid, None)
-                    if review_cancelled.is_set():
-                        finished_output = {
-                            "verdict": "cancelled",
-                            "provider_call": "finished",
-                        }
-                        try:
-                            self.store.update_step(
-                                step_id,
-                                status="cancelled",
-                                output=finished_output,
-                                summary="Review cancelled",
-                            )
-                            emit(
-                                {
-                                    "type": "step_update",
-                                    "frame_id": rid,
-                                    "step_id": step_id,
-                                    "status": "cancelled",
-                                    "output": finished_output,
-                                    "summary": "Review cancelled",
-                                }
-                            )
-                        except Exception:  # noqa: BLE001 — cleanup is best-effort
-                            pass
-
-            threading.Thread(
-                target=invoke_review,
-                name=f"openai4s-review-call-{rid}",
-                daemon=True,
-            ).start()
-            while not review_done.wait(0.2):
-                if st.cancel.is_set():
-                    review_cancelled.set()
-                    output = {
-                        "verdict": "cancelled",
-                        "provider_call": "finishing",
-                    }
-                    self.store.update_step(
-                        step_id,
-                        status="cancelled",
-                        output=output,
-                        summary="Review cancelled · provider request finishing",
-                    )
-                    emit(
-                        {
-                            "type": "step_update",
-                            "frame_id": rid,
-                            "step_id": step_id,
-                            "status": "cancelled",
-                            "output": output,
-                            "summary": "Review cancelled · provider request finishing",
-                        }
-                    )
-                    return None
-            if review_box.get("error") is not None:
-                raise review_box["error"]
-            result = review_box["result"]
-            result["reviewed_artifacts"] = [a["artifact_id"] for a in changed]
-            usage = result.get("usage") or {}
-            self.store.add_frame_tokens(
-                rid,
-                input_tokens=usage.get("input_tokens", 0) or 0,
-                output_tokens=usage.get("output_tokens", 0) or 0,
-            )
-            summary = result.get("summary") or "No issues found"
-            self.store.update_step(
-                step_id, status="done", output=result, summary=summary
-            )
-            emit(
-                {
-                    "type": "step_update",
-                    "frame_id": rid,
-                    "step_id": step_id,
-                    "status": "done",
-                    "output": result,
-                    "summary": summary,
-                }
-            )
-            return result
-        except Exception as exc:  # noqa: BLE001 — review must not fail main work
-            output = {"error": str(exc)[:500], "verdict": "unavailable"}
-            self.store.update_step(
-                step_id,
-                status="error",
-                output=output,
-                summary="Review unavailable",
-            )
-            emit(
-                {
-                    "type": "step_update",
-                    "frame_id": rid,
-                    "step_id": step_id,
-                    "status": "error",
-                    "output": output,
-                    "summary": "Review unavailable",
-                }
-            )
-            return None
 
     def review_call_inflight(self, root_frame_id: str) -> bool:
-        """Whether an uncancellable provider request is still winding down."""
-        with self._lock:
-            if root_frame_id in self._review_ops:
-                return True
-            call = self._review_calls.get(root_frame_id)
-            return bool(call is not None and not call.is_set())
+        return self.reviews.call_inflight(root_frame_id)
 
     def _summarize_title(self, user_text: str, llm_cfg) -> str | None:
         return self.titles.summarize(user_text, llm_cfg)
