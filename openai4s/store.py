@@ -38,6 +38,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from openai4s.storage.plans import PlanRepository
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS frames (
     frame_id      TEXT PRIMARY KEY,
@@ -454,6 +456,11 @@ class Store:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._migrate()
+        self._plans = PlanRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
 
     # --- migration (add columns missing from a pre-existing DB) -----------
     _MIGRATIONS = {
@@ -2250,18 +2257,7 @@ class Store:
 
     # --- plans (structured plan → approve → auto-execute) ----------------
     def _plan_row(self, row) -> dict:
-        d = dict(row)
-        for k in ("steps", "step_status"):
-            if d.get(k):
-                try:
-                    d[k] = json.loads(d[k])
-                except (ValueError, TypeError):
-                    pass
-        if not isinstance(d.get("steps"), list):
-            d["steps"] = []
-        if not isinstance(d.get("step_status"), dict):
-            d["step_status"] = {}
-        return d
+        return self._plans.normalize_row(row)
 
     def create_plan(
         self,
@@ -2275,60 +2271,26 @@ class Store:
         artifact_id: str | None = None,
         status: str = "draft",
     ) -> dict:
-        now = _now_ms()
-        plan_id = f"plan-{uuid.uuid4().hex[:12]}"
-        self._exec(
-            "INSERT INTO plans(plan_id,frame_id,project_id,title,rationale,"
-            "confidence,steps,status,step_status,artifact_id,created_at,updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                plan_id,
-                frame_id,
-                project_id,
-                title,
-                rationale,
-                confidence,
-                json.dumps(steps, ensure_ascii=False, default=str),
-                status,
-                json.dumps({}, ensure_ascii=False),
-                artifact_id,
-                now,
-                now,
-            ),
+        return self._plans.create(
+            frame_id=frame_id,
+            project_id=project_id,
+            title=title,
+            rationale=rationale,
+            confidence=confidence,
+            steps=steps,
+            artifact_id=artifact_id,
+            status=status,
         )
-        return self.get_plan(plan_id)
 
     def get_plan(self, plan_id: str) -> dict | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM plans WHERE plan_id=?", (plan_id,)
-            ).fetchone()
-        return self._plan_row(row) if row else None
+        return self._plans.get(plan_id)
 
     def get_plan_by_frame(self, frame_id: str) -> dict | None:
         """The most recent (non-discarded) plan for a frame, else the newest."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM plans WHERE frame_id=? AND status!='discarded' "
-                "ORDER BY created_at DESC LIMIT 1",
-                (frame_id,),
-            ).fetchone()
-            if row is None:
-                row = self._conn.execute(
-                    "SELECT * FROM plans WHERE frame_id=? "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (frame_id,),
-                ).fetchone()
-        return self._plan_row(row) if row else None
+        return self._plans.get_by_frame(frame_id)
 
     def list_plans(self, frame_id: str, *, limit: int = 50) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM plans WHERE frame_id=? ORDER BY created_at DESC "
-                "LIMIT ?",
-                (frame_id, limit),
-            ).fetchall()
-        return [self._plan_row(r) for r in rows]
+        return self._plans.list_for_frame(frame_id, limit=limit)
 
     def update_plan(
         self,
@@ -2342,54 +2304,26 @@ class Store:
         step_status: dict | None = None,
         artifact_id: str | None = None,
     ) -> None:
-        sets, params = [], []
-
-        def add(col: str, val, js: bool = False) -> None:
-            sets.append(f"{col}=?")
-            params.append(
-                json.dumps(val, ensure_ascii=False, default=str) if js else val
-            )
-
-        if title is not None:
-            add("title", title)
-        if rationale is not None:
-            add("rationale", rationale)
-        if confidence is not None:
-            add("confidence", confidence)
-        if steps is not None:
-            add("steps", steps, True)
-        if status is not None:
-            add("status", status)
-        if step_status is not None:
-            add("step_status", step_status, True)
-        if artifact_id is not None:
-            add("artifact_id", artifact_id)
-        if not sets:
-            return
-        sets.append("updated_at=?")
-        params.append(_now_ms())
-        params.append(plan_id)
-        with self._lock:
-            self._conn.execute(
-                f"UPDATE plans SET {','.join(sets)} WHERE plan_id=?", params
-            )
-            self._conn.commit()
+        self._plans.update(
+            plan_id,
+            title=title,
+            rationale=rationale,
+            confidence=confidence,
+            steps=steps,
+            status=status,
+            step_status=step_status,
+            artifact_id=artifact_id,
+        )
 
     def set_plan_step_status(
         self, plan_id: str, step_id: str, status: str, note: str | None = None
     ) -> dict | None:
         """Merge one step's status into the plan's step_status JSON. Returns the
         updated plan (with steps[] status folded in)."""
-        p = self.get_plan(plan_id)
-        if not p:
-            return None
-        ss = dict(p.get("step_status") or {})
-        ss[step_id] = {"status": status, "note": note, "updated_at": _now_ms()}
-        self.update_plan(plan_id, step_status=ss)
-        return self.get_plan(plan_id)
+        return self._plans.set_step_status(plan_id, step_id, status, note)
 
     def delete_plans_for_frame(self, frame_id: str) -> None:
-        self._exec("DELETE FROM plans WHERE frame_id=?", (frame_id,))
+        self._plans.delete_for_frame(frame_id)
 
     # --- folders (session grouping within a project) --------------------
     def create_folder(self, *, project_id: str, name: str) -> dict:
