@@ -602,6 +602,40 @@ def test_model_profile_activate_moves_to_front_and_sanitizes_key(tmp_path):
     assert store.get_setting("llm_api_key") == ""
 
 
+def test_local_model_discovery_route_is_explicit_and_non_mutating(monkeypatch, tmp_path):
+    class Discovery:
+        def discover(self, *, force=False):
+            return {
+                "endpoints": [{"kind": "ollama", "models": ["qwen3:8b"]}],
+                "probed": 4,
+                "cached": not force,
+                "mutated_settings": False,
+            }
+
+    monkeypatch.setattr(gateway_mod, "LocalModelDiscoveryService", Discovery)
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    replies = []
+    handler._query = lambda: {"force": ["true"]}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+
+    handler._api("GET", "/model-endpoints/discover")
+
+    assert replies == [
+        (
+            200,
+            {
+                "endpoints": [{"kind": "ollama", "models": ["qwen3:8b"]}],
+                "probed": 4,
+                "cached": False,
+                "mutated_settings": False,
+            },
+        )
+    ]
+
+
 # --- API contract assertions (documented in docs/webapp-api.md) ------------
 def test_api_unknown_route_returns_error_envelope(tmp_path):
     """The catch-all error envelope is {"error": ...} — NOT {"detail": ...}.

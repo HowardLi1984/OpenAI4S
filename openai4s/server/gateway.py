@@ -72,6 +72,7 @@ from openai4s.server.execution_coordinator import (
     WebExecutionCoordinator,
 )
 from openai4s.server.execution_views import ExecutionViewService
+from openai4s.server.model_discovery import LocalModelDiscoveryService
 
 # Keep the former gateway helper names as compatibility aliases; plan behavior
 # itself now lives together in PlanService.
@@ -4277,6 +4278,7 @@ def _clean_api_key(value: str | None) -> str:
 
 def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
     store = get_store(cfg.db_path)
+    model_discovery = LocalModelDiscoveryService()
     execution_views = ExecutionViewService(
         store=store,
         format_timestamp=lambda value: _iso(value),
@@ -4676,6 +4678,14 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             # ---- models ----
             if sub == "/models" and method == "GET":
                 self._json(self._models_payload())
+                return
+            if sub == "/model-endpoints/discover" and method == "GET":
+                force = (q.get("force") or [""])[0].strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                }
+                self._json(model_discovery.discover(force=force))
                 return
             if sub == "/models/default":
                 if method == "GET":
