@@ -31,6 +31,7 @@ from openai4s.host.endpoints import free_port as _free_port
 from openai4s.host.endpoints import probe_ready as _probe_ready
 from openai4s.host.files import WorkspaceFileService
 from openai4s.host.files import is_secret_path as _is_secret_path
+from openai4s.host.mcp import MCPService
 from openai4s.host.progress import PLAN_STEP_STATUSES, ProgressService
 from openai4s.host.skills import SkillService
 from openai4s.llm import chat
@@ -575,6 +576,7 @@ class HostDispatcher:
             readiness_probe=lambda url, route: _probe_ready(url, route),
             fingerprint=lambda *fields: _endpoint_fingerprint(*fields),
         )
+        self._mcp_service = MCPService(self.store)
         # app tiles rendered this session
         self._app_tiles: list[dict] = []
         # background executor (exec_peek / exec_interrupt), built lazily.
@@ -1889,54 +1891,16 @@ class HostDispatcher:
 
     # --- mcp ------------------------------------------------------
     def _connector(self, server: str) -> dict | None:
-        c = self.store.get_connector(server)
-        if c:
-            return c
-        for x in self.store.list_connectors():
-            if x.get("name") == server:
-                return x
-        return None
+        return self._mcp_service.connector(server)
 
     def _m_mcp_list(self, *_a: Any) -> list:
-        """Enabled connectors (MCP servers) available to this session."""
-        return [
-            {
-                "id": c["connector_id"],
-                "name": c["name"],
-                "description": c.get("description"),
-            }
-            for c in self.store.list_connectors()
-            if c.get("enabled")
-        ]
+        return self._mcp_service.list()
 
     def _m_mcp_tools(self, server: str) -> Any:
-        from openai4s.mcp_client import manager
+        return self._mcp_service.tools(server)
 
-        c = self._connector(server)
-        if not c:
-            return {"error": f"connector {server!r} not found"}
-        cfg = {"command": c["command"], "args": c.get("args"), "env": c.get("env")}
-        try:
-            return {"tools": manager().list_tools(c["connector_id"], cfg)}
-        except Exception as e:  # noqa: BLE001
-            return {"error": f"mcp tools failed: {e}"}
-
-    def _m_mcp_call(self, spec: dict) -> dict:
-        from openai4s.mcp_client import manager
-
-        server = spec.get("server")
-        tool = spec.get("tool")
-        args = spec.get("args") or {}
-        c = self._connector(server)
-        if not c:
-            return {"error": f"connector {server!r} not found"}
-        if not c.get("enabled"):
-            return {"error": f"connector {server!r} is disabled"}
-        cfg = {"command": c["command"], "args": c.get("args"), "env": c.get("env")}
-        try:
-            return manager().call_tool(c["connector_id"], cfg, tool, args)
-        except Exception as e:  # noqa: BLE001
-            return {"error": f"mcp_call({server}.{tool}) failed: {e}"}
+    def _m_mcp_call(self, spec: dict) -> Any:
+        return self._mcp_service.call(spec)
 
     # --- background exec: peek / interrupt -----------------------
     def _new_background_kernel(self):
