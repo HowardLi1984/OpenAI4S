@@ -1,32 +1,56 @@
-# Architecture — the Code-as-Action dual loop
+# Architecture — hybrid control plane and science runtime
 
-OpenAI4S drives the model with a **dual loop**: an outer REPL *turn* loop, and an inner synchronous *host-RPC* loop that runs **inside** a single code cell.
+OpenAI4S drives the model with one outer agent loop and two deliberately
+different action channels:
 
-**The host executes exactly two kinds of instructions**: ` ```python ` cells on the persistent Jupyter-style kernel ([`kernel/worker.py`](../openai4s/kernel/worker.py)) and ` ```r ` cells on the persistent R kernel ([`kernel/r_worker.R`](../openai4s/kernel/r_worker.R)) — both driven by the same manager over the same JSON-per-line frame protocol. Nothing else (no host-side shell): `host.bash` runs *inside* the kernel worker, and the ReAct tool surface carries no shell tool.
+- **Native JSON tool calls are the orchestration control plane.** They handle
+  deterministic metadata operations, external services, permissions, and
+  workflow control through provider-native structured calls.
+- **Python/R Code-as-Action is the scientific execution plane.** Real
+  computation runs in persistent language kernels and may synchronously call
+  back into host services while a cell is still executing.
+
+The channels never compete in one step: structured tool calls take priority;
+otherwise exactly one complete Python/R cell may run. A task succeeds only
+when a Python cell calls `host.submit_output(...)`. A tool result, prose reply,
+R cell, cancellation, or maximum-turn stop is not completion.
 
 ```mermaid
 flowchart TB
-    UI["CLI  ·  Web UI (HTTP + WebSocket daemon)"] --> M
-    subgraph outer["① OUTER LOOP · REPL turn loop"]
+    UI["CLI · Web UI"] --> M["Planner / reasoner"]
+    M --> LLM["Multi-provider LLM"]
+    LLM --> ROUTE{"Action router"}
+    subgraph outer["① OUTER LOOP · AgentEngine"]
         direction TB
-        M["Model emits prose + ONE code cell<br/>(```python or ```r)"] --> SAFE{"Pre-exec<br/>safety classifier"}
+        ROUTE -->|"native JSON calls"| TOOLS["Control-tool executor<br/>permissions · metadata · external services"]
+        ROUTE -->|"one Python/R cell"| SAFE{"Pre-exec safety classifier"}
         SAFE -->|SAFE python| K["Persistent PYTHON kernel · subprocess<br/>namespace persists · stdout captured"]
         SAFE -->|SAFE r| RK["Persistent R kernel · subprocess<br/>same frame protocol · analysis-only"]
-        K --> COLLECT["Collect stdout · artifacts · rusage"]
-        RK --> COLLECT
-        COLLECT -->|"continue?"| M
+        TOOLS --> OBS["Canonical tool results / observation"]
+        K --> OBS
+        RK --> OBS
+        OBS --> M
     end
     subgraph inner["② INNER LOOP · host RPC · synchronous, mid-cell (python only)"]
         direction TB
         H["host.web_search · web_fetch · read_file<br/>host.llm · delegate · compute · fold · save_artifact"]
     end
     K <-->|"host_call → host_ack → host_response"| H
-    M -.->|prompt| LLM["Multi-provider base model<br/>ark · chatgpt · claude · gemini"]
-    LLM -.->|completion| M
+    K -->|"host.submit_output"| DONE["completed"]
 ```
 
-- **① Outer loop** — the REPL *turn* loop: the model produces a turn (prose + one code cell, ` ```python ` or ` ```r `), the cell is screened and executed in the matching persistent kernel, results/costs are collected, and the loop decides whether to continue. Both loop bodies parse actions through one shared core ([`agent/actions.py`](../openai4s/agent/actions.py)). A task ends only when the agent calls `host.submit_output(...)` — from a python cell; the R kernel is an *analysis* channel (persistent namespace, same result contract, no `host` object).
+- **① Outer loop** — [`agent/engine.py`](../openai4s/agent/engine.py)
+  owns the provider-neutral state machine. [`agent/actions.py`](../openai4s/agent/actions.py)
+  chooses a native tool batch, one Python/R cell, or no action.
+  [`agent/runtime.py`](../openai4s/agent/runtime.py) connects the engine to the
+  local LLM client, compaction, kernels, dispatcher, and CLI transcript;
+  [`server/agent_run.py`](../openai4s/server/agent_run.py) projects the same
+  engine events and actions onto persistent Web sessions and WebSocket events.
 - **② Inner loop** — *within a single cell*, agent code can call `host.llm(...)` / `host.delegate(...)` / `host.compute(...)` any number of times. Each is a synchronous `host_call → host_ack → host_response` RPC on a channel **separate from stdout capture**, so the cell blocks, the host services the call mid-execution, and the cell resumes. **This inner RPC loop does not exist in a `tool_use` architecture** — there, actions are atomic and never call back into the host mid-execution.
+
+`AgentEngine` imports no concrete kernel, dispatcher, store, or server. Those
+are ports assembled by entry-point adapters. This keeps terminal states,
+history ordering, and action priority testable without starting infrastructure.
 
 ## The `host` singleton
 
@@ -54,9 +78,140 @@ host.submit_output(...)                                              # the only 
 
 The engine is **pure Python stdlib**: the kernel is a subprocess speaking a hardened JSON-per-line protocol, the LLM client speaks OpenAI / Anthropic / Gemini wires over `urllib`, and the daemon is `http.server` + a hand-rolled WebSocket — no framework, no third-party dependency in the core.
 
-## The hybrid ReAct tool surface
+## Native JSON control tools
 
-Alongside Code-as-Action, a small **ReAct tool surface** ([`openai4s/tools/`](../openai4s/tools)) exposes the deterministic operations — `list` / `read` / `glob` / `grep` / `web` / `env` / `edit` / `write` — as structured tool calls. The model invokes one by emitting a ` ```tool ` cell carrying a JSON call instead of Python; the call routes through the **same `HostDispatcher`** as `host.*`, so it inherits the permission broker, egress fence, injection screen, and step-card machinery. These are for cheap, side-effect-light steps (look at a file, grep the tree, fetch a page). There is deliberately **no shell tool**: the host executes only python/R cells, and shell commands run inside the kernel (`host.bash`, or `subprocess` in a cell). **Real computation still flows through ` ```python ` / ` ```r ` cells** — the Turing-complete kernels, their persistent namespaces, and (python-side) mid-cell host RPC remain the path for anything that actually computes.
+[`openai4s/tools/`](../openai4s/tools) defines every deterministic control
+operation as a named `Tool` class, following the CoreCoder-style explicit
+catalogue. Each class keeps its public name, schema, safety policy, and real
+`execute()` behaviour together in the corresponding file. `TOOL_TYPES` is the
+single ordered composition root; the LLM adapters translate its instances to
+OpenAI Chat, OpenAI Responses, Anthropic, or Gemini wire formats. Provider
+responses normalize to one lossless tool-call type containing the local ID,
+wire ID, raw arguments, parsed arguments, parse error, and opaque provider
+metadata.
+
+The control executor routes each valid call through the same `HostDispatcher`
+as in-kernel `host.*`, so permissions, egress, injection screening, activity
+events, and audit logging remain shared. It writes one canonical `role=tool`
+history item for every call, including parse errors and calls rejected by the
+per-turn limit. The assistant declaration plus all of its tool results remain
+an atomic group during context compaction.
+
+There is deliberately no native shell tool and no native `submit_output` tool.
+Shell runs only inside the Python kernel, and real scientific work continues
+through persistent Python/R cells. The old fenced ` ```tool ` parser remains a
+silent compatibility path for saved prompts and older clients, but it is no
+longer advertised to the refactored agent.
+
+`HostDispatcher` is the shared orchestration envelope, not the implementation
+home for every capability. It retains wire decoding, permissions and human
+approval, audit/replay recording, injection screening, and activity events,
+then calls the selected class with a `ControlToolContext`. File tools are typed
+against the workspace path port; environment tools are typed against the
+active-runtime hooks. This is a maintainable API boundary for trusted built-in
+code, not an in-process security sandbox. [`host/files.py`](../openai4s/host/files.py)
+owns path confinement and late-bound session workspace selection, while
+read/write/edit/glob/grep/list behaviour stays in the corresponding tool
+classes.
+
+To add a built-in control tool, define one `Tool` subclass with `execute()` and
+add its type to `TOOL_TYPES`; plugins may call `register_tool()` during
+application bootstrap with a new, non-conflicting host method. The dispatcher
+resolves it generically, so no new `_m_*` branch is required. New tools require
+permission by default and may declare their permission target, direct
+secret-path argument, and untrusted-output screening policy on the class.
+Network tools must enable result screening before registration succeeds.
+Model-originated calls use `Tool.invoke()` and must never call `execute()`
+directly, so class extensibility cannot bypass the shared policy envelope.
+Runtime hot-unload is intentionally unsupported.
+
+## Backend ownership
+
+The public compatibility files are composition boundaries, not catch-all
+implementation files. New behaviour goes to the owning class below:
+
+| Boundary | Owns | Implementations |
+|---|---|---|
+| `agent/` | the single provider-neutral outer loop and action routing | `AgentEngine`, actions, ports, local/Web adapters |
+| `tools/` | JSON control-plane schema, policy, and behaviour | one named `Tool` subclass per capability; `TOOL_TYPES` is the only built-in instantiation point |
+| `host_dispatch.py` | permission, approval, audit/replay, injection screening, and RPC routing | thin `_m_*` compatibility adapters |
+| `host/` | host capability behaviour | LLM, files, completion, data/lineage, delegation, progress, skills, MCP, endpoints, credentials, remote capability/science services |
+| `sdk/` | worker-facing `host.*` API | compatible host facade plus the independent compute namespace/job handles |
+| `store.py` | one SQLite connection, schema, migrations, query guard, and public facade | forwards domain operations without duplicating SQL |
+| `storage/` | persistence behaviour and transaction boundaries | frame, artifact, metadata, settings, permission, plan, annotation, agent, connector, and memory repositories |
+| `server/` | persistent Web-session operations | cell, artifact, plan, review, skill, title, and execution-view services; `gateway.py` composes them with stdlib HTTP/WebSocket routes |
+
+Repositories share the `Store` connection and `RLock`; services use narrow
+ports or late-bound providers for replaceable session state. Compatibility
+facades keep existing imports, SDK calls, REST/WS payloads, and saved databases
+working while making each algorithm directly testable. See the
+[backend extension guide](backend-extension-guide.md) for the required path for
+new tools, host capabilities, persistence, and Web-session behaviour.
+
+## Session kernel ownership
+
+Each Web session owns one [`KernelSupervisor`](../openai4s/kernel/supervisor.py)
+with independent, lazy Python and R slots. The supervisor never executes code
+and never reads a protocol frame: each `Kernel` remains the sole synchronous
+reader for its worker. It only owns lifecycle identity, active-environment keys,
+manual-stop state, and a session-monotonic generation.
+
+Lifecycle replacement is build-first. A new worker and its dispatcher must be
+live before the session publishes them and shuts down the old pair, so a failed
+environment switch leaves the usable runtime intact. Cell execution holds the
+session `turn_lock`; stop first requests cancellation/interrupt, then crosses
+that same lock before shutdown. The watchdog freezes a `KernelLease` and uses
+identity-checked kill/restart/abandon operations, preventing a stale helper from
+damaging a newer worker. Python sidecar bootstrap runs once per new generation,
+outside the supervisor lock; R never runs Python bootstrap.
+
+Watchdog policy lives one layer higher in
+[`execution/watchdog.py`](../openai4s/execution/watchdog.py). It is a pure,
+protocol-neutral boundary: timeout budget, permission-pause accounting, exact
+interrupt, hard recovery, and bootstrap callback are inputs; WebSocket events,
+SQLite logging, artifacts, and `host.submit_output()` are deliberately absent.
+Finishing a watched cell only yields an observation—the `AgentEngine` still
+recognizes task success exclusively through the completion signal set by
+`host.submit_output()`.
+
+[`server/cell_run.py`](../openai4s/server/cell_run.py) owns the Web cell
+transaction: allocate identity, prepare the language runtime, emit the existing
+Notebook stream, apply the safety gate, execute through the watchdog, capture
+figures/files, and finally append the execution log. Its request/result values
+live in [`execution/models.py`](../openai4s/execution/models.py). This ordering is
+intentional: even when `host.submit_output()` fires mid-cell, artifact capture
+and logging finish before control returns to `AgentEngine`, which then observes
+the completion signal. The transaction-allocated cell ID is passed into the
+kernel execute frame, so worker provenance, captured artifacts, and the
+execution log share one identity; background and system cells that are outside
+this transaction continue to receive independent kernel-generated IDs.
+
+[`server/artifacts.py`](../openai4s/server/artifacts.py) owns the durable
+workspace side of that transaction: deliverable diffing, Python figure export,
+one environment/provenance snapshot per producing cell, version registration,
+immutable byte snapshots, and restore. Kernel system execution, remote
+provenance draining, event transport, and HTTP serialization remain injected
+Gateway ports, so the manager has no dependency on `SessionRunner`,
+`HostDispatcher`, or `WSHub`.
+
+Artifact ownership separates three identifiers: `frame_id` is the actual
+producer (including a delegated child), `root_frame_id` is the session and
+artifact-collection boundary, and `project_id` is inherited from that root.
+The Store resolves this scope from the frame tree for every write; Web session
+state uses the same resolver. Additive startup repair corrects historical child
+frames/artifacts that were accidentally assigned to `default` or to a child as
+their collection root, while unframed legacy uploads keep their old scope.
+
+Object-level file lineage starts inside the Python worker, where the real
+execution cwd is known. [`kernel/provenance.py`](../openai4s/kernel/provenance.py)
+normalizes reader/writer arguments to an absolute identity path plus a
+filename relative to the kernel's stable execution root before calling
+`prov_resolve_path` or `prov_record`. A later `os.chdir()` changes where a
+relative path resolves but not the artifact namespace root. The Web and CLI
+runtime adapters also inject their workspace, interpreter, and environment into
+independent background-kernel factories, so the host never guesses where a
+relative path came from. Store lookup first uses the exact live path, then a
+physical-path fallback for legacy relative rows and symlink aliases.
 
 ## The R execution channel
 

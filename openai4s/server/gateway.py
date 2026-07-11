@@ -2,7 +2,8 @@
 
 This is the merge layer: it serves the rich openai4s-local web UI (dashboard +
 conversation + tabbed right dock + 3Dmol viewer + notebook) and backs it with the
-openai4s Code-as-Action engine (persistent kernel, host SDK, SQLite store).
+hybrid AgentEngine (native control tools + persistent science kernels), host SDK,
+and SQLite store.
 
   * Static UI          GET /            GET /static/*
   * REST API           /api/*           (projects, frames, messages, artifacts,
@@ -10,14 +11,13 @@ openai4s Code-as-Action engine (persistent kernel, host SDK, SQLite store).
   * WebSocket          GET /api/ws      (view_session/ping ; text_reset/text_chunk/
                                           frame_update/artifact_created)
 
-Each user message runs the Code-as-Action loop in a per-session persistent kernel;
-prose streams as text chunks, code + output stream as tool chunks, and every cell's
-figures / written files are captured as versioned artifacts.
+Each user message runs the shared AgentEngine against a per-session persistent
+kernel; prose streams as text chunks, code + output stream as tool chunks, and
+every cell's figures / written files are captured as versioned artifacts.
 """
 from __future__ import annotations
 
 import base64
-import binascii
 import hashlib
 import io
 import json
@@ -25,7 +25,6 @@ import mimetypes
 import os
 import queue
 import re
-import shutil
 import struct
 import sys
 import tempfile
@@ -34,36 +33,54 @@ import time
 import traceback
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from openai4s.agent.actions import MULTI_CELL_NOTE as _MULTI_CELL_NOTE
-from openai4s.agent.actions import NO_CODE_NUDGE as _NO_CODE_NUDGE
-from openai4s.agent.actions import count_code_blocks as _count_code_blocks
-from openai4s.agent.actions import extract_action as _extract_action
-from openai4s.agent.compaction import compact, should_compact
-from openai4s.agent.loop import SYSTEM_PROMPT, _format_observation
+from openai4s.agent.engine import AgentEngine
+from openai4s.agent.loop import SYSTEM_PROMPT
+from openai4s.agent.models import RunState
+from openai4s.agent.runtime import ChatModel, CompactionPolicy, CompletionSignal
 from openai4s.config import Config, get_config, is_placeholder_api_key
+from openai4s.execution import (
+    CaptureResult,
+    CellRequest,
+    WatchdogPolicy,
+    execute_with_watchdog,
+)
 from openai4s.host_dispatch import build_dispatcher
-from openai4s.kernel import Kernel
+from openai4s.kernel import Kernel, KernelLease, KernelSupervisor
 from openai4s.llm import ARK_PLAN_MODELS, PROVIDERS, chat
 from openai4s.review import review_evidence
+from openai4s.server.agent_run import EventCancellation
+from openai4s.server.agent_run import ProseStreamer as _ProseStreamer
+from openai4s.server.agent_run import WebActionExecutor, WebEventSink
+from openai4s.server.artifacts import ArtifactManager, ArtifactOperationError
+from openai4s.server.cell_run import CellExecutionPorts, CellExecutionService
+from openai4s.server.execution_views import ExecutionViewService
+
+# Keep the former gateway helper names as compatibility aliases; plan behavior
+# itself now lives together in PlanService.
+from openai4s.server.plans import PlanService
+from openai4s.server.plans import extract_plan_json as _extract_plan_json
+from openai4s.server.plans import normalize_plan as _normalize_plan
+from openai4s.server.plans import public_plan as _plan_public
+from openai4s.server.plans import short_hash as _short_hash
+from openai4s.server.plans import slugify as _slugify
+from openai4s.server.reviews import ReviewPorts, ReviewService
+from openai4s.server.skills import SkillCustomizationService
+from openai4s.server.titles import SessionTitleService
 from openai4s.skills_loader import SkillLoader
 from openai4s.store import Store, get_store
-from openai4s.tools import MAX_TOOL_CALLS_PER_TURN as _MAX_TOOL_CALLS_PER_TURN
-from openai4s.tools import execute_tool_call as _execute_tool_call
-from openai4s.tools import finalize_tool_batch as _finalize_tool_batch
-from openai4s.tools import parse_fence_delimiter as _parse_fence_delimiter
-from openai4s.tools import parse_tool_calls as _parse_tool_calls
-from openai4s.tools import render_tools_prompt as _render_tools_prompt
-from openai4s.tools import strip_fenced_blocks as _strip_fenced_blocks
+from openai4s.tools import control_tool_specs
 
 os.environ.setdefault("MPLBACKEND", "Agg")  # headless matplotlib for figure capture
 
 WEBUI_DIR = Path(__file__).resolve().parent / "webui"
-_NB_DIVIDER = "----- output -----"  # matches the frontend live-notebook parser
+_WATCHDOG_INTERRUPT_GRACE_S = 10.0
+_WATCHDOG_KILL_GRACE_S = 10.0
 
 
 # --------------------------------------------------------------------------- #
@@ -81,60 +98,6 @@ def _iso(ms: int | float | None) -> str | None:
         )
     except (ValueError, OSError, TypeError):
         return None
-
-
-_TEXT_EDIT_EXT = (
-    ".md",
-    ".markdown",
-    ".txt",
-    ".log",
-    ".csv",
-    ".tsv",
-    ".json",
-    ".py",
-    ".js",
-    ".ts",
-    ".fasta",
-    ".fa",
-    ".nwk",
-    ".treefile",
-    ".xml",
-    ".yaml",
-    ".yml",
-    ".sh",
-    ".r",
-    ".tex",
-    ".html",
-    ".htm",
-    ".css",
-)
-_BINARY_EXT = (
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-    ".svg",
-    ".pdf",
-    ".pdb",
-    ".cif",
-    ".mol",
-    ".mol2",
-    ".sdf",
-    ".xyz",
-)
-
-
-def _is_text_editable(filename: str | None, content_type: str | None) -> bool:
-    name = (filename or "").lower()
-    ct = (content_type or "").lower()
-    if ct.startswith("image/") or name.endswith(_BINARY_EXT):
-        return False
-    return (
-        name.endswith(_TEXT_EDIT_EXT)
-        or ct.startswith("text/")
-        or any(k in ct for k in ("json", "csv", "xml", "javascript"))
-    )
 
 
 def _guess_ctype(name: str) -> str:
@@ -416,17 +379,22 @@ class SessionState:
         self.root_frame_id = root_frame_id
         self.project_id = project_id
         self.workspace = workspace
-        self.kernel: Kernel | None = None
+        # One owner for both persistent execution channels.  ``Kernel`` keeps
+        # sole ownership of protocol I/O; the supervisor only coordinates
+        # lifecycle and exact-worker identity across cancellation/watchdogs.
+        self.kernels = KernelSupervisor()
         self.dispatcher = None
         self.messages: list[dict] = []
         self.cell_index = 0
         self.booted = False
         self.turn_lock = threading.Lock()
+        # Stop intent is visible before Stop waits for ``turn_lock``. New turns
+        # back off instead of clearing cancellation and overtaking the stop.
+        self.stop_requested = threading.Event()
+        self.stop_finished = threading.Event()
+        self.stop_finished.set()
+        self.stop_lock = threading.Lock()
         self.cancel = threading.Event()
-        # True when the kernel was explicitly stopped by the user (so the next
-        # turn/REPL knows to auto-start a fresh one rather than treating it as
-        # never-booted). Distinguishes "stopped" from "not yet started".
-        self.kernel_manual_stop = False
         # Per-session model override (from the composer dropdown) + plan flag.
         self.model: str | None = None
         self.plan: bool = False
@@ -446,8 +414,39 @@ class SessionState:
         # R-only env (dispatcher.active_r_env), torn down with the session.
         # `r_env_name` records which env the running R kernel resolved against
         # (None = default resolution: the 'r' env, else Rscript on PATH).
-        self.r_kernel: Kernel | None = None
         self.r_env_name: str | None = None
+
+    @property
+    def kernel(self) -> Kernel | None:
+        """Current Python worker (compatibility view; lifecycle lives above)."""
+        return self.kernels.kernel("python")
+
+    @property
+    def r_kernel(self) -> Kernel | None:
+        """Current R worker (compatibility view; lifecycle lives above)."""
+        return self.kernels.kernel("r")
+
+    @property
+    def kernel_manual_stop(self) -> bool:
+        return bool(self.kernels.status("python")["manual_stop"])
+
+    @contextmanager
+    def execution_barrier(self):
+        """Serialize a turn while giving an already-requested Stop priority."""
+        while True:
+            self.turn_lock.acquire()
+            # Admission and cancellation reset are one critical section. If a
+            # Stop arrives after this clear, its newly-set signal survives; if
+            # it arrived before, stop_requested makes this entrant yield.
+            self.cancel.clear()
+            if not self.stop_requested.is_set():
+                break
+            self.turn_lock.release()
+            self.stop_finished.wait()
+        try:
+            yield
+        finally:
+            self.turn_lock.release()
 
 
 class MessageJob:
@@ -477,25 +476,6 @@ class MessageJob:
             "job_id": self.job_id,
             "error": self.error or "message job failed",
         }
-
-
-def _capture_snippet(idx: int) -> str:
-    return (
-        "import json as __oj\n"
-        "__osfigs=[]\n"
-        "try:\n"
-        " import sys as __sys\n"
-        " if 'matplotlib' in __sys.modules:\n"
-        "  import matplotlib.pyplot as __plt\n"
-        "  for __n in list(__plt.get_fignums()):\n"
-        f"   __nm='figure_cell{idx}_'+str(__n)+'.png'\n"
-        "   try:\n"
-        "    __plt.figure(__n).savefig(__nm,dpi=130,bbox_inches='tight')\n"
-        "    __plt.close(__n); __osfigs.append(__nm)\n"
-        "   except Exception: pass\n"
-        "except Exception: pass\n"
-        "print('__OSFIGS__'+__oj.dumps(__osfigs))\n"
-    )
 
 
 def _maybe_call(v):
@@ -841,113 +821,6 @@ _SUBMIT_NUDGE = (
 )
 
 
-class _ProseStreamer:
-    """Streams narration outside top-level fences as live text chunks.
-
-    Complete lines are scanned with the same nesting rule as the authoritative
-    reply parser. Buffering the current line prevents a literal nested
-    ```tool example inside a Python string from leaking into the chat bubble.
-    """
-
-    def __init__(self, emit, root_frame_id: str):
-        self.emit = emit
-        self.rid = root_frame_id
-        self.acc = ""
-        self.line_buf = ""
-        self.fence_stack: list[tuple[str, int]] = []
-        self.emitted_any = False
-        self.emitted = ""  # exact prose text streamed so far (for reconciliation)
-
-    def feed(self, delta: str) -> None:
-        self.acc += delta
-        self._drain(delta)
-
-    def _drain(self, delta: str) -> None:
-        # A delimiter is meaningful only as a full line, so keep the current
-        # partial line buffered until another delta (or final reconciliation).
-        self.line_buf += delta
-        out: list[str] = []
-        while True:
-            newline = self.line_buf.find("\n")
-            if newline < 0:
-                break
-            line = self.line_buf[: newline + 1]
-            self.line_buf = self.line_buf[newline + 1 :]
-            delimiter = _parse_fence_delimiter(line)
-            if delimiter:
-                fence_char, fence_length, info = delimiter
-                if not self.fence_stack:
-                    self.fence_stack.append((fence_char, fence_length))
-                elif (
-                    fence_char != self.fence_stack[-1][0]
-                    or fence_length < self.fence_stack[-1][1]
-                ):
-                    pass  # literal nested delimiter; remain inside the outer fence
-                elif info:
-                    self.fence_stack.append((fence_char, fence_length))
-                else:
-                    self.fence_stack.pop()
-            elif not self.fence_stack:
-                out.append(line)
-        chunk = "".join(out)
-        if chunk:
-            self._emit_prose(chunk)
-
-    def _emit_prose(self, chunk: str) -> None:
-        if not chunk:
-            return
-        self.emit(
-            {
-                "type": "text_chunk",
-                "frame_id": self.rid,
-                "block_type": "text",
-                "chunk": chunk,
-            }
-        )
-        self.emitted += chunk
-        self.emitted_any = True
-
-    def finalize(self) -> None:
-        # Reconcile the live stream with EXACTLY the prose that gets persisted
-        # (all top-level fenced blocks stripped, including an incomplete final
-        # block). Emit the buffered last prose line, if any, as one suffix.
-        target = _strip_fenced_blocks(self.acc)
-        if target.startswith(self.emitted) and len(target) > len(self.emitted):
-            self._emit_prose(target[len(self.emitted) :])
-
-
-def _activity_title(code: str, idx: int) -> str:
-    """Human-readable label for a code cell's activity card — the leading
-    `# comment`, else a generic fallow."""
-    for line in code.splitlines():
-        s = line.strip()
-        if s.startswith("#"):
-            t = s.lstrip("#").strip()
-            if t:
-                return t[:90]
-        elif s:
-            break
-    return f"Running analysis · cell {idx}"
-
-
-_JUNK_DIR_SEGMENTS = frozenset({"__pycache__", "node_modules", "site-packages", "venv"})
-
-
-def _ignored_file(p: Path) -> bool:
-    """True for files that are dependencies/scratch, NOT deliverables, so they
-    are never registered as artifacts. Cloned-repo trees are pruned separately
-    in _snapshot (by locating .git roots)."""
-    parts = p.parts
-    if any(seg.startswith(".") for seg in parts):
-        return True
-    if any(
-        seg in _JUNK_DIR_SEGMENTS or seg.endswith((".egg-info", ".dist-info"))
-        for seg in parts
-    ):
-        return True
-    return p.name.endswith((".pyc", ".pyo"))
-
-
 class SessionRunner:
     def __init__(self, cfg: Config, hub: WSHub) -> None:
         self.cfg = cfg
@@ -956,11 +829,98 @@ class SessionRunner:
         self.skills = SkillLoader(cfg=cfg)
         self._sessions: dict[str, SessionState] = {}
         self._jobs: dict[str, MessageJob] = {}
-        self._review_ops: dict[str, threading.Event] = {}
-        self._review_calls: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
+        self.reviews = ReviewService(
+            store=lambda: self.store,
+            lock=self._lock,
+            jobs=self._jobs,
+            ports=ReviewPorts(
+                state_for=lambda root_frame_id, project_id: self._state(
+                    root_frame_id, project_id
+                ),
+                emitter_for=lambda root_frame_id: self.hub.emitter(root_frame_id),
+                llm_config_for=lambda state: self._llm_cfg(state),
+                review_evidence=lambda evidence, config: review_evidence(
+                    evidence, config
+                ),
+                providers=lambda: PROVIDERS,
+                clean_api_key=lambda value: _clean_api_key(value),
+                job_factory=lambda job_id, root_frame_id: MessageJob(
+                    job_id, root_frame_id
+                ),
+                busy_error=lambda code, message: GatewayError(code, message),
+                run_reviewer=lambda *args, **kwargs: self._run_reviewer(
+                    *args, **kwargs
+                ),
+                review_config_for=lambda state: self._review_llm_cfg(state),
+                artifact_excerpt=lambda artifact: self._review_artifact_excerpt(
+                    artifact
+                ),
+            ),
+        )
+        self._review_ops = self.reviews.operations
+        self._review_calls = self.reviews.provider_calls
         self._ws_root = cfg.data_dir / "agent-workspaces"
         self._ws_root.mkdir(parents=True, exist_ok=True)
+        self.artifacts = ArtifactManager(
+            data_dir=cfg.data_dir,
+            store=self.store,
+            workspace_for=self.workspace_for,
+            broadcast=getattr(
+                self.hub,
+                "broadcast",
+                lambda root_frame_id, event: self.hub.emitter(root_frame_id)(event),
+            ),
+            environment_snapshot=_environment_snapshot,
+            guess_content_type=_guess_ctype,
+            checksum=_sha256,
+        )
+        self.plans = PlanService(
+            store=self.store,
+            emitter_for=lambda root_frame_id: self.hub.emitter(root_frame_id),
+            run_message=lambda *args, **kwargs: self.run_message(*args, **kwargs),
+        )
+        self.titles = SessionTitleService(
+            store=lambda: self.store,
+            broadcast=lambda root_frame_id, event: self.hub.broadcast(
+                root_frame_id, event
+            ),
+            chat_call=lambda messages, llm_cfg, **kwargs: chat(
+                messages, llm_cfg, **kwargs
+            ),
+            summarize_call=lambda user_text, llm_cfg: self._summarize_title(
+                user_text, llm_cfg
+            ),
+        )
+        self.cells = CellExecutionService(
+            CellExecutionPorts(
+                prepare_language=lambda st, language: (
+                    self._ensure_r_kernel(st) if language == "r" else None
+                ),
+                kernel_id=lambda st, language: (
+                    self._r_kernel_id(st)
+                    if language == "r"
+                    else self._kernel_id(st)
+                ),
+                snapshot=self.artifacts.snapshot,
+                protect_versions=self.artifacts.protect_latest,
+                safety_refusal=lambda code, origin: self._safety_refusal(code, origin),
+                run=lambda st, request, cell_id, on_chunk, lease: (
+                    self._execute_with_watchdog(
+                        st,
+                        request.code,
+                        request.origin,
+                        on_chunk,
+                        language=request.language,
+                        lease=lease,
+                        cell_id=cell_id,
+                    )
+                ),
+                capture=self._capture_artifacts,
+                emit_artifact_step=self._emit_artifact_step,
+                record_cell=self.store.log_cell,
+            )
+        )
 
     def workspace_for(self, root_frame_id: str) -> Path:
         ws = self._ws_root / root_frame_id
@@ -969,13 +929,10 @@ class SessionRunner:
 
     # --- artifact version snapshots --------------------------------------
     def _versions_dir(self) -> Path:
-        d = self.cfg.data_dir / "artifact-versions"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        return self.artifacts.versions_dir()
 
     def live_artifact_path(self, a: dict) -> Path:
-        """The live workspace file the agent reads/writes (always latest bytes)."""
-        return self.workspace_for(a.get("root_frame_id") or "default") / a["filename"]
+        return self.artifacts.live_path(a)
 
     def _write_version_snapshot(
         self,
@@ -985,100 +942,28 @@ class SessionRunner:
         src_path: Path | None = None,
         data: bytes | None = None,
     ) -> None:
-        """Persist an IMMUTABLE per-version copy of a version's bytes under
-        ``data_dir/artifact-versions`` and bind it via ``snapshot_path``. This is
-        what makes version history real: the version's ``path`` keeps pointing at
-        the (mutable) live workspace file — so a later cell overwriting that file
-        does NOT rewrite history, and the provenance reverse-lookup on the live
-        path still resolves. Best-effort; a failure just leaves the path-only
-        fallback (old behaviour)."""
-        try:
-            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "artifact")
-            snap = self._versions_dir() / f"{version_id}__{safe}"
-            if data is not None:
-                snap.write_bytes(data)
-            elif src_path is not None:
-                shutil.copyfile(src_path, snap)
-            else:
-                return
-            self.store.set_version_snapshot(version_id, str(snap))
-        except OSError:
-            pass
+        self.artifacts.write_version_snapshot(
+            version_id, filename, src_path=src_path, data=data
+        )
 
     def _protect_latest_version_snapshots(self, st: SessionState) -> None:
-        """Freeze any current latest artifacts that still lack immutable bytes.
-
-        Older installs recorded only the live workspace path for artifact
-        versions. If a later cell overwrites that path, the old version silently
-        becomes unrecoverable. Before running a cell, snapshot each artifact's
-        current latest version while its live bytes are still intact.
-        """
-        try:
-            artifacts = self.store.list_artifacts({"root_frame_id": st.root_frame_id})
-        except Exception:  # noqa: BLE001
-            return
-        for art in artifacts:
-            version_id = art.get("latest_version_id")
-            if not version_id:
-                continue
-            try:
-                meta = self.store.version_meta(version_id)
-                if not meta or meta.get("snapshot_path") or not meta.get("path"):
-                    continue
-                path = Path(meta["path"])
-                if path.is_file():
-                    self._write_version_snapshot(
-                        version_id,
-                        meta.get("filename") or art.get("filename") or "artifact",
-                        src_path=path,
-                    )
-            except Exception:  # noqa: BLE001
-                continue
+        self.artifacts.protect_latest(st)
 
     def restore_version(self, artifact_id: str, version_id: str) -> dict:
-        """Make an old version current AND copy its (immutable) bytes back into the
-        live workspace file so the agent sees the restored content too. History is
-        preserved (the previously-latest version stays in the list)."""
-        a = self.store.get_artifact(artifact_id)
-        v = self.store.version_meta(version_id)
-        if not a or not v or v.get("artifact_id") != artifact_id:
-            return {"error": "version not found"}
-        src = v.get("snapshot_path") or v.get("path")
-        if not src:
-            return {"error": "version has no stored bytes"}
-        try:
-            data = Path(src).read_bytes()
-            live = self.live_artifact_path(a)
-            # protect a pre-fix latest that lacks an immutable snapshot before we
-            # overwrite the live file (post-fix versions already have one)
-            cur_vid = a.get("latest_version_id")
-            cur_meta = self.store.version_meta(cur_vid) if cur_vid else None
-            if (
-                cur_meta
-                and not cur_meta.get("snapshot_path")
-                and cur_meta.get("path")
-                and Path(cur_meta["path"]).resolve() == live.resolve()
-                and live.exists()
-            ):
-                self._write_version_snapshot(
-                    cur_vid, a["filename"], data=live.read_bytes()
-                )
-            live.parent.mkdir(parents=True, exist_ok=True)
-            live.write_bytes(data)
-        except OSError as e:  # noqa: BLE001
-            return {"error": f"restore failed: {e}"}
-        self.store.set_latest_version(artifact_id, version_id)
-        if a.get("root_frame_id"):
-            self.hub.broadcast(
-                a["root_frame_id"],
-                {"type": "artifact_created", "root_frame_id": a["root_frame_id"]},
-            )
-        return {
-            "ok": True,
-            "artifact": _artifact_json(self.store.get_artifact(artifact_id)),
-        }
+        result = self.artifacts.restore(artifact_id, version_id)
+        if result.get("ok") and result.get("artifact"):
+            result = dict(result)
+            result["artifact"] = _artifact_json(result["artifact"])
+        return result
 
     def _state(self, root_frame_id: str, project_id: str) -> SessionState:
+        scope = self.store.resolve_frame_scope(
+            root_frame_id,
+            fallback_project=project_id,
+        )
+        if scope["root_frame_id"] != root_frame_id:
+            raise ValueError("Web session operations require a root frame id")
+        project_id = scope["project_id"]
         with self._lock:
             st = self._sessions.get(root_frame_id)
             if st is None:
@@ -1108,10 +993,6 @@ class SessionRunner:
                 from openai4s.security.biosecurity import BIOSECURITY_PROMPT
 
                 ctx += "\n\n" + BIOSECURITY_PROMPT
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            ctx += "\n\n" + _render_tools_prompt()
         except Exception:  # noqa: BLE001
             pass
         proj = self.store.get_project(st.project_id) if st.project_id else None
@@ -1193,55 +1074,76 @@ class SessionRunner:
             pass
         st.messages = [{"role": "system", "content": ctx}]
 
-    def _spawn_kernel(self, st: SessionState) -> None:
-        """Create the persistent kernel process + run skill bootstrap. Does not
-        touch st.messages (so it is safe for stop→start)."""
-        disp = build_dispatcher(self.cfg, frame_id=st.root_frame_id)
-        # Project every visible host.* call into a rich, persisted activity step
-        # (plan / search / env / skill / bash / edit / artifact) so the UI shows
-        # what the agent DID, not the Python it wrote to do it.
-        disp.on_step = self._make_step_sink(st)
-        disp.on_plan = self._make_plan_sink(st)
-        # keep the R-channel target across dispatcher rebuilds (env switches,
-        # kernel restarts) — the R kernel itself is lazy and session-scoped
-        disp.active_r_env = getattr(st.dispatcher, "active_r_env", None)
-        st.dispatcher = disp
-        self._wire_delegation(st)
-        # Register this conversation's UI channel with the permission broker so
-        # tool-call approval prompts (from this kernel, its background cells, or
-        # any delegated sub-agent) surface here and can be answered.
-        try:
-            from openai4s.permissions import broker
+    def _spawn_kernel(self, st: SessionState) -> KernelLease:
+        """Ensure the Python worker matches the resolved runtime environment.
 
-            _rid = st.root_frame_id
-            broker().register_channel(
-                _rid,
-                self.hub.emitter(_rid),
-                cancel_event=st.cancel,
-                # only prompt when a human is actually watching this conversation
-                watching=lambda r=_rid: self.hub.has_subscriber(r),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        # Resolve which prebuilt environment this kernel runs in. Falls back to
-        # the base kernel when the requested env is gone or is R-only (no Python
-        # to host the notebook kernel). The agent can switch with host.env.use().
+        The candidate dispatcher stays local until ``KernelSupervisor`` accepts
+        its worker.  If construction fails, the old worker/dispatcher pair and
+        active environment metadata remain intact.
+        """
+        previous_env = st.env_name
         env = self._resolve_env(st)
-        disp.active_env_bin = env.bin_dir  # env-name reporting (host.env.list)
-        disp.on_env_switch = self._make_env_switch_sink(st)
-        st.kernel = Kernel(
-            dispatcher=disp,
-            cwd=str(st.workspace),
-            mode="repl",
-            python=env.interpreter,
-            env_root=str(env.root) if env.is_conda else None,
-            env_name=env.name,
+        env_key = (
+            env.name,
+            str(env.interpreter or ""),
+            str(env.root) if getattr(env, "is_conda", False) else None,
         )
-        st.kernel_manual_stop = False
-        self._run_bootstrap(st)
-        st.booted = True
 
-    def _wire_delegation(self, st: SessionState) -> None:
+        def factory() -> Kernel:
+            disp = build_dispatcher(
+                self.cfg,
+                frame_id=st.root_frame_id,
+                workspace=st.workspace,
+            )
+            # Project every visible host.* call into persisted UI activity.
+            disp.on_step = self._make_step_sink(st)
+            disp.on_plan = self._make_plan_sink(st)
+            # Preserve the lazy R-channel target across Python replacements.
+            disp.active_r_env = getattr(st.dispatcher, "active_r_env", None)
+            self._wire_delegation(st, disp)
+            try:
+                from openai4s.permissions import broker
+
+                _rid = st.root_frame_id
+                broker().register_channel(
+                    _rid,
+                    self.hub.emitter(_rid),
+                    cancel_event=st.cancel,
+                    watching=lambda r=_rid: self.hub.has_subscriber(r),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            disp.active_env_bin = env.bin_dir
+            disp.on_env_switch = self._make_env_switch_sink(st)
+            kernel_options = {
+                "cwd": str(st.workspace),
+                "mode": "repl",
+                "python": env.interpreter,
+                "env_root": str(env.root) if env.is_conda else None,
+                "env_name": env.name,
+            }
+            disp.background_kernel_factory = lambda: Kernel(
+                dispatcher=disp,
+                **kernel_options,
+            )
+            return Kernel(dispatcher=disp, **kernel_options)
+
+        previous_lease = st.kernels.lease("python")
+        try:
+            lease = st.kernels.ensure("python", env_key, factory)
+        except BaseException:
+            st.env_name = previous_env
+            raise
+        st.dispatcher = lease.kernel.dispatcher
+        if previous_lease is None or previous_lease.kernel is not lease.kernel:
+            # Run outside the supervisor lock so cancellation can interrupt a
+            # slow sidecar.  The caller's turn_lock still prevents execution
+            # from racing this one-time bootstrap.
+            self._run_bootstrap(st, lease.kernel)
+        st.booted = True
+        return lease
+
+    def _wire_delegation(self, st: SessionState, dispatcher=None) -> None:
         """Enable host.delegate inside web-session kernels.
 
         The standalone Agent wires this in its __post_init__, but the web UI uses
@@ -1250,7 +1152,7 @@ class SessionRunner:
         Rewire per turn so delegated specialists inherit the currently selected
         model from the composer dropdown.
         """
-        disp = st.dispatcher
+        disp = dispatcher if dispatcher is not None else st.dispatcher
         if disp is None:
             return
         delegation_enabled = str(
@@ -1335,7 +1237,7 @@ class SessionRunner:
         return sink
 
     def _ensure_kernel(self, st: SessionState) -> None:
-        if st.kernel is not None:
+        if st.kernels.alive("python"):
             return
         self._seed_messages(st)
         self._spawn_kernel(st)
@@ -1418,9 +1320,7 @@ class SessionRunner:
 
     def cancel(self, root_frame_id: str) -> None:
         with self._lock:
-            pending_review = self._review_ops.get(root_frame_id)
-            if pending_review is not None:
-                pending_review.set()
+            self.reviews.cancel_locked(root_frame_id)
             st = self._sessions.get(root_frame_id)
         if st is None:
             return
@@ -1432,25 +1332,23 @@ class SessionRunner:
             broker().cancel_root(root_frame_id)
         except Exception:  # noqa: BLE001
             pass
-        if st.kernel is not None:
-            try:
-                st.kernel.interrupt()
-            except Exception:
-                pass
-        # a running ```r cell blocks the turn thread on the R worker — Stop must
-        # reach BOTH kernels or the R channel is uncancellable until the watchdog
-        if st.r_kernel is not None:
-            try:
-                st.r_kernel.interrupt()
-            except Exception:  # noqa: BLE001
-                pass
+        # A running ```r cell blocks the same turn thread as Python.  Interrupt
+        # both exact supervisor slots without waiting on the execution barrier.
+        st.kernels.interrupt()
 
-    def _run_bootstrap(self, st: SessionState) -> None:
+    def interrupt_kernel(self, root_frame_id: str) -> dict:
+        """Best-effort user interrupt for both persistent execution channels."""
+        st = self._sessions.get(root_frame_id)
+        interrupted = st.kernels.interrupt() if st is not None else 0
+        return {"ok": True, "interrupted": interrupted, "frame_id": root_frame_id}
+
+    def _run_bootstrap(self, st: SessionState, kernel: Kernel | None = None) -> None:
         """(Re)run skill-sidecar bootstrap in the session kernel."""
         try:
             boot = _maybe_call(getattr(self.skills, "bootstrap_code", ""))
-            if boot and boot.strip():
-                st.kernel.execute(boot, origin="system")
+            target = kernel if kernel is not None else st.kernel
+            if target is not None and boot and boot.strip():
+                target.execute(boot, origin="system")
         except Exception:  # noqa: BLE001
             pass
 
@@ -1464,39 +1362,40 @@ class SessionRunner:
         """
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
-        with st.turn_lock:
+        with st.execution_barrier():
             # the R kernel restarts with the session: drop it here and let the
             # next ```r cell respawn it fresh (same lazy path as first use)
-            if st.r_kernel is not None:
-                try:
-                    st.r_kernel.shutdown()
-                except Exception:  # noqa: BLE001
-                    pass
-                st.r_kernel = None
+            st.kernels.stop("r", manual=False)
             if st.kernel is None:
                 self._ensure_kernel(st)
+                lease = st.kernels.lease("python")
             elif st.desired_env and st.desired_env != st.env_name:
                 # The active kernel is a transient base fallback. A full spawn
                 # re-runs environment resolution so a recovered pinned env can
                 # finally take effect; Kernel.restart() would reuse base Python.
-                try:
-                    st.kernel.shutdown()
-                except Exception:  # noqa: BLE001 — respawn is the recovery path
-                    pass
-                st.kernel = None
-                self._spawn_kernel(st)
+                previous = st.kernels.lease("python")
+                lease = self._spawn_kernel(st)
+                if previous is not None and lease.kernel is previous.kernel:
+                    # The pin is still unavailable, so resolution selected the
+                    # same fallback key and ensure() correctly reused it. An
+                    # explicit Restart must still clear that base namespace.
+                    lease = st.kernels.restart(
+                        "python",
+                        after_restart=lambda kernel: self._run_bootstrap(st, kernel),
+                    )
             else:
-                st.kernel.restart()
-                self._run_bootstrap(st)
-            gen = getattr(st.kernel, "generation", 0)
-        emit(
-            {
-                "type": "kernel_status",
-                "frame_id": root_frame_id,
-                "status": "restarted",
-                "generation": gen,
-            }
-        )
+                lease = st.kernels.restart(
+                    "python", after_restart=lambda kernel: self._run_bootstrap(st, kernel)
+                )
+            gen = lease.generation if lease is not None else 0
+            emit(
+                {
+                    "type": "kernel_status",
+                    "frame_id": root_frame_id,
+                    "status": "restarted",
+                    "generation": gen,
+                }
+            )
         return {
             "ok": True,
             "status": "restarted",
@@ -1556,39 +1455,26 @@ class SessionRunner:
         """Cheap 'is this session's kernel process live' — no job scan (unlike
         kernel_status)."""
         st = self._sessions.get(root_frame_id)
-        return bool(
-            st
-            and st.kernel is not None
-            and (not hasattr(st.kernel, "is_alive") or st.kernel.is_alive())
-        )
+        return bool(st and st.kernels.alive("python"))
 
     def kernel_status(self, root_frame_id: str) -> dict:
         """Report a session's notebook/kernel state so the UI can offer
         stop/start/resume."""
         st = self._sessions.get(root_frame_id)
-        alive = bool(
-            st
-            and st.kernel is not None
-            and (not hasattr(st.kernel, "is_alive") or st.kernel.is_alive())
-        )
+        supervisor_status = st.kernels.status("python") if st else None
+        alive = bool(supervisor_status and supervisor_status["alive"])
         if st is None:
             state = "none"
-        elif alive:
-            state = "running"
-        elif st.kernel_manual_stop:
-            state = "stopped"
         else:
-            state = "none"
+            state = supervisor_status["state"]
         return {
             "frame_id": root_frame_id,
             "state": state,  # none | running | stopped
             "alive": alive,
-            "generation": getattr(st.kernel, "generation", 0)
-            if st and st.kernel
-            else 0,
+            "generation": supervisor_status["generation"] if supervisor_status else 0,
             "turn_running": self.is_running(root_frame_id),
             "cell_count": (st.cell_index if st else 0),
-            "manual_stop": bool(st and st.kernel_manual_stop),
+            "manual_stop": bool(supervisor_status and supervisor_status["manual_stop"]),
             "env": self._env_summary(st),
             "repl_enabled": bool(self.cfg.notebook_repl),
         }
@@ -1641,7 +1527,7 @@ class SessionRunner:
         return f"r — {name}"
 
     def _ensure_r_kernel(self, st: SessionState) -> str | None:
-        """Make st.r_kernel live and targeted, or return a soft error string.
+        """Make the supervised R slot live and targeted, or soft-fail.
 
         Mirrors agent/loop.py Agent._execute_r: respawn when the worker died or
         host.env.use() retargeted the R channel (dispatcher.active_r_env). The
@@ -1649,25 +1535,20 @@ class SessionRunner:
         python — this never raises.
         """
         want = getattr(st.dispatcher, "active_r_env", None)
-        k = st.r_kernel
-        if k is not None and (not k.is_alive() or st.r_env_name != want):
-            try:
-                k.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
-            st.r_kernel = None
-            k = None
-        if k is None:
-            from openai4s.kernel.environments import get_environment
-            from openai4s.kernel.r_kernel import spawn_r_kernel
+        from openai4s.kernel.environments import get_environment
+        from openai4s.kernel.r_kernel import spawn_r_kernel
 
-            try:
-                st.r_kernel = spawn_r_kernel(
+        try:
+            lease = st.kernels.ensure(
+                "r",
+                want,
+                lambda: spawn_r_kernel(
                     cwd=str(st.workspace), env=get_environment(want)
-                )
-            except Exception as e:  # noqa: BLE001 — soft-fail into the observation
-                return f"R kernel unavailable: {e}"
-            st.r_env_name = want
+                ),
+            )
+        except Exception as e:  # noqa: BLE001 — soft-fail into the observation
+            return f"R kernel unavailable: {e}"
+        st.r_env_name = lease.key
         return None
 
     def stop_kernel(self, root_frame_id: str, project_id: str = "default") -> dict:
@@ -1677,43 +1558,49 @@ class SessionRunner:
         st = self._sessions.get(root_frame_id)
         if st is None:
             return {"ok": True, "state": "none", "frame_id": root_frame_id}
-        self.cancel(root_frame_id)
-        if st.kernel is not None:
-            try:
-                st.kernel.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
-            st.kernel = None
-        if st.r_kernel is not None:
-            try:
-                st.r_kernel.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
-            st.r_kernel = None
-        st.kernel_manual_stop = True
-        st.cancel.clear()
         emit = self.hub.emitter(root_frame_id)
-        emit({"type": "kernel_status", "frame_id": root_frame_id, "status": "stopped"})
+        with st.stop_lock:
+            st.stop_finished.clear()
+            st.stop_requested.set()
+            try:
+                self.cancel(root_frame_id)
+                # Wait for the single protocol reader to leave before detaching
+                # and shutting down its worker. New turns observe stop_requested
+                # and yield this barrier instead of clearing cancellation.
+                with st.turn_lock:
+                    st.kernels.stop("python", manual=True)
+                    st.kernels.stop("r", manual=True)
+                # Publish the stopped state before waking a queued start; its
+                # later "started" event must be the final visible lifecycle.
+                emit(
+                    {
+                        "type": "kernel_status",
+                        "frame_id": root_frame_id,
+                        "status": "stopped",
+                    }
+                )
+            finally:
+                st.stop_requested.clear()
+                st.stop_finished.set()
         return {"ok": True, "state": "stopped", "frame_id": root_frame_id}
 
     def start_kernel(self, root_frame_id: str, project_id: str = "default") -> dict:
         """(Re)start a stopped/absent kernel WITHOUT wiping the conversation, so
         the user can resume. Idempotent when already running."""
         st = self._state(root_frame_id, project_id)
-        with st.turn_lock:
-            if st.kernel is None:
-                self._seed_messages(st)
-                self._spawn_kernel(st)
-            gen = getattr(st.kernel, "generation", 0)
         emit = self.hub.emitter(root_frame_id)
-        emit(
-            {
-                "type": "kernel_status",
-                "frame_id": root_frame_id,
-                "status": "started",
-                "generation": gen,
-            }
-        )
+        with st.execution_barrier():
+            self._ensure_kernel(st)
+            lease = st.kernels.lease("python")
+            gen = lease.generation if lease is not None else 0
+            emit(
+                {
+                    "type": "kernel_status",
+                    "frame_id": root_frame_id,
+                    "status": "started",
+                    "generation": gen,
+                }
+            )
         return {
             "ok": True,
             "state": "running",
@@ -1763,36 +1650,29 @@ class SessionRunner:
             }
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
-        with st.turn_lock:
+        with st.execution_barrier():
             st.pending_env = None
             already = (
                 st.env_name == env_name
-                and st.kernel is not None
-                and st.kernel.is_alive()
+                and st.kernels.alive("python")
             )
             st.desired_env = env_name
-            st.env_name = env_name
             self._persist_env(root_frame_id, env_name)
             if not already:
-                # respawn into the new interpreter (fresh dispatcher + bootstrap)
-                if st.kernel is not None:
-                    try:
-                        st.kernel.shutdown()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    st.kernel = None
                 self._seed_messages(st)
-                self._spawn_kernel(st)
-            gen = getattr(st.kernel, "generation", 0)
-        emit(
-            {
-                "type": "kernel_status",
-                "frame_id": root_frame_id,
-                "status": "env_changed",
-                "generation": gen,
-                "env": self._env_summary(st),
-            }
-        )
+                lease = self._spawn_kernel(st)
+            else:
+                lease = st.kernels.lease("python")
+            gen = lease.generation if lease is not None else 0
+            emit(
+                {
+                    "type": "kernel_status",
+                    "frame_id": root_frame_id,
+                    "status": "env_changed",
+                    "generation": gen,
+                    "env": self._env_summary(st),
+                }
+            )
         return {
             "ok": True,
             "state": "running",
@@ -1827,20 +1707,13 @@ class SessionRunner:
         if target == st.env_name:
             self._persist_env(st.root_frame_id, target)
             return
-        st.env_name = target
-        if st.kernel is not None:
-            try:
-                st.kernel.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
-            st.kernel = None
-        self._spawn_kernel(st)
+        lease = self._spawn_kernel(st)
         emit(
             {
                 "type": "kernel_status",
                 "frame_id": st.root_frame_id,
                 "status": "env_changed",
-                "generation": getattr(st.kernel, "generation", 0),
+                "generation": lease.generation,
                 "env": self._env_summary(st),
             }
         )
@@ -1913,152 +1786,11 @@ class SessionRunner:
         return job
 
     def submit_review(self, root_frame_id: str, project_id: str) -> MessageJob:
-        """Run an on-demand Reviewer without adding a user/assistant message."""
-        job = MessageJob(f"review-job-{uuid.uuid4().hex[:12]}", root_frame_id)
-        operation_cancel = threading.Event()
-        with self._lock:
-            provider_call = self._review_calls.get(root_frame_id)
-            if root_frame_id in self._review_ops or (
-                provider_call is not None and not provider_call.is_set()
-            ):
-                raise GatewayError(409, "a previous review call is still finishing")
-            done = [
-                jid
-                for jid, existing in self._jobs.items()
-                if existing.done.is_set()
-                and (time.time() - (existing.finished_at or 0)) > 300
-            ]
-            for jid in done:
-                self._jobs.pop(jid, None)
-            self._review_ops[root_frame_id] = operation_cancel
-            self._jobs[job.job_id] = job
-
-        def _target() -> None:
-            emit = self.hub.emitter(root_frame_id)
-            frame_status = "ready"
-            job_result: dict | None = None
-            job_error: str | None = None
-            try:
-                st = self._state(root_frame_id, project_id)
-                with st.turn_lock:
-                    # Capture after acquiring the turn lock. If the user requested
-                    # a review while a turn was still running, that turn gets to
-                    # publish its real terminal status before we temporarily show
-                    # the Reviewer as processing.
-                    current_frame = self.store.get_frame(root_frame_id) or {}
-                    frame_status = str(current_frame.get("status") or "ready")
-                    if frame_status not in {
-                        "ready",
-                        "done",
-                        "failed",
-                        "cancelled",
-                        "completed",
-                        "success",
-                    }:
-                        # Acquiring the turn lock proves there is no active turn.
-                        # Repair a stale processing/running status left by a prior
-                        # daemon crash before temporarily showing the Reviewer.
-                        frame_status = "ready"
-                        self.store.update_frame(root_frame_id, status=frame_status)
-                    st.cancel.clear()
-                    if operation_cancel.is_set():
-                        st.cancel.set()
-                    emit(
-                        {
-                            "type": "frame_update",
-                            "frame_id": root_frame_id,
-                            "status": "processing",
-                        }
-                    )
-                    message_count = self.store.message_count(root_frame_id)
-                    messages = self.store.list_messages(
-                        root_frame_id, start=max(0, message_count - 1000), limit=1000
-                    )
-                    last_user = max(
-                        (i for i, m in enumerate(messages) if m.get("role") == "user"),
-                        default=-1,
-                    )
-                    user_text = (
-                        str(messages[last_user].get("content") or "")
-                        if last_user >= 0
-                        else ""
-                    )
-                    assistant_text = "\n\n".join(
-                        str(m.get("content") or "")
-                        for m in messages[last_user + 1 :]
-                        if m.get("role") == "assistant"
-                    ).strip()
-                    result = self._run_reviewer(
-                        st,
-                        emit,
-                        user_text=user_text,
-                        assistant_text=assistant_text,
-                        artifact_versions_before={},
-                        cell_count_before=0,
-                        step_count_before=0,
-                        mode="manual",
-                    )
-                    job_status = "cancelled" if st.cancel.is_set() else "completed"
-                    job_result = {
-                        "status": job_status,
-                        "frame_id": root_frame_id,
-                        "review": result,
-                    }
-            except Exception as exc:  # noqa: BLE001
-                job_error = str(exc)
-            finally:
-                try:
-                    emit(
-                        {
-                            "type": "frame_update",
-                            "frame_id": root_frame_id,
-                            "status": frame_status,
-                        }
-                    )
-                except Exception:
-                    pass
-                with self._lock:
-                    if self._review_ops.get(root_frame_id) is operation_cancel:
-                        self._review_ops.pop(root_frame_id, None)
-                job.finish(result=job_result, error=job_error)
-
-        thread = threading.Thread(
-            target=_target,
-            name=f"openai4s-review-{root_frame_id}",
-            daemon=True,
-        )
-        job.thread = thread
-        try:
-            thread.start()
-        except Exception:
-            with self._lock:
-                if self._review_ops.get(root_frame_id) is operation_cancel:
-                    self._review_ops.pop(root_frame_id, None)
-                self._jobs.pop(job.job_id, None)
-            raise
-        return job
+        return self.reviews.submit(root_frame_id, project_id)
 
     # -- capture figures + written files after a cell -> artifacts ---------
     def _snapshot(self, ws: Path) -> dict[str, int]:
-        # Cloned repos / installed tool trees (a `git clone ProteinMPNN` dumping
-        # weights + LICENSE + examples, etc.) are dependencies, NOT deliverables —
-        # locate their roots (any dir holding a `.git`) and skip every file under
-        # them, so they never balloon the artifact list.
-        try:
-            repo_roots = {g.parent for g in ws.rglob(".git")}
-        except OSError:
-            repo_roots = set()
-        out: dict[str, int] = {}
-        for p in ws.rglob("*"):
-            if not p.is_file() or _ignored_file(p.relative_to(ws)):
-                continue
-            if repo_roots and any(root in p.parents for root in repo_roots):
-                continue
-            try:
-                out[str(p)] = p.stat().st_mtime_ns
-            except OSError:
-                pass
-        return out
+        return self.artifacts.snapshot(ws)
 
     def _register_file(
         self,
@@ -2068,63 +1800,13 @@ class SessionRunner:
         emit,
         env_snapshot_id: str | None = None,
     ) -> dict | None:
-        """Persist one produced file as a (versioned) artifact and notify the UI.
-        Returns the reference-style metadata for the saved version, or None if the
-        file vanished mid-turn. ``env_snapshot_id`` binds this version to the
-        kernel environment that produced it (Provenance → Environment)."""
-        rel = str(path.relative_to(st.workspace))
-        try:
-            size = path.stat().st_size
-            checksum = _sha256(path)  # inside guard: kernel may delete mid-turn
-        except OSError:
-            return None
-        existing = self.store.artifact_by_filename(rel, st.root_frame_id, strict=True)
-        rec = self.store.save_artifact(
-            path=str(path),
-            filename=rel,
-            content_type=_guess_ctype(rel),
-            size_bytes=size,
-            checksum=checksum,
-            producing_cell_id=cell_id,
-            frame_id=st.root_frame_id,
-            project_id=st.project_id,
-            artifact_id=(existing["artifact_id"] if existing else None),
+        return self.artifacts.register_file(
+            st,
+            path,
+            cell_id,
+            emit,
             env_snapshot_id=env_snapshot_id,
         )
-        # freeze THIS version's bytes immutably so a later cell overwriting the
-        # live file can't rewrite history (view/restore serve the right bytes)
-        self._write_version_snapshot(rec["version_id"], rel, src_path=path)
-        emit(
-            {
-                "type": "artifact_created",
-                "artifact": {
-                    "id": rec["artifact_id"],
-                    "artifact_id": rec["artifact_id"],
-                    "version_id": rec[
-                        "version_id"
-                    ],  # lets the UI bust its stale image cache
-                    "filename": rel,
-                    "content_type": rec.get("content_type"),
-                    "size_bytes": size,
-                    "project_id": st.project_id,
-                    "root_frame_id": st.root_frame_id,
-                },
-            }
-        )
-        try:
-            version_number = len(self.store.list_versions(rec["artifact_id"]))
-        except Exception:  # noqa: BLE001
-            version_number = 1
-        return {
-            "artifact_id": rec["artifact_id"],
-            "version_id": rec["version_id"],
-            "version_number": version_number,
-            "filename": rel,
-            "content_type": rec.get("content_type"),
-            "size_bytes": size,
-            "checksum": checksum,
-            "storage_path": rec.get("path"),
-        }
 
     def _capture(
         self,
@@ -2135,60 +1817,55 @@ class SessionRunner:
         emit,
         language: str = "python",
     ) -> tuple[list, list, list]:
-        figures: list[str] = []
-        # 1) save any open matplotlib figures (separate, unlogged cell). Python
-        # kernel only — an R cell's plots are captured through the workspace
-        # diff below (ggsave / the default Rplots.pdf device write into cwd).
-        if language == "python":
-            try:
-                cap = st.kernel.execute(_capture_snippet(cell_index), origin="system")
-                for line in (cap.get("stdout") or "").splitlines():
-                    if line.startswith("__OSFIGS__"):
-                        try:
-                            figures = json.loads(line[len("__OSFIGS__") :]) or []
-                        except (ValueError, TypeError):
-                            figures = []
-            except Exception:
-                figures = []
-        # 2) diff the workspace for new / changed files
-        after = self._snapshot(st.workspace)
-        changed = [Path(p) for p, m in after.items() if before.get(p) != m]
-        figset = set(figures)
-        files_written: list[str] = []
-        saved: list[dict] = []
-        # capture the kernel environment ONCE per producing cell (full freeze is
-        # a site-packages scan) and bind every artifact from this cell to it, so a
-        # figure records the env at PRODUCTION time — not whatever is live later.
-        env_sid = self._capture_env_snapshot(st) if changed else None
-        # figures first, then other written files — matches the visual timeline
-        for p in sorted(
-            changed,
-            key=lambda q: (str(q.relative_to(st.workspace)) not in figset, str(q)),
-        ):
-            rel = str(p.relative_to(st.workspace))
-            meta = self._register_file(st, p, cell_id, emit, env_snapshot_id=env_sid)
-            if meta is not None:
-                saved.append(meta)
-            if rel not in figset:
-                files_written.append(rel)
-        return figures, files_written, saved
+        captured = self._capture_artifacts(
+            st,
+            cell_index,
+            cell_id,
+            before,
+            emit,
+            language,
+        )
+        return captured.figures, captured.files_written, captured.artifacts
+
+    def _capture_artifacts(
+        self,
+        st: SessionState,
+        cell_index: int,
+        cell_id: str,
+        before: dict[str, int],
+        emit,
+        language: str,
+    ) -> CaptureResult:
+        kernel = st.kernel
+        run_system_cell = (
+            (lambda code: kernel.execute(code, origin="system"))
+            if kernel is not None
+            else None
+        )
+        return self.artifacts.capture(
+            st,
+            cell_index,
+            cell_id,
+            before,
+            emit,
+            language=language,
+            run_system_cell=run_system_cell,
+            drain_remote_provenance=self._remote_provenance_drain(st),
+        )
 
     def _capture_env_snapshot(self, st=None) -> str | None:
-        """Freeze the current kernel env and store it (deduped); return its id.
-        Also folds in any remote-GPU job provenance (remote env + code git +
-        model weights) buffered by the dispatcher during this cell, so a
-        remotely-computed artifact records what actually produced it and is
-        reproducible. Best-effort — never let provenance capture break saving."""
-        try:
-            snap = _environment_snapshot()
-            disp = getattr(st, "dispatcher", None)
-            if disp is not None and hasattr(disp, "pop_remote_provenance"):
-                remote = disp.pop_remote_provenance()
-                if remote:
-                    snap["remote"] = remote
-            return self.store.upsert_env_snapshot(snap)
-        except Exception:  # noqa: BLE001
-            return None
+        return self.artifacts.capture_environment(
+            self._remote_provenance_drain(st)
+        )
+
+    @staticmethod
+    def _remote_provenance_drain(st):
+        dispatcher = getattr(st, "dispatcher", None)
+        if dispatcher is not None and hasattr(
+            dispatcher, "pop_remote_provenance"
+        ):
+            return dispatcher.pop_remote_provenance
+        return None
 
     # -- run one user message ---------------------------------------------
     def effective_api_key(self) -> str:
@@ -2292,83 +1969,14 @@ class SessionRunner:
         return f"**这一轮出错了。** {msg[:300]}"
 
     def _auto_review_enabled(self, root_frame_id: str) -> bool:
-        value = self.store.get_setting(f"review:auto:{root_frame_id}")
-        if value is None:
-            value = self.store.get_setting("auto_review_enabled", "0")
-        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+        return self.reviews.auto_enabled(root_frame_id)
 
     def _review_llm_cfg(self, st: SessionState):
-        import dataclasses
-
-        cfg = self._llm_cfg(st)
-        local_model = self.store.get_setting(f"review:model:{st.root_frame_id}")
-        if local_model == "__agent__":
-            model = None
-        else:
-            model = local_model
-        if local_model is None and not model:
-            model = self.store.get_setting("reviewer_model")
-        overrides: dict = {"timeout_s": min(float(cfg.timeout_s), 45.0)}
-        model = (model or "").strip()
-        if model:
-            profile = next(
-                (
-                    p
-                    for p in self.store.list_model_profiles()
-                    if str(p.get("model") or "").strip() == model
-                ),
-                None,
-            )
-            provider = str((profile or {}).get("provider") or "").strip()
-            if not provider:
-                provider = next(
-                    (
-                        name
-                        for name, spec in PROVIDERS.items()
-                        if str(spec.get("model") or "").strip() == model
-                    ),
-                    "",
-                )
-            overrides["model"] = model
-            if provider and provider != cfg.provider:
-                overrides["provider"] = provider
-                overrides["base_url"] = str(
-                    (profile or {}).get("base_url") or ""
-                ).strip()
-                overrides["api_key"] = _clean_api_key((profile or {}).get("api_key"))
-            elif profile and profile.get("base_url"):
-                overrides["base_url"] = str(profile["base_url"]).strip()
-            if profile and _clean_api_key(profile.get("api_key")):
-                overrides["api_key"] = _clean_api_key(profile.get("api_key"))
-        try:
-            return dataclasses.replace(cfg, **overrides)
-        except Exception:  # noqa: BLE001
-            return cfg
+        return self.reviews.llm_config(st)
 
     @staticmethod
     def _review_artifact_excerpt(artifact: dict) -> str | None:
-        path = artifact.get("path")
-        if not path or not Path(path).is_file():
-            return None
-        filename = str(artifact.get("filename") or path).lower()
-        content_type = str(artifact.get("content_type") or "").lower()
-        readable = (
-            content_type.startswith("text/")
-            or content_type
-            in {
-                "application/json",
-                "application/xml",
-                "application/javascript",
-            }
-            or filename.endswith((".md", ".txt", ".csv", ".tsv", ".json", ".py", ".r"))
-        )
-        if not readable:
-            return None
-        try:
-            data = Path(path).read_bytes()[:8_000]
-        except OSError:
-            return None
-        return data.decode("utf-8", errors="replace")
+        return ReviewService.artifact_excerpt(artifact)
 
     def _run_reviewer(
         self,
@@ -2382,351 +1990,27 @@ class SessionRunner:
         step_count_before: int = 0,
         mode: str = "auto",
     ) -> dict | None:
-        """Persist and stream one constrained Reviewer step; never fail the turn."""
-        rid = st.root_frame_id
-        step_id = f"review-{uuid.uuid4().hex[:12]}"
-        cfg = self._review_llm_cfg(st)
-        self.store.add_step(
-            step_id=step_id,
-            frame_id=rid,
-            kind="review",
-            title="Reviewer",
-            input={"mode": mode, "model": cfg.model or None},
-            status="running",
+        return self.reviews.run(
+            st,
+            emit,
+            user_text=user_text,
+            assistant_text=assistant_text,
+            artifact_versions_before=artifact_versions_before,
+            cell_count_before=cell_count_before,
+            step_count_before=step_count_before,
+            mode=mode,
         )
-        emit(
-            {
-                "type": "step",
-                "frame_id": rid,
-                "step_id": step_id,
-                "kind": "review",
-                "title": "Reviewer",
-                "input": {"mode": mode, "model": cfg.model or None},
-                "status": "running",
-            }
-        )
-        try:
-            artifacts = self.store.list_artifacts({"root_frame_id": rid})
-            changed = []
-            changed_total = 0
-            for artifact in artifacts:
-                aid = artifact.get("artifact_id") or artifact.get("id")
-                if not aid:
-                    continue
-                latest = artifact.get("latest_version_id")
-                if (
-                    aid in artifact_versions_before
-                    and artifact_versions_before[aid] == latest
-                ):
-                    continue
-                changed_total += 1
-                if len(changed) >= 64:
-                    continue
-                resolved_path = artifact.get(
-                    "path"
-                ) or self.store.resolve_artifact_path(aid)
-                artifact_with_path = {**artifact, "path": resolved_path}
-                item = {
-                    "artifact_id": aid,
-                    "filename": artifact.get("filename"),
-                    "content_type": artifact.get("content_type"),
-                    "size_bytes": artifact.get("size_bytes"),
-                    "latest_version_id": latest,
-                    "exists": bool(resolved_path and Path(resolved_path).is_file()),
-                }
-                excerpt = (
-                    self._review_artifact_excerpt(artifact_with_path)
-                    if len(changed) < 12
-                    else None
-                )
-                if excerpt:
-                    item["excerpt"] = excerpt
-                changed.append(item)
-            cells = self.store.list_cells(rid)[cell_count_before:]
-            execution = []
-            for cell in cells[-24:]:
-                execution.append(
-                    {
-                        "cell_index": cell.get("cell_index"),
-                        "source": str(cell.get("code") or "")[:5_000],
-                        "stdout": str(cell.get("stdout") or "")[:4_000],
-                        "stderr": str(cell.get("stderr") or "")[:2_000],
-                        "error": str(cell.get("error") or "")[:2_000],
-                        "status": cell.get("status"),
-                        "files_written": cell.get("files_written") or [],
-                        "files_read": cell.get("files_read") or [],
-                    }
-                )
-            tool_evidence = []
-            tool_start = max(step_count_before, self.store.step_count(rid) - 200)
-            for step in self.store.list_steps(rid, start=tool_start, limit=200)[-32:]:
-                if step.get("kind") == "review":
-                    continue
-                tool_evidence.append(
-                    {
-                        "kind": step.get("kind"),
-                        "title": step.get("title"),
-                        "status": step.get("status"),
-                        "summary": step.get("summary"),
-                        "input": step.get("input"),
-                        "output": step.get("output"),
-                    }
-                )
-            evidence = {
-                "user_request": user_text[:16_000],
-                "final_answer": assistant_text[:24_000],
-                "submitted_output": getattr(
-                    getattr(st, "dispatcher", None), "last_output", None
-                ),
-                "execution": execution,
-                "tool_evidence": tool_evidence,
-                "changed_artifacts": changed,
-                "changed_artifact_count": changed_total,
-                "omitted_artifact_count": max(0, changed_total - len(changed)),
-            }
-            if st.cancel.is_set():
-                output = {
-                    "verdict": "cancelled",
-                    "provider_call": "not_started",
-                }
-                self.store.update_step(
-                    step_id,
-                    status="cancelled",
-                    output=output,
-                    summary="Review cancelled",
-                )
-                emit(
-                    {
-                        "type": "step_update",
-                        "frame_id": rid,
-                        "step_id": step_id,
-                        "status": "cancelled",
-                        "output": output,
-                        "summary": "Review cancelled",
-                    }
-                )
-                return None
-            review_done = threading.Event()
-            review_cancelled = threading.Event()
-            review_box: dict = {}
-            with self._lock:
-                previous = self._review_calls.get(rid)
-                if previous is not None and not previous.is_set():
-                    raise RuntimeError("a previous review call is still finishing")
-                self._review_calls[rid] = review_done
-
-            def invoke_review() -> None:
-                try:
-                    review_box["result"] = review_evidence(evidence, cfg)
-                except Exception as review_exc:  # noqa: BLE001
-                    review_box["error"] = review_exc
-                finally:
-                    review_done.set()
-                    with self._lock:
-                        if self._review_calls.get(rid) is review_done:
-                            self._review_calls.pop(rid, None)
-                    if review_cancelled.is_set():
-                        finished_output = {
-                            "verdict": "cancelled",
-                            "provider_call": "finished",
-                        }
-                        try:
-                            self.store.update_step(
-                                step_id,
-                                status="cancelled",
-                                output=finished_output,
-                                summary="Review cancelled",
-                            )
-                            emit(
-                                {
-                                    "type": "step_update",
-                                    "frame_id": rid,
-                                    "step_id": step_id,
-                                    "status": "cancelled",
-                                    "output": finished_output,
-                                    "summary": "Review cancelled",
-                                }
-                            )
-                        except Exception:  # noqa: BLE001 — cleanup is best-effort
-                            pass
-
-            threading.Thread(
-                target=invoke_review,
-                name=f"openai4s-review-call-{rid}",
-                daemon=True,
-            ).start()
-            while not review_done.wait(0.2):
-                if st.cancel.is_set():
-                    review_cancelled.set()
-                    output = {
-                        "verdict": "cancelled",
-                        "provider_call": "finishing",
-                    }
-                    self.store.update_step(
-                        step_id,
-                        status="cancelled",
-                        output=output,
-                        summary="Review cancelled · provider request finishing",
-                    )
-                    emit(
-                        {
-                            "type": "step_update",
-                            "frame_id": rid,
-                            "step_id": step_id,
-                            "status": "cancelled",
-                            "output": output,
-                            "summary": "Review cancelled · provider request finishing",
-                        }
-                    )
-                    return None
-            if review_box.get("error") is not None:
-                raise review_box["error"]
-            result = review_box["result"]
-            result["reviewed_artifacts"] = [a["artifact_id"] for a in changed]
-            usage = result.get("usage") or {}
-            self.store.add_frame_tokens(
-                rid,
-                input_tokens=usage.get("input_tokens", 0) or 0,
-                output_tokens=usage.get("output_tokens", 0) or 0,
-            )
-            summary = result.get("summary") or "No issues found"
-            self.store.update_step(
-                step_id, status="done", output=result, summary=summary
-            )
-            emit(
-                {
-                    "type": "step_update",
-                    "frame_id": rid,
-                    "step_id": step_id,
-                    "status": "done",
-                    "output": result,
-                    "summary": summary,
-                }
-            )
-            return result
-        except Exception as exc:  # noqa: BLE001 — review must not fail main work
-            output = {"error": str(exc)[:500], "verdict": "unavailable"}
-            self.store.update_step(
-                step_id,
-                status="error",
-                output=output,
-                summary="Review unavailable",
-            )
-            emit(
-                {
-                    "type": "step_update",
-                    "frame_id": rid,
-                    "step_id": step_id,
-                    "status": "error",
-                    "output": output,
-                    "summary": "Review unavailable",
-                }
-            )
-            return None
 
     def review_call_inflight(self, root_frame_id: str) -> bool:
-        """Whether an uncancellable provider request is still winding down."""
-        with self._lock:
-            if root_frame_id in self._review_ops:
-                return True
-            call = self._review_calls.get(root_frame_id)
-            return bool(call is not None and not call.is_set())
+        return self.reviews.call_inflight(root_frame_id)
 
-    @staticmethod
-    def _summarize_title(user_text: str, llm_cfg) -> str | None:
-        """A short, descriptive session title distilled from the first message.
-
-        One cheap, capped chat call; returns None on empty input / any usable
-        result the caller should ignore. The caller runs this off-thread and
-        keeps the truncation placeholder if this returns None or raises.
-        """
-        src = re.sub(r"\s+", " ", user_text or "").strip()[:2000]
-        if not src:
-            return None
-        msgs = [
-            {
-                "role": "system",
-                "content": (
-                    "You name chat sessions. Read the user's first message and reply "
-                    "with a short title capturing its intent — at most 16 characters "
-                    "for Chinese/CJK, or 6 words for English. Reply in the SAME "
-                    "language as the message. Output the title only: no surrounding "
-                    "quotes, no trailing punctuation, no label like '标题:' or 'Title:'."
-                ),
-            },
-            {"role": "user", "content": src},
-        ]
-        # 64 (not 32) leaves headroom: a 16-char CJK title can already cost ~32
-        # tokens, so a tighter cap risks cutting the title mid-string.
-        res = chat(msgs, llm_cfg, max_tokens=64, temperature=0.3)
-        # A length-truncated reply is a partial title — keep the placeholder
-        # instead of saving a chopped one. (Gemini says "MAX_TOKENS".)
-        if str(res.get("finish_reason") or "").lower() in ("length", "max_tokens"):
-            return None
-        title = (res.get("content") or "").strip()
-        if not title:
-            return None
-        title = title.splitlines()[0].strip()
-        title = re.sub(r"^(标题|title)\s*[:：]\s*", "", title, flags=re.IGNORECASE)
-        # Strip only symmetric wrapping decoration. NOT the CJK book/quote
-        # brackets 《》「」『』【】 as a char-class: str.strip() treats them as a
-        # set removed from both ends, which mangles legit titles like
-        # "《红楼梦》赏析" → "红楼梦》赏析". Instead unwrap one *balanced* pair.
-        title = title.strip().strip("\"“”'`*").strip()
-        for _o, _c in (
-            ("《", "》"),
-            ("「", "」"),
-            ("『", "』"),
-            ("【", "】"),
-            ("（", "）"),
-            ("(", ")"),
-        ):
-            if (
-                len(title) >= 2
-                and title[0] == _o
-                and title[-1] == _c
-                and title.count(_o) == 1
-                and title.count(_c) == 1
-            ):
-                title = title[1:-1].strip()
-                break
-        return title[:80] or None
+    def _summarize_title(self, user_text: str, llm_cfg) -> str | None:
+        return self.titles.summarize(user_text, llm_cfg)
 
     def _spawn_title_summary(
         self, root_frame_id: str, user_text: str, llm_cfg, placeholder: str
     ) -> None:
-        """Upgrade the placeholder session title to an LLM summary, off-thread.
-
-        Never blocks the turn and never raises into it. Any failure (no API key,
-        timeout, empty reply) simply leaves the truncation placeholder in place.
-        Skips writing if the user renamed the session (`name`) or changed the
-        title away from our placeholder while we were thinking.
-        """
-
-        def _target() -> None:
-            try:
-                title = self._summarize_title(user_text, llm_cfg)
-            except Exception:  # noqa: BLE001 — titling must never break a turn
-                return
-            if not title or title == placeholder:
-                return
-            cur = self.store.get_frame(root_frame_id) or {}
-            if cur.get("name") or cur.get("task_summary") != placeholder:
-                return
-            self.store.update_frame(root_frame_id, task_summary=title)
-            self.hub.broadcast(
-                root_frame_id,
-                {
-                    "type": "frame_update",
-                    "frame_id": root_frame_id,
-                    "status": "titled",
-                    "task_summary": title,
-                },
-            )
-
-        threading.Thread(
-            target=_target, name=f"os-title-{root_frame_id}", daemon=True
-        ).start()
+        self.titles.spawn(root_frame_id, user_text, llm_cfg, placeholder)
 
     def _build_annotated_content(self, st, text: str, annos: list):
         """Turn an annotation turn into a MULTIMODAL user message: the text
@@ -2785,8 +2069,7 @@ class SessionRunner:
         # plan mode wins: a plan turn never executes, so explore is meaningless
         st.explore = bool(explore) and not st.plan
         emit = self.hub.emitter(root_frame_id)
-        with st.turn_lock:
-            st.cancel.clear()
+        with st.execution_barrier():
             self._ensure_kernel(st)
             self._wire_delegation(st)
             self.store.update_frame(root_frame_id, status="processing")
@@ -2969,129 +2252,71 @@ class SessionRunner:
         return text + "\n\n---\n(附:被引用的文件内容)\n\n" + "\n\n".join(blocks)
 
     def _loop(self, st: SessionState, emit, assistant_visible: list[dict]) -> str:
+        """Run one Web turn through the shared provider-neutral AgentEngine."""
         rid = st.root_frame_id
         max_turns = self.cfg.max_turns or 12
         if st.explore:
             max_turns = max(max_turns, self.cfg.explore_max_turns or 0)
-        llm_cfg = self._llm_cfg(st)  # resolve once per turn (not per iteration)
-        for _turn in range(max_turns):
-            if st.cancel.is_set():
-                return "cancelled"
-            if should_compact(st.messages, self.cfg):
-                st.messages = compact(
-                    st.messages, self.cfg, archive_dir=self.cfg.compaction_dir
-                )
-            streamer = _ProseStreamer(emit, rid)
-            res = chat(st.messages, llm_cfg, on_delta=streamer.feed)
-            streamer.finalize()
-            reply = res.get("content", "") or ""
-            usage = res.get("usage") or {}
-            if usage:
-                self.store.add_frame_tokens(
-                    rid,
-                    input_tokens=usage.get("prompt_tokens", 0) or 0,
-                    output_tokens=usage.get("completion_tokens", 0) or 0,
-                )
-            st.messages.append({"role": "assistant", "content": reply})
-            action = _extract_action(reply)
-            # strip ALL fenced blocks (matches what the streamer hides live), so
-            # the persisted bubble equals the streamed prose and no code leaks in
-            prose = _strip_fenced_blocks(reply).strip()
-            if prose:
-                # Stamp the block with the moment it was produced (before this
-                # iteration's code runs and emits its steps) so a reopened session
-                # can interleave prose with the step cards in true chronological
-                # order — persisted at turn end (see submit_message). The −1ms
-                # keeps a block strictly ahead of the step it triggers even if that
-                # step is added within the same millisecond (the UI breaks msg/step
-                # timestamp ties toward the step); the gap back to the previous
-                # iteration's steps is a whole LLM round-trip, so this only removes
-                # false ties — it never reorders a block behind an earlier step.
-                assistant_visible.append(
-                    {"at": int(time.time() * 1000) - 1, "text": prose}
-                )
-                # fallback for non-streaming wires: emit prose we didn't stream live
-                if not streamer.emitted_any:
-                    emit(
-                        {
-                            "type": "text_chunk",
-                            "frame_id": rid,
-                            "block_type": "text",
-                            "chunk": prose + "\n",
-                        }
-                    )
-            # M5: plan mode is ENFORCED — never execute code. Instead of just
-            # returning the prose, parse the structured plan out of this reply,
-            # persist it + save a plan_*.json artifact, and emit `plan_ready` so
-            # the UI renders the review card (title / confidence / steps /
-            # deliverables + Approve · Discard · Describe-changes).
-            if st.plan:
-                try:
-                    self._finalize_plan(st, reply, prose, emit)
-                except Exception:  # noqa: BLE001 — never let plan capture break a turn
-                    traceback.print_exc()
-                return "plan"
-            if action is None:
-                # ReAct tool surface: run any top-level ```tool calls
-                # (deterministic ops through the dispatcher — same activity-step
-                # cards, permission gate and injection screen as a host cell
-                # call). A code cell (```python or ```r) WINS over tools, so a
-                # ```tool token merely quoted inside a code cell never executes;
-                # tools are only honored when the reply has no code cell.
-                tool_calls, tool_errors = _parse_tool_calls(reply)
-                if tool_calls or tool_errors:
-                    parts: list[str] = []
-                    for call in tool_calls[:_MAX_TOOL_CALLS_PER_TURN]:
-                        # Apply a queued env switch (host.env.use / the env_use
-                        # tool) before the call that depends on it — e.g. env_use
-                        # then bash — respawning the kernel into the new env, then
-                        # run against the (possibly rebuilt) dispatcher.
-                        if st.pending_env:
-                            self._apply_pending_env(st, emit)
-                        text, _ok = _execute_tool_call(st.dispatcher, call)
-                        parts.append(text)
-                    if st.pending_env:  # a trailing env_use → make it live onward
-                        self._apply_pending_env(st, emit)
-                    obs = _finalize_tool_batch(parts, len(tool_calls), tool_errors)
-                    st.messages.append({"role": "user", "content": obs})
-                    if st.dispatcher.last_output is not None:
-                        return "submitted"
-                    continue
-                if st.dispatcher.last_output is not None:
-                    return "submitted"
-                if prose:
-                    nudge = _EXPLORE_NUDGE if st.explore else _SUBMIT_NUDGE
-                    st.messages.append({"role": "user", "content": nudge})
-                    continue
-                st.messages.append({"role": "user", "content": _NO_CODE_NUDGE})
-                continue
-            # If the agent called host.env.use() during the previous cell, switch
-            # the kernel into that prebuilt env now (before this cell's imports).
+        llm_cfg = self._llm_cfg(st)
+
+        def add_usage(usage: dict) -> None:
+            self.store.add_frame_tokens(
+                rid,
+                input_tokens=usage.get("prompt_tokens", 0) or 0,
+                output_tokens=usage.get("completion_tokens", 0) or 0,
+            )
+
+        events = WebEventSink(emit, rid, assistant_visible, add_usage)
+
+        def apply_pending() -> None:
             if st.pending_env:
                 self._apply_pending_env(st, emit)
-            info = self._execute_and_log(
+
+        def execute_cell(action) -> dict:
+            return self._execute_and_log(
                 st,
                 action.code,
                 "agent",
                 emit,
                 stream=True,
                 language=action.language,
-            )
-            obs = _format_observation(info["result"])
-            # One cell runs per step: if the model batched SEVERAL code cells
-            # into this single reply, only the FIRST one just executed —
-            # `extract_action` takes the first match and the rest were stripped
-            # as prose and silently dropped. Say so explicitly, or the model
-            # treats the un-run cells (and any output it already narrated for
-            # them) as done and "concludes" the whole task after one cell — the
-            # false-completion bug where a deliverable task ends with an empty
-            # working dir because cells 2..N never ran.
-            if _count_code_blocks(reply) > 1:
-                obs += _MULTI_CELL_NOTE
-            st.messages.append({"role": "user", "content": obs})
-            if st.dispatcher.last_output is not None:
-                return "submitted"
-        return "max_turns"
+            )["result"]
+
+        def finalize_plan(reply, prose: str) -> None:
+            try:
+                self._finalize_plan(st, reply.content, prose, emit)
+            except Exception:  # noqa: BLE001 — plan capture must not break a turn
+                traceback.print_exc()
+
+        engine = AgentEngine(
+            ChatModel(
+                llm_cfg,
+                chat,
+                tools=() if st.plan else control_tool_specs(),
+                stream=True,
+            ),
+            WebActionExecutor(
+                dispatcher=lambda: st.dispatcher,
+                apply_pending=apply_pending,
+                execute_cell=execute_cell,
+                events=events,
+                prose_nudge=_SUBMIT_NUDGE,
+                explore_nudge=_EXPLORE_NUDGE,
+                explore_mode=st.explore,
+                plan_mode=st.plan,
+                finalize_plan=finalize_plan,
+                cancelled=st.cancel.is_set,
+            ),
+            context_policy=CompactionPolicy(self.cfg),
+            event_sink=events,
+            cancellation=EventCancellation(st.cancel),
+            completion=CompletionSignal(
+                lambda: getattr(st.dispatcher, "last_output", None)
+            ),
+            max_turns=max_turns,
+        )
+        state = RunState(st.messages, max_turns=max_turns)
+        return engine.run(state).stop_reason
 
     def _execute_with_watchdog(
         self,
@@ -3099,137 +2324,50 @@ class SessionRunner:
         code: str,
         origin: str,
         on_chunk,
-        kernel_attr: str = "kernel",
+        language: str = "python",
+        lease: KernelLease | None = None,
+        cell_id: str | None = None,
     ) -> dict:
-        """Run one cell but NEVER let a wedged kernel hang the turn forever.
-
-        `kernel_attr` names the SessionState slot holding the target kernel —
-        "kernel" (python) or "r_kernel" — the SIGINT/kill/abandon ladder below
-        is language-neutral.
-
-        The kernel read loop (`Kernel.execute` → `_readline`) blocks on the
-        worker's stdout with no timeout, so if the worker wedges (e.g. a cell
-        deadlocks importing a heavy package after install) the turn stalls in
-        status='processing' with no reply — the "runs but never returns" bug.
-
-        We run `kernel.execute` in a helper thread and bound it. On timeout:
-          1. SIGINT the worker (breaks a Python-level hang). If that frees the
-             cell we RETURN its interrupted result and keep the kernel + namespace
-             so the turn can continue.
-          2. else hard-KILL the old worker. If the helper was blocked in the read
-             loop this EOFs it and it dies → we `restart()` the kernel in place.
-          3. else (helper wedged inside a host-side call — SIGKILL of the worker
-             can't reach it) we ABANDON this Kernel (`st.kernel=None`, respawned
-             lazily) rather than `restart()` it: restarting the SHARED kernel
-             would reassign the `_proc` slot the zombie still holds and let it
-             corrupt/steal frames from a fresh worker. The zombie stays bound to
-             the dead old proc and dies when its call returns.
-          4. raise TimeoutError → run_message finalises the turn as *failed*.
-
-        The cap is generous (default 900s, `OPENAI4S_CELL_TIMEOUT`) so real
-        heavy science cells (imports, training, big fetches) are never cut short.
-        """
-        import math
-        import os
-
-        try:
-            cap = float(os.environ.get("OPENAI4S_CELL_TIMEOUT", "900") or 900)
-        except (TypeError, ValueError):
-            cap = 900.0
-        if not math.isfinite(cap) or cap <= 0:  # inf/nan/<=0 → disable (old behaviour)
-            return getattr(st, kernel_attr).execute(
-                code, origin=origin, on_chunk=on_chunk
-            )
-
-        box: dict = {}
-
-        def _run() -> None:
-            try:
-                box["result"] = getattr(st, kernel_attr).execute(
-                    code, origin=origin, on_chunk=on_chunk
-                )
-            except BaseException as e:  # noqa: BLE001 — relay to the caller thread
-                box["error"] = e
-
-        th = threading.Thread(
-            target=_run, name=f"os-cell-{st.root_frame_id}", daemon=True
-        )
-        th.start()
-        # Watchdog with a FROZEN clock while a tool call is blocked awaiting the
-        # user's permission decision: a slow human approval must never look like a
-        # wedged cell (which would SIGINT/kill the kernel and fail the turn). Only
-        # actual execution time counts toward `cap`; the permission-gate's own
-        # timeout is the human-approval backstop.
+        """Web adapter for the protocol-neutral exact-lease cell watchdog."""
+        lease = lease or st.kernels.lease(language)
+        if lease is None:
+            raise RuntimeError(f"{language} kernel is not available")
         try:
             from openai4s.permissions import broker as _perm_broker
 
-            _brk = _perm_broker()
+            permission_broker = _perm_broker()
         except Exception:  # noqa: BLE001
-            _brk = None
-        remaining = cap
-        while remaining > 0:
-            slice_ = min(remaining, 1.0)
-            th.join(slice_)
-            if not th.is_alive():
-                break
-            if _brk is not None and _brk.is_pending(st.root_frame_id):
-                continue  # paused for approval — do not spend the watchdog budget
-            remaining -= slice_
-        if not th.is_alive():
-            if "error" in box:
-                raise box["error"]
-            return box["result"]
+            permission_broker = None
 
-        # Cap exceeded — try a gentle SIGINT first. It breaks a Python-level hang
-        # and KEEPS the kernel + namespace, so the cell just comes back as an
-        # interrupted (error) result and the turn continues.
-        kernel = getattr(st, kernel_attr)
-        try:
-            kernel.interrupt()
-        except Exception:  # noqa: BLE001
-            pass
-        th.join(10)
-        if not th.is_alive():
-            if "error" in box:
-                raise box["error"]
-            if box.get("result") is not None:
-                return box["result"]
-            return {
-                "stdout": "",
-                "stderr": "",
-                "error": f"cell interrupted after exceeding {int(cap)}s",
-            }
+        def permission_pending() -> bool:
+            return bool(
+                permission_broker
+                and permission_broker.is_pending(st.root_frame_id)
+            )
 
-        # Still wedged after SIGINT. Hard-kill the OLD worker in place (do NOT
-        # reassign self._proc). If the helper was blocked in the kernel READ this
-        # EOFs it and it dies; if it was blocked in a host-side call, kill can't
-        # reach it.
-        try:
-            proc = getattr(kernel, "_proc", None)
-            if proc is not None:
-                proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
-        th.join(10)
-        if th.is_alive():
-            # Helper is stuck in a host-side call (not the read loop). Restarting
-            # the SHARED kernel would reassign the _proc slot the zombie still
-            # holds → frame corruption/steal. Abandon this Kernel instead; the
-            # session lazily respawns a fresh one and the zombie dies harmlessly
-            # against the dead old proc.
-            setattr(st, kernel_attr, None)
-        else:
-            # Helper is gone — safe to restart the shared Kernel in place.
-            try:
-                kernel.restart()
-                if kernel_attr == "kernel":
-                    self._run_bootstrap(st)  # skill sidecars are python-only
-            except Exception:  # noqa: BLE001
-                pass
-        raise TimeoutError(
-            f"cell exceeded {int(cap)}s with no result and was stopped; the "
-            "kernel was reset (variables from earlier cells were cleared). Break "
-            "the work into smaller steps, or raise OPENAI4S_CELL_TIMEOUT."
+        policy = WatchdogPolicy.from_environment(
+            interrupt_grace_s=_WATCHDOG_INTERRUPT_GRACE_S,
+            kill_grace_s=_WATCHDOG_KILL_GRACE_S,
+        )
+        after_restart = (
+            (lambda target: self._run_bootstrap(st, target))
+            if language == "python"
+            else None
+        )
+        return execute_with_watchdog(
+            st.kernels,
+            lease,
+            lambda kernel: kernel.execute(
+                code,
+                origin=origin,
+                on_chunk=on_chunk,
+                cell_id=cell_id,
+            ),
+            policy=policy,
+            cancelled=st.cancel.is_set,
+            paused=permission_pending,
+            after_restart=after_restart,
+            thread_name=f"os-cell-{st.root_frame_id}",
         )
 
     def _safety_refusal(self, code: str, origin: str) -> str | None:
@@ -3262,207 +2400,21 @@ class SessionRunner:
         stream: bool = True,
         language: str = "python",
     ) -> dict:
-        """Run one code cell in the matching persistent kernel (python or R);
-        capture + persist it."""
-        rid = st.root_frame_id
-        st.cell_index += 1
-        idx = st.cell_index
-        cell_id = f"c-{uuid.uuid4().hex[:12]}"
-        # spawn/retarget the R kernel FIRST so the segment label below reflects
-        # the env the cell actually runs in; a missing R becomes a soft error
-        # observation after the safety gate (the model can fall back to python)
-        r_error: str | None = None
-        if language == "r":
-            r_error = self._ensure_r_kernel(st)
-        kernel_id = self._r_kernel_id(st) if language == "r" else self._kernel_id(st)
-        title = _activity_title(code, idx)
-        on_chunk = None
-        if stream:
-            emit(
-                {
-                    "type": "text_chunk",
-                    "frame_id": rid,
-                    "block_type": "tool",
-                    "chunk": f"⚙{title}\n",
-                    "cell_index": idx,
-                    "kernel_id": kernel_id,
-                    "language": language,
-                }
-            )
-            emit(
-                {
-                    "type": "text_chunk",
-                    "frame_id": rid,
-                    "block_type": "tool",
-                    "chunk": code + "\n" + _NB_DIVIDER + "\n",
-                }
-            )
-
-            def on_chunk(t: str, _emit=emit, _rid=rid) -> None:  # noqa: E306
-                _emit(
-                    {
-                        "type": "text_chunk",
-                        "frame_id": _rid,
-                        "block_type": "tool",
-                        "chunk": t,
-                    }
-                )
-
-        before = self._snapshot(st.workspace)
-        self._protect_latest_version_snapshots(st)
-        # Pre-exec code-safety gate (report e6w). Only agent-authored cells are
-        # gated — a user typing directly into the Notebook is explicitly running
-        # their own code and is not screened.
-        refusal = self._safety_refusal(code, origin)
-        if refusal is not None:
-            result = {
-                "type": "response",
-                "id": cell_id,
-                "stdout": "",
-                "stderr": "",
-                "error": refusal,
-                "interrupted": False,
-                "trace": {"error_lineno": None, "error_call": None},
-                "usage": {},
-            }
-            if stream:
-                emit(
-                    {
-                        "type": "text_chunk",
-                        "frame_id": rid,
-                        "block_type": "tool",
-                        "chunk": "\n" + refusal,
-                    }
-                )
-            self.store.log_cell(
-                frame_id=rid,
-                root_frame_id=rid,
-                code=code,
-                result=result,
-                origin=origin,
-                cell_seq=idx,
-                cell_index=idx,
-                project_id=st.project_id,
-                kernel_id=kernel_id,
-                language=language,
-                figures=[],
-                files_written=[],
-                files_read=[],
-            )
-            return {
-                "result": result,
-                "idx": idx,
-                "cell_id": cell_id,
-                "figures": [],
-                "files_written": [],
-                "saved": [],
-            }
-        if r_error is not None:
-            # no R interpreter (or spawn failed): a soft error result, logged
-            # and streamed exactly like a failed cell — never a crashed turn
-            result = {
-                "type": "response",
-                "id": cell_id,
-                "stdout": "",
-                "stderr": "",
-                "error": r_error,
-                "interrupted": False,
-                "trace": {"error_lineno": None, "error_call": None},
-                "usage": {},
-            }
-            if stream:
-                emit(
-                    {
-                        "type": "text_chunk",
-                        "frame_id": rid,
-                        "block_type": "tool",
-                        "chunk": "\n" + r_error,
-                    }
-                )
-            self.store.log_cell(
-                frame_id=rid,
-                root_frame_id=rid,
-                code=code,
-                result=result,
-                origin=origin,
-                cell_seq=idx,
-                cell_index=idx,
-                project_id=st.project_id,
-                kernel_id=kernel_id,
-                language=language,
-                figures=[],
-                files_written=[],
-                files_read=[],
-            )
-            return {
-                "result": result,
-                "idx": idx,
-                "cell_id": cell_id,
-                "figures": [],
-                "files_written": [],
-                "saved": [],
-            }
-        if language == "r":
-            try:
-                result = self._execute_with_watchdog(
-                    st, code, origin, on_chunk, kernel_attr="r_kernel"
-                )
-            except BaseException:
-                # a dead/desynced R worker must never poison the session:
-                # drop it so the next ```r cell respawns fresh. The turn still
-                # fails (uniform kernel-death contract) — but not every later
-                # R turn with it.
-                dead = st.r_kernel
-                st.r_kernel = None
-                if dead is not None:
-                    try:
-                        dead.shutdown()
-                    except Exception:  # noqa: BLE001
-                        pass
-                raise
-        else:
-            result = self._execute_with_watchdog(st, code, origin, on_chunk)
-        result["id"] = cell_id
-        if stream and result.get("error"):
-            emit(
-                {
-                    "type": "text_chunk",
-                    "frame_id": rid,
-                    "block_type": "tool",
-                    "chunk": "\n" + result["error"],
-                }
-            )
-        figures, files_written, saved = self._capture(
-            st, idx, cell_id, before, emit, language=language
-        )
-        # Files this cell produced are auto-captured as versioned artifacts; project
-        # that into a persisted "artifact" activity step (files / environment / the
-        # returned artifact metadata) so the UI renders a "Saving …" card exactly
-        # like the reference — no explicit host.save_artifact call required.
-        if saved and stream:
-            self._emit_artifact_step(st, title, saved, emit)
-        self.store.log_cell(
-            frame_id=rid,
-            root_frame_id=rid,
+        """Compatibility façade over the typed cell execution service."""
+        request = CellRequest(
             code=code,
-            result=result,
             origin=origin,
-            cell_seq=idx,
-            cell_index=idx,
-            project_id=st.project_id,
-            kernel_id=kernel_id,
             language=language,
-            figures=figures,
-            files_written=files_written,
-            files_read=[],
+            stream=stream,
         )
+        executed = self.cells.execute(st, request, emit)
         return {
-            "result": result,
-            "idx": idx,
-            "cell_id": cell_id,
-            "figures": figures,
-            "files_written": files_written,
-            "saved": saved,
+            "result": executed.result,
+            "idx": executed.cell_index,
+            "cell_id": executed.cell_id,
+            "figures": executed.capture.figures,
+            "files_written": executed.capture.files_written,
+            "saved": executed.capture.artifacts,
         }
 
     def _emit_artifact_step(
@@ -3523,201 +2475,29 @@ class SessionRunner:
 
     # -- structured plan: capture / persist / approve / revise / discard ----
     def _finalize_plan(self, st: SessionState, reply: str, prose: str, emit) -> None:
-        """Called at the end of a plan-mode turn: extract the structured plan
-        from the model reply, upsert the plan row (+ a plan_*.json artifact) and
-        emit `plan_ready`."""
-        rid = st.root_frame_id
-        raw = _extract_plan_json(reply)
-        task_hint = ""
-        for m in reversed(st.messages):
-            if m.get("role") == "user":
-                task_hint = re.sub(r"\s+", " ", str(m.get("content") or "")).strip()
-                break
-        plan = _normalize_plan(raw, prose, task_hint)
-        if not plan["steps"]:
-            # nothing parseable — leave the prose plan as-is (legacy fallback card)
-            return
-        prev = self.store.get_plan_by_frame(rid)
-        reuse = prev if (prev and prev.get("status") == "draft") else None
-        art = self._write_plan_artifact(
-            st, plan, reuse.get("artifact_id") if reuse else None, emit
-        )
-        art_id = (
-            art.get("artifact_id")
-            if art
-            else (reuse.get("artifact_id") if reuse else None)
-        )
-        if reuse:
-            self.store.update_plan(
-                reuse["plan_id"],
-                title=plan["title"],
-                rationale=plan["rationale"],
-                confidence=plan["confidence"],
-                steps=plan["steps"],
-                status="draft",
-                step_status={},
-                artifact_id=art_id,
-            )
-            row = self.store.get_plan(reuse["plan_id"])
-        else:
-            row = self.store.create_plan(
-                frame_id=rid,
-                project_id=st.project_id,
-                title=plan["title"],
-                rationale=plan["rationale"],
-                confidence=plan["confidence"],
-                steps=plan["steps"],
-                artifact_id=art_id,
-                status="draft",
-            )
-        self._emit_plan_ready(emit, rid, row)
+        self.plans.finalize(st, reply, prose, emit)
 
     def _write_plan_artifact(
         self, st: SessionState, plan: dict, artifact_id: str | None, emit
     ) -> dict | None:
-        """Write the plan as plan_<slug>_<id>.json into the workspace and record
-        it as a (versioned) artifact so it shows up in Files, like the reference."""
-        try:
-            if artifact_id:
-                existing = self.store.get_artifact(artifact_id) or {}
-                filename = existing.get("filename") or (
-                    f"plan_{_slugify(plan['title'])}_{_short_hash(st.root_frame_id)}.json"
-                )
-            else:
-                filename = f"plan_{_slugify(plan['title'])}_{_short_hash(st.root_frame_id)}.json"
-            body = json.dumps(
-                {
-                    "title": plan["title"],
-                    "rationale": plan["rationale"],
-                    "confidence": plan["confidence"],
-                    "steps": plan["steps"],
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            path = st.workspace / filename
-            path.write_text(body, encoding="utf-8")
-            data = body.encode("utf-8")
-            rec = self.store.save_artifact(
-                path=str(path),
-                filename=filename,
-                content_type="application/json",
-                size_bytes=len(data),
-                checksum=hashlib.sha256(data).hexdigest(),
-                frame_id=st.root_frame_id,
-                project_id=st.project_id,
-                artifact_id=artifact_id,
-            )
-            emit(
-                {
-                    "type": "artifact_created",
-                    "frame_id": st.root_frame_id,
-                    "artifact_id": rec.get("artifact_id"),
-                    "filename": filename,
-                }
-            )
-            return rec
-        except Exception:  # noqa: BLE001 — the artifact is a nicety, not required
-            traceback.print_exc()
-            return None
+        return self.plans.write_artifact(st, plan, artifact_id, emit)
 
     def _emit_plan_ready(self, emit, rid: str, plan: dict | None) -> None:
-        pub = _plan_public(plan)
-        if pub is None:
-            return
-        emit(
-            {
-                "type": "plan_ready",
-                "frame_id": rid,
-                "plan_id": pub.get("plan_id"),
-                "status": pub.get("status"),
-                "plan": pub,
-                "artifact_id": pub.get("artifact_id"),
-            }
-        )
+        self.plans.emit_ready(emit, rid, plan)
 
     def get_plan_state(self, root_frame_id: str) -> dict:
-        plan = self.store.get_plan_by_frame(root_frame_id)
-        pub = _plan_public(plan)
-        return {
-            "frame_id": root_frame_id,
-            "plan_id": pub.get("plan_id") if pub else None,
-            "status": pub.get("status") if pub else None,
-            "plan": pub,
-        }
+        return self.plans.get_state(root_frame_id)
 
     def discard_plan(self, root_frame_id: str) -> dict:
-        plan = self.store.get_plan_by_frame(root_frame_id)
-        if not plan:
-            return {"ok": False, "error": "no plan for this session"}
-        self.store.update_plan(plan["plan_id"], status="discarded")
-        emit = self.hub.emitter(root_frame_id)
-        self._emit_plan_ready(emit, root_frame_id, self.store.get_plan(plan["plan_id"]))
-        return {"ok": True, "plan_id": plan["plan_id"], "status": "discarded"}
+        return self.plans.discard(root_frame_id)
 
     def _plan_exec_seed(self, plan: dict) -> str:
-        lines = []
-        for i, s in enumerate(plan.get("steps") or []):
-            deliv = "、".join(s.get("deliverables") or []) or "（无指定文件）"
-            lines.append(
-                f"- [{s.get('id') or ('s' + str(i + 1))}] {s.get('title', '')}"
-                f"：{s.get('detail', '')}  → 产出：{deliv}"
-            )
-        steps_txt = "\n".join(lines)
-        return (
-            f"已批准计划「{plan.get('title', '')}」，现在开始自动执行。\n\n"
-            "请严格按下面的步骤顺序推进：\n" + steps_txt + "\n\n"
-            "执行规则：\n"
-            '1. 每开始一个步骤前，先调用 host.plan_update("<step_id>", '
-            '"in_progress")（这会把计划卡上的该步标记为进行中）。\n'
-            "2. 该步骤列出的产物文件全部写好后，调用 "
-            'host.plan_update("<step_id>", "completed")。若某步确实无法完成，'
-            '调用 host.plan_update("<step_id>", "failed", note="原因") 后继续下一步。\n'
-            "3. 按顺序逐步推进，把每一步的结果文件写到工作目录（会自动成为产物）。\n"
-            "4. 严格遵守我在原始任务中提出的所有约束（例如：最终总结里不要对大于约 "
-            "1MB 的原始数据文件使用 Markdown 链接，只按文件名引用）。\n"
-            "5. 全部完成后写一段简洁的最终总结，并调用 host.submit_output(...)。"
-        )
+        return self.plans.execution_seed(plan)
 
     def run_plan_execution(
         self, root_frame_id: str, project_id: str, model: str | None = None
     ) -> dict:
-        """Approve → auto-execute: work the plan's steps in order (the agent ticks
-        each via host.plan_update). Runs a normal execution turn seeded with the
-        approved plan; marks the plan completed/failed at the end."""
-        plan = self.store.get_plan_by_frame(root_frame_id)
-        if not plan:
-            return {
-                "status": "failed",
-                "frame_id": root_frame_id,
-                "error": "no plan to approve",
-            }
-        if plan.get("status") in ("executing", "completed"):
-            return {
-                "status": "failed",
-                "frame_id": root_frame_id,
-                "error": f"plan already {plan['status']}",
-            }
-        emit = self.hub.emitter(root_frame_id)
-        self.store.update_plan(plan["plan_id"], status="executing")
-        self._emit_plan_ready(emit, root_frame_id, self.store.get_plan(plan["plan_id"]))
-        seed = self._plan_exec_seed(plan)
-        result = self.run_message(root_frame_id, project_id, seed, model, plan=False)
-        final = (
-            "completed"
-            if result.get("status") == "completed"
-            else (
-                "failed"
-                if result.get("status") == "failed"
-                else self.store.get_plan(plan["plan_id"]).get("status") or "completed"
-            )
-        )
-        if final in ("completed", "failed"):
-            self.store.update_plan(plan["plan_id"], status=final)
-        self._emit_plan_ready(emit, root_frame_id, self.store.get_plan(plan["plan_id"]))
-        result["plan_id"] = plan["plan_id"]
-        result["plan_status"] = final
-        return result
+        return self.plans.run_execution(root_frame_id, project_id, model)
 
     def run_plan_revision(
         self,
@@ -3726,15 +2506,7 @@ class SessionRunner:
         changes: str,
         model: str | None = None,
     ) -> dict:
-        """Describe-changes → regenerate the plan (a fresh plan-mode turn seeded
-        with the user's feedback). Emits a new plan_ready(draft)."""
-        seed = (
-            "请根据下面的修改意见，重新拟定上面的执行计划，并再次只输出："
-            "一段简短的方案说明（散文）＋ 一个 ```json 代码块（"
-            "{title, rationale, confidence, steps:[{id,title,detail,deliverables}]} "
-            "结构，与之前一致）。不要执行、不要调用任何工具。\n\n修改意见：" + changes
-        )
-        return self.run_message(root_frame_id, project_id, seed, model, plan=True)
+        return self.plans.run_revision(root_frame_id, project_id, changes, model)
 
     def submit_plan_approval(
         self, root_frame_id: str, project_id: str, model: str | None = None
@@ -3802,7 +2574,7 @@ class SessionRunner:
         """Execute code directly in the session kernel (notebook REPL, no LLM)."""
         st = self._state(root_frame_id, project_id)
         emit = self.hub.emitter(root_frame_id)
-        with st.turn_lock:
+        with st.execution_barrier():
             self._ensure_kernel(st)
             info = self._execute_and_log(st, code, "user", emit, stream=False)
             r = info["result"]
@@ -3824,175 +2596,6 @@ class SessionRunner:
                     "files_read": [],
                 }
             }
-
-
-# --------------------------------------------------------------------------- #
-#  Structured plan helpers (plan mode → review card → auto-execute)
-# --------------------------------------------------------------------------- #
-def _short_hash(text: str) -> str:
-    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:8]
-
-
-def _slugify(text: str, maxlen: int = 44) -> str:
-    s = re.sub(r"[^\w\s-]", "", (text or "").lower())
-    s = re.sub(r"[\s_-]+", "-", s).strip("-")
-    return s[:maxlen].strip("-") or "plan"
-
-
-def _try_json(s: str):
-    try:
-        return json.loads((s or "").strip())
-    except (ValueError, TypeError):
-        return None
-
-
-def _first_json_object(text: str):
-    """Return the first balanced {...} object in `text` that parses, else None."""
-    start = (text or "").find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        c = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-            continue
-        if c == '"':
-            in_str = True
-        elif c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return _try_json(text[start : i + 1])
-    return None
-
-
-def _extract_plan_json(reply: str):
-    """Pull a structured plan object out of a plan-mode reply. Prefers a ```json
-    fenced block; falls back to any plan-shaped fenced block, then a bare {...}."""
-    if not reply:
-        return None
-    for m in re.finditer(r"```json\s*\n(.*?)```", reply, re.DOTALL | re.IGNORECASE):
-        obj = _try_json(m.group(1))
-        if isinstance(obj, dict) and ("steps" in obj or "title" in obj):
-            return obj
-    for m in re.finditer(r"```[a-zA-Z0-9]*\s*\n(.*?)```", reply, re.DOTALL):
-        obj = _try_json(m.group(1))
-        if isinstance(obj, dict) and "steps" in obj:
-            return obj
-    obj = _first_json_object(reply)
-    if isinstance(obj, dict) and "steps" in obj:
-        return obj
-    return None
-
-
-_PLAN_NUM_LINE_RE = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+(.*)$")
-
-
-def _steps_from_prose(prose: str) -> list[dict]:
-    """Last-resort: turn a numbered/bulleted prose list into plan steps."""
-    steps: list[dict] = []
-    for line in (prose or "").splitlines():
-        m = _PLAN_NUM_LINE_RE.match(line)
-        if not m:
-            continue
-        txt = m.group(1).strip()
-        txt = re.sub(r"^\*\*(.+?)\*\*", r"\1", txt)  # drop leading bold
-        if not txt:
-            continue
-        head = re.split(r"\s[—:：-]\s", txt, maxsplit=1)
-        steps.append(
-            {
-                "id": f"s{len(steps) + 1}",
-                "title": head[0].strip()[:120],
-                "detail": (head[1].strip() if len(head) > 1 else ""),
-                "deliverables": [],
-            }
-        )
-        if len(steps) >= 24:
-            break
-    return steps
-
-
-def _normalize_plan(raw, prose: str = "", task_hint: str = "") -> dict:
-    """Coerce a loose/extracted plan into the canonical shape."""
-    raw = raw if isinstance(raw, dict) else {}
-    steps: list[dict] = []
-    src = raw.get("steps")
-    if isinstance(src, list):
-        for i, s in enumerate(src):
-            if isinstance(s, str):
-                s = {"title": s}
-            if not isinstance(s, dict):
-                continue
-            deliv = s.get("deliverables") or s.get("outputs") or s.get("files") or []
-            if isinstance(deliv, str):
-                deliv = [deliv]
-            steps.append(
-                {
-                    "id": str(s.get("id") or f"s{i + 1}"),
-                    "title": (
-                        str(
-                            s.get("title") or s.get("content") or s.get("name") or ""
-                        ).strip()
-                        or f"Step {i + 1}"
-                    ),
-                    "detail": str(
-                        s.get("detail")
-                        or s.get("description")
-                        or s.get("summary")
-                        or ""
-                    ).strip(),
-                    "deliverables": [str(d) for d in deliv if d],
-                }
-            )
-    if not steps:
-        steps = _steps_from_prose(prose)
-    conf = raw.get("confidence")
-    if isinstance(conf, (int, float)):
-        conf = "high" if conf >= 0.75 else "low" if conf < 0.4 else "medium"
-    conf = (str(conf).strip() or None) if conf is not None else None
-    return {
-        "title": (
-            str(raw.get("title") or "").strip()
-            or (task_hint[:80] if task_hint else "")
-            or "执行计划"
-        ),
-        "rationale": str(raw.get("rationale") or raw.get("reasoning") or "").strip(),
-        "confidence": conf,
-        "steps": steps,
-    }
-
-
-def _plan_public(plan) -> dict | None:
-    """Public view of a stored plan: fold live step_status into steps[].status."""
-    if not plan:
-        return None
-    ss = plan.get("step_status") or {}
-    steps = []
-    for s in plan.get("steps") or []:
-        d = dict(s)
-        d["status"] = (
-            (ss.get(s.get("id")) or {}).get("status") or s.get("status") or "pending"
-        )
-        steps.append(d)
-    return {
-        "plan_id": plan.get("plan_id"),
-        "title": plan.get("title"),
-        "rationale": plan.get("rationale"),
-        "confidence": plan.get("confidence"),
-        "steps": steps,
-        "status": plan.get("status"),
-        "artifact_id": plan.get("artifact_id"),
-    }
 
 
 # --------------------------------------------------------------------------- #
@@ -4127,72 +2730,30 @@ def _memory_enabled(store) -> bool:
 
 # --- user skill authoring helpers ------------------------------------------
 def _skill_slug(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9_-]+", "-", (name or "").strip().lower()).strip("-")
-    return slug[:64] or "skill"
+    return SkillCustomizationService.slug(name)
 
 
 def _parse_skill_md(content: str) -> tuple[dict, str]:
-    from openai4s.skills_loader.loader import _parse_frontmatter
-
-    try:
-        return _parse_frontmatter(content)
-    except Exception:  # noqa: BLE001
-        return {}, content
+    return SkillCustomizationService.parse_document(content)
 
 
 def _write_user_skill(
     loader, name: str, description: str, body: str, existing: bool = False
 ) -> dict:
-    name = (name or "").strip()
-    if not name:
-        return {"error": "skill name is required"}
-    slug = _skill_slug(name)
-    # refuse to shadow a BUNDLED skill of the same slug (discover() would keep the
-    # bundled one anyway, so this would be a silently-ignored write).
-    try:
-        if not existing and (loader.skills_dir / slug).is_dir():
-            return {
-                "error": f"'{slug}' collides with a built-in skill — "
-                "pick a different name"
-            }
-    except Exception:  # noqa: BLE001
-        pass
-    root = loader.user_skills_dir() / slug
-    root.mkdir(parents=True, exist_ok=True)
-    desc = " ".join((description or "").split())
-    fm = f"---\nname: {name}\ndescription: {desc}\norigin: user\n---\n\n"
-    (root / "SKILL.md").write_text(fm + (body or "").strip() + "\n", "utf-8")
-    loader.discover()  # refresh so it shows up immediately
-    return {"ok": True, "name": name, "slug": slug, "origin": "user"}
+    return SkillCustomizationService(loader).create_or_update(
+        name,
+        description,
+        body,
+        existing=existing,
+    )
 
 
 def _read_user_skill(loader, name: str) -> dict:
-    for s in loader.skills().values():
-        if s.name == name or s.root.name == name:
-            meta, body = _parse_skill_md((s.root / "SKILL.md").read_text("utf-8"))
-            return {
-                "name": s.name,
-                "description": s.description,
-                "body": body,
-                "origin": s.origin,
-                "editable": s.origin == "user",
-            }
-    return {"error": "skill not found"}
+    return SkillCustomizationService(loader).get(name)
 
 
 def _delete_user_skill(loader, name: str) -> dict:
-    import shutil as _sh
-
-    udir = loader.user_skills_dir().resolve()
-    for s in loader.skills().values():
-        if s.name == name or s.root.name == name:
-            root = s.root.resolve()
-            if str(root).startswith(str(udir)) and root != udir:
-                _sh.rmtree(root, ignore_errors=True)
-                loader.discover()
-                return {"ok": True}
-            return {"error": "only user-authored skills can be deleted"}
-    return {"error": "skill not found"}
+    return SkillCustomizationService(loader).delete(name)
 
 
 def _detect_gpu() -> dict:
@@ -4394,8 +2955,12 @@ def _clean_api_key(value: str | None) -> str:
 
 def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
     store = get_store(cfg.db_path)
-    skills = SkillLoader(cfg=cfg)
-    _disabled_skills: set[str] = set()
+    execution_views = ExecutionViewService(
+        store=store,
+        format_timestamp=lambda value: _iso(value),
+    )
+    skill_customization = SkillCustomizationService(SkillLoader(cfg=cfg))
+    _disabled_skills = skill_customization.disabled_names
     _disabled_agents: set[str] = set()
     _default_model = {"id": cfg.llm.model or "default"}
 
@@ -5482,18 +4047,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         403,
                     )
                     return
-                st = runner._sessions.get(m.group(1))  # noqa: SLF001
-                if st and st.kernel is not None:
-                    try:
-                        st.kernel.interrupt()
-                    except Exception:  # noqa: BLE001
-                        pass
-                if st and st.r_kernel is not None:
-                    try:
-                        st.r_kernel.interrupt()
-                    except Exception:  # noqa: BLE001
-                        pass
-                self._json({"ok": True})
+                self._json(runner.interrupt_kernel(m.group(1)))
                 return
             m = re.fullmatch(r"/frames/([^/]+)/kernel/start", sub)
             if m and method == "POST":
@@ -5634,22 +4188,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 return
             m = re.fullmatch(r"/artifacts/([^/]+)", sub)
             if m and method == "DELETE":
-                a = store.get_artifact(m.group(1))
-                stale = store.delete_artifact(m.group(1))
-                for p in stale:
-                    try:
-                        Path(p).unlink()
-                    except OSError:
-                        pass
-                if a and a.get("root_frame_id"):
-                    hub.broadcast(
-                        a["root_frame_id"],
-                        {
-                            "type": "artifact_created",
-                            "root_frame_id": a["root_frame_id"],
-                        },
-                    )
-                self._json({"ok": True})
+                self._json(self._delete_artifact(m.group(1)))
                 return
             m = re.fullmatch(r"/artifacts/(.+)", sub)
             if m and method == "GET":
@@ -5666,18 +4205,18 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             m = re.fullmatch(r"/skills/catalog/([^/]+)/enabled", sub)
             if m and method in ("PUT", "PATCH"):
                 name = unquote(m.group(1))
-                if self._body().get("enabled"):
-                    _disabled_skills.discard(name)
-                else:
-                    _disabled_skills.add(name)
-                self._json({"ok": True})
+                self._json(
+                    skill_customization.set_enabled(
+                        name,
+                        self._body().get("enabled"),
+                    )
+                )
                 return
             # ---- skill authoring (create / edit / import / delete) ----
             if sub == "/skills" and method == "POST":
                 b = self._body()
                 self._json(
-                    _write_user_skill(
-                        skills,
+                    skill_customization.create_or_update(
                         b.get("name") or "",
                         b.get("description") or "",
                         b.get("body") or b.get("content") or "",
@@ -5686,29 +4225,25 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 return
             if sub == "/skills/import" and method == "POST":
                 b = self._body()
-                # accept a raw SKILL.md (content) or explicit fields
-                content = b.get("content") or ""
-                name = b.get("name") or ""
-                desc = b.get("description") or ""
-                body_md = b.get("body") or ""
-                if content and not body_md:
-                    meta, parsed = _parse_skill_md(content)
-                    name = name or meta.get("name") or ""
-                    desc = desc or meta.get("description") or ""
-                    body_md = parsed
-                self._json(_write_user_skill(skills, name, desc, body_md))
+                self._json(
+                    skill_customization.import_document(
+                        content=b.get("content") or "",
+                        name=b.get("name") or "",
+                        description=b.get("description") or "",
+                        body=b.get("body") or "",
+                    )
+                )
                 return
             m = re.fullmatch(r"/skills/([^/]+)", sub)
             if m and sub not in ("/skills/catalog", "/skills/import"):
                 name = unquote(m.group(1))
                 if method == "GET":
-                    self._json(_read_user_skill(skills, name))
+                    self._json(skill_customization.get(name))
                     return
                 if method in ("PUT", "PATCH"):
                     b = self._body()
                     self._json(
-                        _write_user_skill(
-                            skills,
+                        skill_customization.create_or_update(
                             name,
                             b.get("description") or "",
                             b.get("body") or b.get("content") or "",
@@ -5717,7 +4252,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     )
                     return
                 if method == "DELETE":
-                    self._json(_delete_user_skill(skills, name))
+                    self._json(skill_customization.delete(name))
                     return
             # ---- agents ----
             if sub == "/agents" and method == "GET":
@@ -6198,29 +4733,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             }
 
         def _skills_catalog(self, disabled: set[str]) -> list[dict]:
-            try:
-                cat = skills.catalog()
-            except Exception:
-                return []
-            out = []
-            for s in cat:
-                name = s.get("name") if isinstance(s, dict) else str(s)
-                origin = s.get("origin") if isinstance(s, dict) else None
-                out.append(
-                    {
-                        "name": name,
-                        "displayName": (s.get("displayName") or s.get("title") or name)
-                        if isinstance(s, dict)
-                        else name,
-                        "description": (s.get("description") or "")
-                        if isinstance(s, dict)
-                        else "",
-                        "origin": origin,
-                        "editable": origin == "user",
-                        "enabled": name not in disabled,
-                    }
-                )
-            return out
+            return skill_customization.catalog(disabled)
 
         def _agents_payload(self) -> list[dict]:
             out = []
@@ -6310,214 +4823,59 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             }
 
         def _exec_log(self, root_frame_id: str) -> dict:
-            cells = store.list_cells(root_frame_id)
-            kernels: list[str] = []
-            entries = []
-            for c in cells:
-                k = c.get("kernel_id") or "python"
-                if k not in kernels:
-                    kernels.append(k)
-                entries.append(
-                    {
-                        "cell_index": c.get("cell_index"),
-                        "kernel_id": k,
-                        "language": c.get("language") or "python",
-                        "source": c.get("code") or "",
-                        "stdout": c.get("stdout") or "",
-                        "stderr": c.get("stderr") or "",
-                        "error": c.get("error") or "",
-                        "status": c.get("status") or "ok",
-                        "figures": c.get("figures") or [],
-                        "files_written": c.get("files_written") or [],
-                        "files_read": c.get("files_read") or [],
-                        "cpu_seconds": c.get("cpu_s"),
-                        "peak_rss_kb": c.get("peak_rss_kb"),
-                    }
-                )
-            return {"kernels": kernels, "entries": entries}
+            return execution_views.execution_log(root_frame_id)
 
         def _lineage(self, artifact_id: str) -> dict:
-            a = store.get_artifact(artifact_id)
-            if not a:
-                return {
-                    "artifact_id": artifact_id,
-                    "filename": None,
-                    "interactions": [],
-                    "dependency_mappings": {"inputs": []},
-                }
-            interactions = []
-            inputs: list[str] = []
-            vid = a.get("latest_version_id")
-            cell = None
-            if vid:
-                vmeta = store.version_meta(vid)
-                pcid = (vmeta or {}).get("producing_cell_id")
-                if pcid:
-                    cell = store.cell_detail(pcid)
-            if cell:
-                fw = cell.get("files_written") or []
-                fr = cell.get("files_read") or []
-                inputs = [f for f in fr if f not in fw and f != a["filename"]]
-                interactions.append(
-                    {
-                        "kind": "cell",
-                        "cell_index": cell.get("cell_index"),
-                        "kernel_id": cell.get("kernel_id") or "python",
-                        "language": cell.get("language") or "python",
-                        "exit_status": cell.get("status") or "ok",
-                        "source": cell.get("code") or "",
-                        "files_written": fw,
-                        "files_read": fr,
-                    }
-                )
-            interactions.append({"kind": "save", "at": _iso(a.get("created_at"))})
-            return {
-                "artifact_id": artifact_id,
-                "filename": a.get("filename"),
-                "interactions": interactions,
-                "dependency_mappings": {"inputs": inputs},
-            }
+            return execution_views.artifact_lineage(artifact_id)
 
         def _edit_artifact(self, artifact_id: str, content: str) -> dict:
-            """Save edited content as a NEW version. The live workspace file (that
-            the agent reads) is updated in place, while an immutable per-version
-            snapshot preserves these exact bytes for history/restore — the same
-            model as auto-capture, so ``path`` stays the live file."""
-            a = store.get_artifact(artifact_id)
-            if not a:
-                raise GatewayError(404, "artifact not found")
-            if not _is_text_editable(a.get("filename"), a.get("content_type")):
-                raise GatewayError(415, "artifact is not text-editable")
-            live = runner.live_artifact_path(a)
-            # protect a PRE-FIX latest that has no immutable snapshot yet, before we
-            # overwrite the live file (post-fix versions already carry their own).
-            cur_vid = a.get("latest_version_id")
-            cur_meta = store.version_meta(cur_vid) if cur_vid else None
             try:
-                if (
-                    cur_meta
-                    and not cur_meta.get("snapshot_path")
-                    and cur_meta.get("path")
-                    and Path(cur_meta["path"]).resolve() == live.resolve()
-                    and live.exists()
-                ):
-                    runner._write_version_snapshot(
-                        cur_vid, a["filename"], data=live.read_bytes()
-                    )
-            except OSError:
-                pass
-            raw = content.encode("utf-8")
-            try:
-                live.parent.mkdir(parents=True, exist_ok=True)
-                live.write_text(content, encoding="utf-8")
-            except OSError as e:
-                raise GatewayError(500, f"write failed: {e}")
-            rec = store.save_artifact(
-                path=str(live),
-                filename=a["filename"],
-                content_type=a.get("content_type"),
-                size_bytes=len(raw),
-                checksum=hashlib.sha256(raw).hexdigest(),
-                frame_id=a.get("root_frame_id"),
-                project_id=a.get("project_id"),
-                artifact_id=artifact_id,
-            )
-            runner._write_version_snapshot(rec["version_id"], a["filename"], data=raw)
-            if a.get("root_frame_id"):
-                hub.broadcast(
-                    a["root_frame_id"],
-                    {
-                        "type": "artifact_created",
-                        "artifact": {
-                            "id": artifact_id,
-                            "filename": a["filename"],
-                            "version_id": rec["version_id"],
-                            "root_frame_id": a["root_frame_id"],
-                        },
-                    },
+                return runner.artifacts.edit(
+                    artifact_id,
+                    content,
+                    broadcast=lambda root_frame_id, event: hub.broadcast(
+                        root_frame_id, event
+                    ),
                 )
-            return {
-                "ok": True,
-                "artifact_id": artifact_id,
-                "version_id": rec["version_id"],
-                "size_bytes": len(raw),
-            }
+            except ArtifactOperationError as error:
+                raise GatewayError(error.code, error.message) from error
 
         def _restore_version(self, artifact_id: str, version_id: str) -> dict:
             return runner.restore_version(artifact_id, version_id)
 
         def _rename_artifact(self, artifact_id: str, filename: str | None) -> dict:
-            if not filename:
-                raise GatewayError(400, "filename required")
-            a = store.get_artifact(artifact_id)
-            if not a:
-                raise GatewayError(404, "artifact not found")
-            store.rename_artifact(artifact_id, filename)
-            if a.get("root_frame_id"):
-                hub.broadcast(
-                    a["root_frame_id"],
-                    {
-                        "type": "artifact_created",
-                        "artifact": {
-                            "id": artifact_id,
-                            "filename": filename,
-                            "root_frame_id": a["root_frame_id"],
-                        },
-                    },
+            try:
+                return runner.artifacts.rename(
+                    artifact_id,
+                    filename,
+                    broadcast=lambda root_frame_id, event: hub.broadcast(
+                        root_frame_id, event
+                    ),
                 )
-            return {"ok": True, "artifact_id": artifact_id, "filename": filename}
+            except ArtifactOperationError as error:
+                raise GatewayError(error.code, error.message) from error
 
         def _upload(self, b: dict) -> dict:
-            filename = b.get("filename") or f"upload-{uuid.uuid4().hex[:8]}"
-            data_b64 = b.get("content_base64") or b.get("content") or ""
-            frame_id = b.get("frame_id")
-            project_id = b.get("project_id") or "default"
             try:
-                raw = base64.b64decode(data_b64) if data_b64 else b""
-            except (binascii.Error, ValueError):
-                raw = data_b64.encode("utf-8") if isinstance(data_b64, str) else b""
-            ws = (
-                runner.workspace_for(frame_id) if frame_id else cfg.data_dir / "uploads"
-            )
-            ws.mkdir(parents=True, exist_ok=True)
-            target = ws / Path(filename).name
-            target.write_bytes(raw)
-            existing = (
-                store.artifact_by_filename(target.name, frame_id, strict=True)
-                if frame_id
-                else None
-            )
-            rec = store.save_artifact(
-                path=str(target),
-                filename=target.name,
-                content_type=_guess_ctype(target.name),
-                size_bytes=len(raw),
-                checksum=hashlib.sha256(raw).hexdigest(),
-                frame_id=frame_id,
-                project_id=project_id,
-                is_user_upload=True,
-                artifact_id=(existing["artifact_id"] if existing else None),
-            )
-            # freeze this upload's bytes so re-uploading the same name keeps history
-            runner._write_version_snapshot(rec["version_id"], target.name, data=raw)
-            if frame_id:
-                hub.broadcast(
-                    frame_id,
-                    {
-                        "type": "artifact_created",
-                        "artifact": {
-                            "id": rec["artifact_id"],
-                            "filename": target.name,
-                            "content_type": rec.get("content_type"),
-                            "root_frame_id": frame_id,
-                        },
-                    },
+                return runner.artifacts.upload(
+                    b,
+                    broadcast=lambda root_frame_id, event: hub.broadcast(
+                        root_frame_id, event
+                    ),
                 )
-            return {
-                "artifact_id": rec["artifact_id"],
-                "id": rec["artifact_id"],
-                "filename": target.name,
-            }
+            except ArtifactOperationError as error:
+                raise GatewayError(error.code, error.message) from error
+
+        def _delete_artifact(self, artifact_id: str) -> dict:
+            try:
+                return runner.artifacts.delete(
+                    artifact_id,
+                    broadcast=lambda root_frame_id, event: hub.broadcast(
+                        root_frame_id, event
+                    ),
+                )
+            except ArtifactOperationError as error:
+                raise GatewayError(error.code, error.message) from error
 
         # ---- websocket --------------------------------------------------
         def _handle_ws(self) -> None:

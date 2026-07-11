@@ -729,7 +729,10 @@ def test_frame_update_status_literal_vocabulary(tmp_path):
     terminal site emits a VARIABLE status ∈ {completed, failed, cancelled}
     (asserted behaviorally by the structured-submit and max-turn tests above).
     If this fails, a status was added/removed — update docs/webapp-api.md."""
+    from openai4s.server import titles as titles_mod
+
     src = Path(gateway_mod.__file__).read_text(encoding="utf-8")
+    src += Path(titles_mod.__file__).read_text(encoding="utf-8")
     sites = list(re.finditer(r'"type": "frame_update"', src))
     assert len(sites) >= 7  # the emit sites documented today
     literals = set()
@@ -979,8 +982,8 @@ def test_execution_log_route_serializer_contract(tmp_path):
 
 def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
     """The artifact lineage payload (UI provenance view): a produced artifact
-    reports its producing cell interaction + save event, and
-    dependency_mappings.inputs = files_read minus files_written minus itself.
+    reports its producing cell interaction + save event, and merges legacy
+    execution-log reads with real version lineage before filtering outputs.
     An unknown artifact returns the same shape, empty."""
     cfg, runner, store, fid, st = _runner_frame(tmp_path)
     handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
@@ -992,12 +995,40 @@ def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
         code="plot(df)",
         result={"id": "cell-7", "stdout": "", "stderr": "", "error": None},
         cell_index=3,
-        files_read=["raw.csv", "fig.txt"],
+        files_read=["legacy.csv", "fig.txt", "raw.csv"],
         files_written=["fig.txt"],
+    )
+    raw = store.save_artifact(
+        path=str(st.workspace / "raw.csv"),
+        filename="raw.csv",
+        content_type="text/csv",
+        size_bytes=3,
+        checksum="raw",
+        frame_id=fid,
+    )
+    edge_only = store.save_artifact(
+        path=str(st.workspace / "edge.csv"),
+        filename="edge.csv",
+        content_type="text/csv",
+        size_bytes=4,
+        checksum="edge",
+        frame_id=fid,
     )
     f = st.workspace / "fig.txt"
     f.write_text("bytes")
     rec = runner._register_file(st, f, "cell-7", lambda e: None)
+    store.add_lineage_edge(
+        input_version_id=raw["version_id"],
+        output_version_id=rec["version_id"],
+        producing_cell_id="cell-7",
+        frame_id=fid,
+    )
+    store.add_lineage_edge(
+        input_version_id=edge_only["version_id"],
+        output_version_id=rec["version_id"],
+        producing_cell_id="cell-7",
+        frame_id=fid,
+    )
 
     lin = handler._lineage(rec["artifact_id"])
     assert lin["artifact_id"] == rec["artifact_id"]
@@ -1009,8 +1040,12 @@ def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
     assert cell["source"] == "plot(df)"
     assert cell["exit_status"] == "ok"
     assert cell["files_written"] == ["fig.txt"]
-    # inputs exclude what the cell itself wrote and the artifact's own filename
-    assert lin["dependency_mappings"] == {"inputs": ["raw.csv"]}
+    assert cell["files_read"] == ["legacy.csv", "fig.txt", "raw.csv", "edge.csv"]
+    # inputs exclude what the cell itself wrote and the artifact's own filename,
+    # while retaining both legacy telemetry and Store-backed lineage edges.
+    assert lin["dependency_mappings"] == {
+        "inputs": ["legacy.csv", "raw.csv", "edge.csv"]
+    }
 
     empty = handler._lineage("a-does-not-exist")
     assert empty == {
@@ -1019,6 +1054,63 @@ def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
         "interactions": [],
         "dependency_mappings": {"inputs": []},
     }
+    replies = []
+    handler._query = lambda: {}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._api("GET", "/artifacts/a-does-not-exist/lineage")
+    assert replies[-1] == (200, empty)
+
+
+def test_lineage_serializer_follows_latest_and_restored_version_edges(tmp_path):
+    cfg, runner, store, fid, st = _runner_frame(tmp_path)
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    sources = []
+    for name in ("input-a.txt", "input-b.txt"):
+        path = st.workspace / name
+        path.write_text(name)
+        sources.append(
+            store.save_artifact(
+                path=str(path),
+                filename=name,
+                content_type="text/plain",
+                size_bytes=len(name),
+                checksum=name,
+                frame_id=fid,
+            )
+        )
+
+    output = st.workspace / "result.txt"
+    versions = []
+    for index, source in enumerate(sources, start=1):
+        cell_id = f"cell-{index}"
+        store.log_cell(
+            frame_id=fid,
+            root_frame_id=fid,
+            code=f"write version {index}",
+            result={"id": cell_id, "stdout": "", "stderr": "", "error": None},
+            cell_index=index,
+            files_read=[],
+            files_written=["result.txt"],
+        )
+        output.write_text(f"version {index}")
+        record = runner._register_file(st, output, cell_id, lambda event: None)
+        versions.append(record)
+        store.add_lineage_edge(
+            input_version_id=source["version_id"],
+            output_version_id=record["version_id"],
+            producing_cell_id=cell_id,
+            frame_id=fid,
+        )
+
+    latest = handler._lineage(versions[0]["artifact_id"])
+    assert latest["dependency_mappings"] == {"inputs": ["input-b.txt"]}
+    assert latest["interactions"][0]["files_read"] == ["input-b.txt"]
+
+    store.set_latest_version(versions[0]["artifact_id"], versions[0]["version_id"])
+    restored = handler._lineage(versions[0]["artifact_id"])
+    assert restored["dependency_mappings"] == {"inputs": ["input-a.txt"]}
+    assert restored["interactions"][0]["files_read"] == ["input-a.txt"]
 
 
 def test_upload_base64_decode_and_raw_fallback(tmp_path):
@@ -1337,6 +1429,12 @@ def test_notebook_repl_execute_route_gated_by_flag(monkeypatch, tmp_path):
     assert hits == [(fid, "default", "print(2)")]
     assert replies2[-1] == (200, sentinel)
 
+    interrupts = []
+    runner2.interrupt_kernel = lambda rfid: interrupts.append(rfid) or {"ok": True}
+    handler2._api("POST", f"/frames/{fid}/kernel/interrupt")
+    assert interrupts == [fid]
+    assert replies2[-1] == (200, {"ok": True})
+
 
 def test_resolve_env_does_not_clobber_pin_when_env_unresolvable(monkeypatch, tmp_path):
     """Regression: a transiently-unresolvable pinned env must fall back to base
@@ -1387,29 +1485,72 @@ def test_restart_respawns_when_active_env_is_only_a_pin_fallback(monkeypatch, tm
     calls = []
 
     class FallbackKernel:
-        generation = 1
-
         def shutdown(self):
             calls.append("shutdown")
 
         def restart(self):
             calls.append("restart")
 
-    st.kernel = FallbackKernel()
+    st.kernels.ensure("python", "base", FallbackKernel)
     st.env_name = "base"
     st.desired_env = "struct"
 
     def spawn(state):
         calls.append("spawn")
         state.env_name = state.desired_env
-        state.kernel = SimpleNamespace(generation=2)
+        return state.kernels.ensure(
+            "python",
+            "struct",
+            lambda: SimpleNamespace(shutdown=lambda: None),
+        )
 
     monkeypatch.setattr(runner, "_spawn_kernel", spawn)
     result = runner.restart_kernel(st.root_frame_id, st.project_id)
 
-    assert calls == ["shutdown", "spawn"]
+    # Replacement is build-first: the old base worker is shut down only after
+    # the recovered target worker exists.
+    assert calls == ["spawn", "shutdown"]
     assert st.env_name == "struct"
-    assert result["generation"] == 2
+    assert result["generation"] == 1
+
+
+def test_restart_still_clears_namespace_when_pin_remains_unavailable(
+    monkeypatch, tmp_path
+):
+    """A fallback resolving to the same base key must not turn Restart into reuse."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    st = runner._state("f-restart-still-fallback", "default")
+    calls = []
+
+    class FallbackKernel:
+        def restart(self):
+            calls.append("restart")
+
+        def shutdown(self):
+            calls.append("shutdown")
+
+    kernel = FallbackKernel()
+    st.kernels.ensure("python", "base", lambda: kernel)
+    st.env_name = "base"
+    st.desired_env = "struct"
+
+    def unresolved(state):
+        calls.append("resolve-base")
+        return state.kernels.ensure("python", "base", lambda: FallbackKernel())
+
+    monkeypatch.setattr(runner, "_spawn_kernel", unresolved)
+    monkeypatch.setattr(
+        runner,
+        "_run_bootstrap",
+        lambda state, target=None: calls.append("bootstrap"),
+    )
+
+    result = runner.restart_kernel(st.root_frame_id, st.project_id)
+
+    assert st.kernel is kernel
+    assert calls == ["resolve-base", "restart", "bootstrap"]
+    assert result["generation"] == 1
 
 
 def test_tool_batch_applies_env_switch_before_following_call(monkeypatch, tmp_path):

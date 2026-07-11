@@ -1,4 +1,6 @@
 """Agent loop + delegation + compaction tests, with the LLM mocked offline."""
+from pathlib import Path
+
 import pytest
 
 import openai4s.agent.compaction as comp_mod
@@ -54,6 +56,37 @@ def test_code_as_action_cycle(monkeypatch):
     assert result["submitted_output"]["output"] == {"answer": 42}
     # 2 assistant turns happened
     assert len(scripted.calls) == 2
+
+
+def test_cli_save_artifact_resolves_relative_to_actual_kernel_cwd(
+    monkeypatch, tmp_path
+):
+    scripted = ScriptedLLM(
+        [
+            "```python\n"
+            "open('cli-result.txt', 'w').write('science')\n"
+            "saved = host.save_artifact('cli-result.txt')\n"
+            "print(saved['version_id'])\n"
+            "```",
+            "```python\n"
+            "host.submit_output({'saved': True}, ['Saved the CLI artifact'])\n"
+            "```",
+        ]
+    )
+    monkeypatch.setattr(loop_mod, "chat", scripted)
+    monkeypatch.chdir(tmp_path)
+
+    agent = Agent(use_skills=False, allow_delegate=False, max_turns=3)
+    result = agent.run("write and save a relative artifact")
+
+    assert result["stop_reason"] == "submitted"
+    artifact = agent.dispatcher.store.artifact_by_filename(
+        "cli-result.txt", agent.frame_id, strict=True
+    )
+    assert artifact is not None
+    metadata = agent.dispatcher.store.version_meta(artifact["latest_version_id"])
+    assert metadata["path"] == str(tmp_path / "cli-result.txt")
+    assert Path(metadata["snapshot_path"]).read_text() == "science"
 
 
 def test_no_code_block_nudge(monkeypatch):
@@ -359,6 +392,34 @@ def test_delegate_single_and_list(monkeypatch):
     many = runner({"request": ["A", "B", "C"]})
     assert isinstance(many, list) and len(many) == 3
     assert {m["output"]["echo"] for m in many} == {"A", "B", "C"}
+
+
+def test_delegate_output_schema_uses_shared_completion_validation(monkeypatch):
+    def fake_run(self, task):
+        output = {"x": 1} if task == "valid" else {"y": 1}
+        return {
+            "stop_reason": "submitted",
+            "submitted_output": {
+                "output": output,
+                "completion_bullets": ["Computed the result"],
+            },
+            "final_message": None,
+        }
+
+    monkeypatch.setattr(loop_mod.Agent, "run", fake_run)
+    runner = DelegationRunner(get_config())
+    schema = {"type": "object", "required": ["x"]}
+
+    invalid = runner({"request": "invalid", "output_schema": schema})
+    assert invalid["error"] == (
+        "output_schema violation: output missing required field 'x'"
+    )
+    assert runner.children()[0]["status"] == "failed"
+
+    valid = runner({"request": "valid", "output_schema": schema})
+    assert "error" not in valid
+    assert valid["output"] == {"x": 1}
+    assert runner.children()[1]["status"] == "done"
 
 
 def test_delegate_session_cap(monkeypatch):

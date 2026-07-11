@@ -17,36 +17,97 @@ from dataclasses import dataclass
 from typing import Any
 
 from openai4s.tools.base import Tool
-from openai4s.tools.edit import edit_file, static_edit_precheck
-from openai4s.tools.env import env_create, env_list, env_use
-from openai4s.tools.fs import list_dir, read_text_file, write_file
-from openai4s.tools.search import content_search, glob_files
-from openai4s.tools.web import web_fetch, web_search
+from openai4s.tools.content_search import ContentSearchTool
+from openai4s.tools.edit import EditFileTool
+from openai4s.tools.env_create import EnvCreateTool
+from openai4s.tools.env_list import EnvListTool
+from openai4s.tools.env_use import EnvUseTool
+from openai4s.tools.glob_files import GlobFilesTool
+from openai4s.tools.list_directory import ListDirectoryTool
+from openai4s.tools.read_text_file import ReadTextFileTool
+from openai4s.tools.web_fetch import WebFetchTool
+from openai4s.tools.web_search import WebSearchTool
+from openai4s.tools.write_file import WriteFileTool
 
 # Ordered, canonical tool surface. Order here is the order shown in the prompt.
 # There is deliberately NO shell tool: the host executes only python/R cells —
 # shell commands run inside the kernel (`host.bash` in sdk/host.py, or
 # subprocess in a cell), never in the host process.
-REGISTRY: list[Tool] = [
-    list_dir,
-    read_text_file,
-    write_file,
-    glob_files,
-    content_search,
-    edit_file,
-    env_list,
-    env_use,
-    env_create,
-    web_search,
-    web_fetch,
-]
+TOOL_TYPES: tuple[type[Tool], ...] = (
+    ListDirectoryTool,
+    ReadTextFileTool,
+    WriteFileTool,
+    GlobFilesTool,
+    ContentSearchTool,
+    EditFileTool,
+    EnvListTool,
+    EnvUseTool,
+    EnvCreateTool,
+    WebSearchTool,
+    WebFetchTool,
+)
+FILE_TOOL_TYPES = TOOL_TYPES[:6]
 
-_BY_NAME: dict[str, Tool] = {t.name: t for t in REGISTRY}
+_FORBIDDEN_CONTROL_NAMES = frozenset({"bash", "submit_output"})
+_PORTABLE_TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
+REGISTRY: list[Tool] = []
+_BY_NAME: dict[str, Tool] = {}
+_BY_HOST_METHOD: dict[str, Tool] = {}
+
+
+def register_tool(tool: Tool) -> Tool:
+    """Register one executable class instance during application bootstrap."""
+    if not isinstance(tool, Tool) or type(tool).execute is Tool.execute:
+        raise TypeError("control tools must be concrete Tool subclasses")
+    if not tool.name or not tool.host_method:
+        raise ValueError("control tools require a name and host_method")
+    if not _PORTABLE_TOOL_NAME.fullmatch(tool.name):
+        raise ValueError(f"tool name is not provider-portable: {tool.name!r}")
+    if (
+        tool.name in _FORBIDDEN_CONTROL_NAMES
+        or tool.host_method in _FORBIDDEN_CONTROL_NAMES
+    ):
+        raise ValueError("shell and completion cannot be registered as control tools")
+    if tool.name in _BY_NAME:
+        raise ValueError(f"duplicate public tool name: {tool.name!r}")
+    if tool.host_method in _BY_HOST_METHOD:
+        raise ValueError(f"duplicate host method: {tool.host_method!r}")
+    if tool.needs_network and not tool.screen_untrusted_output:
+        raise ValueError("network tools must screen untrusted output")
+    REGISTRY.append(tool)
+    _BY_NAME[tool.name] = tool
+    _BY_HOST_METHOD[tool.host_method] = tool
+    return tool
+
+
+def _unregister_tool(name: str) -> None:
+    """Test/plugin-cleanup counterpart; runtime hot-unload is unsupported."""
+    tool = _BY_NAME.pop(name, None)
+    if tool is None:
+        return
+    _BY_HOST_METHOD.pop(tool.host_method, None)
+    REGISTRY.remove(tool)
+
+
+for _tool_type in TOOL_TYPES:
+    register_tool(_tool_type())
+
+BUILTIN_CONTROL_HOST_METHODS = frozenset(
+    tool.host_method for tool in REGISTRY
+)
 
 
 def get_tool(name: str) -> Tool | None:
     """Look up a Tool by its ReAct name, or None if unknown."""
     return _BY_NAME.get(name)
+
+
+def get_tool_by_host_method(host_method: str) -> Tool | None:
+    """Look up the concrete implementation behind one protected host method."""
+    tool = _BY_HOST_METHOD.get(host_method)
+    if tool is None or type(tool).execute is Tool.execute:
+        return None
+    return tool
 
 
 def all_tools() -> list[Tool]:
@@ -317,6 +378,10 @@ def _render_result_body(result: Any) -> str:
     if set(result.keys()) == {"error"}:
         return f"error: {result['error']}"
     parts: list[str] = []
+    warning = result.get("_security_warning")
+    if isinstance(warning, str) and warning:
+        parts.append(f"[SECURITY WARNING]\n{warning}")
+    warning_parts = len(parts)
     for key in ("content", "stdout", "output"):
         val = result.get(key)
         if isinstance(val, str) and val:
@@ -333,6 +398,12 @@ def _render_result_body(result: Any) -> str:
         parts.append(f"ok={result['ok']}")
     if result.get("error"):
         parts.append(f"error: {result['error']}")
+    if len(parts) == warning_parts:
+        payload = {
+            key: value for key, value in result.items() if key != "_security_warning"
+        }
+        if payload:
+            parts.append(_safe_json(payload))
     if not parts:
         return _safe_json(result)
     return "\n".join(parts)
@@ -389,12 +460,11 @@ def execute_tool_call(dispatcher: Any, call: Any) -> tuple[str, bool]:
             )
         spec = dict(raw_spec)
 
-        if tool.host_method == "edit_file":
-            err = static_edit_precheck(spec)
-            if err:
-                return f"[Tool: {tool.name}] {err}", False
+        err = tool.native_precheck(spec)
+        if err:
+            return f"[Tool: {tool.name}] {err}", False
 
-        result = dispatcher(tool.host_method, [spec])
+        result = tool.invoke(dispatcher, spec)
         ok = not (isinstance(result, dict) and set(result.keys()) == {"error"})
         return format_tool_result(tool, result), ok
     except Exception as e:  # noqa: BLE001 — a tool error must not crash the loop
