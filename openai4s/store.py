@@ -26,7 +26,6 @@ All timestamps are epoch-ms. Booleans are 0/1. One DB per data_dir.
 """
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import json
 import os
@@ -40,6 +39,11 @@ from typing import Any
 
 from openai4s.storage.annotations import AnnotationRepository
 from openai4s.storage.memories import MemoryRepository
+from openai4s.storage.permissions import (
+    DEFAULT_PERMISSION_RULES as _DEFAULT_PERMISSION_RULES,
+)
+from openai4s.storage.permissions import PermissionRuleRepository
+from openai4s.storage.permissions import perm_match as _perm_match
 from openai4s.storage.plans import PlanRepository
 
 _SCHEMA = """
@@ -390,62 +394,6 @@ def _same_file_path(left: str, right: str) -> bool:
     )
 
 
-def _perm_match(text: str, pattern: str) -> bool:
-    """opencode-style wildcard match: '*' = any chars (spans '/'), '?' = one
-    char, case-sensitive. '' and '*' match anything. An EXACT string equality is
-    always a match FIRST — so a remembered literal target that itself contains
-    fnmatch metacharacters (e.g. a command with '[', '?' or '*') still matches
-    itself instead of being reinterpreted as a glob."""
-    text = text or ""
-    pattern = pattern or "*"
-    if pattern in ("*", ""):
-        return True
-    if text == pattern:
-        return True
-    try:
-        return fnmatch.fnmatchcase(text, pattern)
-    except Exception:  # noqa: BLE001
-        return False
-
-
-# security-first defaults, mirroring opencode: read-only tools run silently,
-# .env reads are denied, everything that writes/executes/reaches-out asks.
-# Gentle-by-default policy. This is a LOCAL, single-user research daemon whose
-# kernel already runs arbitrary Python UN-gated, so gating the normal in-workspace
-# research workflow adds friction without real protection. We therefore ALLOW the
-# safe, confined, or already-guarded tools (file reads/writes/edits stay inside the
-# session workspace, .env/secrets are hard-blocked, web_* is SSRF-guarded) and keep
-# an approval prompt ONLY for genuinely risky / external / irreversible actions:
-# external MCP connectors, long-running background procs, writing credentials, and
-# deleting/publishing skills. (Shell is NOT a host method — host.bash runs inside
-# the kernel worker, governed by the pre-exec code gate like any cell. And an
-# UNWATCHED turn allows everything anyway — the gate only ever prompts when a
-# human is actively viewing.)
-_DEFAULT_PERMISSION_RULES = (
-    # secrets: absolute veto regardless of anything else
-    ("read_file", "*.env", "deny"),
-    # safe in-workspace / guarded research workflow -> allow (no prompt)
-    ("read_file", "*", "allow"),
-    ("write_file", "*", "allow"),
-    ("edit_file", "*", "allow"),
-    ("glob", "*", "allow"),
-    ("grep", "*", "allow"),
-    ("list_dir", "*", "allow"),
-    ("save_artifact", "*", "allow"),
-    ("delegate", "*", "allow"),
-    ("env_setup", "*", "allow"),
-    ("web_fetch", "*", "allow"),
-    ("web_search", "*", "allow"),
-    ("skills_edit", "*", "allow"),
-    # genuinely risky / external / irreversible -> ask (only when a human is watching)
-    ("mcp_call", "*", "ask"),
-    ("exec_background", "*", "ask"),
-    ("credentials_set", "*", "ask"),
-    ("skills_delete", "*", "ask"),
-    ("skills_publish", "*", "ask"),
-)
-
-
 class Store:
     """Thread-safe SQLite wrapper. One per data_dir; created lazily."""
 
@@ -472,6 +420,13 @@ class Store:
             self._conn,
             self._lock,
             clock_ms=lambda: _now_ms(),
+        )
+        self._permissions = PermissionRuleRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+            get_setting=self.get_setting,
+            set_setting=self.set_setting,
         )
 
     # --- migration (add columns missing from a pre-existing DB) -----------
@@ -2115,63 +2070,27 @@ class Store:
         pattern: str = "*",
         decision: str,
     ) -> str:
-        """Upsert one rule keyed by (scope, scope_id, tool, pattern). Returns
-        the rule_id (existing or new)."""
-        scope_id = scope_id or ""
-        pattern = pattern or "*"
-        now = _now_ms()
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT rule_id FROM permission_rules WHERE scope=? AND "
-                "scope_id=? AND tool=? AND pattern=?",
-                (scope, scope_id, tool, pattern),
-            ).fetchone()
-            if row:
-                rid = row["rule_id"]
-                self._conn.execute(
-                    "UPDATE permission_rules SET decision=?, updated_at=? "
-                    "WHERE rule_id=?",
-                    (decision, now, rid),
-                )
-            else:
-                rid = f"perm_{uuid.uuid4().hex[:12]}"
-                self._conn.execute(
-                    "INSERT INTO permission_rules(rule_id,scope,scope_id,tool,"
-                    "pattern,decision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (rid, scope, scope_id, tool, pattern, decision, now, now),
-                )
-            self._conn.commit()
-        return rid
+        return self._permissions.set_rule(
+            scope=scope,
+            scope_id=scope_id,
+            tool=tool,
+            pattern=pattern,
+            decision=decision,
+        )
 
     def delete_permission_rule(self, rule_id: str) -> None:
-        self._exec("DELETE FROM permission_rules WHERE rule_id=?", (rule_id,))
+        self._permissions.delete_rule(rule_id)
 
     def get_permission_rules(self, *, scope: str, scope_id: str = "") -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM permission_rules WHERE scope=? AND scope_id=? "
-                "ORDER BY updated_at",
-                (scope, scope_id or ""),
-            ).fetchall()
-        return [dict(r) for r in rows]
+        return self._permissions.get_rules(scope=scope, scope_id=scope_id)
 
     def list_permission_rules_for_frame(
         self, *, root_frame_id: str | None = None, project_id: str | None = None
     ) -> dict:
-        """All rules relevant to a conversation, grouped by scope (for the UI)."""
-        return {
-            "global": self.get_permission_rules(scope="global", scope_id=""),
-            "project": (
-                self.get_permission_rules(scope="project", scope_id=project_id)
-                if project_id
-                else []
-            ),
-            "conversation": (
-                self.get_permission_rules(scope="conversation", scope_id=root_frame_id)
-                if root_frame_id
-                else []
-            ),
-        }
+        return self._permissions.list_for_frame(
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+        )
 
     def resolve_permission(
         self,
@@ -2181,91 +2100,15 @@ class Store:
         tool: str,
         pattern_input: str = "",
     ) -> str:
-        """Resolve a tool call to allow|ask|deny across the three scopes.
-
-        DENY is an absolute veto: if ANY matching rule at ANY scope says 'deny',
-        the call is denied — a guardrail cannot be overridden by a broader
-        convenience 'allow' (this makes both the .env deny beat a conversation
-        read allow, AND a conversation 'deny bash *' beat a global 'allow git *',
-        which a pure specificity/scope ordering could not do together).
-        Otherwise, among matching allow/ask rules the WINNER is the most specific
-        (more specific tool, then pattern, then longer pattern), tie-broken by
-        narrower scope (conversation > project > global) then recency. When
-        nothing matches, the fallback is 'ask' (opencode's security-first
-        default)."""
-        cands: list[dict] = list(self.get_permission_rules(scope="global", scope_id=""))
-        if project_id:
-            cands += self.get_permission_rules(scope="project", scope_id=project_id)
-        if root_frame_id:
-            cands += self.get_permission_rules(
-                scope="conversation", scope_id=root_frame_id
-            )
-        scope_rank = {"global": 0, "project": 1, "conversation": 2}
-        best = None
-        best_key = None
-        for r in cands:
-            rtool = r["tool"] or "*"
-            rpat = r["pattern"] or "*"
-            if not _perm_match(tool, rtool):
-                continue
-            if not _perm_match(pattern_input or "", rpat):
-                continue
-            if r["decision"] == "deny":
-                return "deny"  # absolute veto — any matching deny wins outright
-            key = (
-                0 if rtool in ("*", "") else 1,
-                0 if rpat in ("*", "") else 1,
-                len(rpat),
-                scope_rank.get(r["scope"], 0),
-                r.get("updated_at") or 0,
-            )
-            if best_key is None or key > best_key:
-                best_key = key
-                best = r
-        return best["decision"] if best else "ask"
+        return self._permissions.resolve(
+            root_frame_id=root_frame_id,
+            project_id=project_id,
+            tool=tool,
+            pattern_input=pattern_input,
+        )
 
     def seed_default_permission_rules(self, *, force: bool = False) -> None:
-        """Insert the security-first global defaults once (idempotent). Normally
-        skips if already seeded so a user's later deletions/edits are not
-        reverted on restart. `force=True` (the 'reset to defaults' action)
-        re-inserts missing defaults AND restores the built-in decision of any
-        default rule the user modified (e.g. flips a changed 'bash * allow' back
-        to 'ask')."""
-        if not force and self.get_setting("perm_seeded"):
-            return
-        now = _now_ms()
-        with self._lock:
-            for tool, pattern, decision in _DEFAULT_PERMISSION_RULES:
-                row = self._conn.execute(
-                    "SELECT rule_id, decision FROM permission_rules WHERE scope='global' "
-                    "AND scope_id='' AND tool=? AND pattern=?",
-                    (tool, pattern),
-                ).fetchone()
-                if row is not None:
-                    # restore the built-in decision on reset if it was changed
-                    if force and row["decision"] != decision:
-                        self._conn.execute(
-                            "UPDATE permission_rules SET decision=?, updated_at=? "
-                            "WHERE rule_id=?",
-                            (decision, now, row["rule_id"]),
-                        )
-                    continue
-                self._conn.execute(
-                    "INSERT INTO permission_rules(rule_id,scope,scope_id,tool,"
-                    "pattern,decision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (
-                        f"perm_{uuid.uuid4().hex[:12]}",
-                        "global",
-                        "",
-                        tool,
-                        pattern,
-                        decision,
-                        now,
-                        now,
-                    ),
-                )
-            self._conn.commit()
-        self.set_setting("perm_seeded", "1")
+        self._permissions.seed_defaults(force=force)
 
     # --- plans (structured plan → approve → auto-execute) ----------------
     def _plan_row(self, row) -> dict:
