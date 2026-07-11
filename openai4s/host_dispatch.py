@@ -16,8 +16,6 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
-import socket
-import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +24,11 @@ from typing import Any, Callable
 
 from openai4s.config import Config, get_config
 from openai4s.host.credentials import CredentialService
+from openai4s.host.endpoints import EndpointService
+from openai4s.host.endpoints import endpoint_fingerprint as _endpoint_fingerprint
+from openai4s.host.endpoints import fallback_port as _fallback_port
+from openai4s.host.endpoints import free_port as _free_port
+from openai4s.host.endpoints import probe_ready as _probe_ready
 from openai4s.host.files import WorkspaceFileService
 from openai4s.host.files import is_secret_path as _is_secret_path
 from openai4s.host.progress import PLAN_STEP_STATUSES, ProgressService
@@ -566,6 +569,12 @@ class HostDispatcher:
         self._skill_service = SkillService(self.cfg)
         self._skills = self._skill_service.loader  # private compatibility alias
         self._credential_service = CredentialService()
+        self._endpoint_service = EndpointService(
+            self.store,
+            allocate_port=lambda: _free_port(),
+            readiness_probe=lambda url, route: _probe_ready(url, route),
+            fingerprint=lambda *fields: _endpoint_fingerprint(*fields),
+        )
         # app tiles rendered this session
         self._app_tiles: list[dict] = []
         # background executor (exec_peek / exec_interrupt), built lazily.
@@ -1854,121 +1863,19 @@ class HostDispatcher:
 
     # --- managed endpoints ---------------------------------------
     def _m_endpoints_free_port(self, *_a: Any) -> int:
-        """Reserve a free port from the 20000-29999 band (port = mutex)."""
-        return _free_port()
+        return self._endpoint_service.free_port()
 
     def _m_endpoints_list(self, *_a: Any) -> list:
-        return self.store.list_endpoints()
+        return self._endpoint_service.list()
 
     def _m_endpoints_register(self, spec: dict) -> dict:
-        """Register a managed model endpoint.
-
-        - remote (https) endpoints have NO start/stop/live scripts.
-        - local endpoints get a port (the mutex), start/stop/live scripts, and
-          a credential NAME (never the value — the kernel never sees secrets).
-        - byte-identical re-registration is silent; a changed script MUST pop an
-          approval card showing the script verbatim before it can run.
-        """
-        name = spec["name"]
-        url = spec.get("url") or ""
-        is_remote = url.startswith("https://")
-
-        # Look the endpoint up FIRST: the port is the mutex, and a re-register
-        # of the same name must REUSE its existing port when the caller does not
-        # pin one. Allocating a fresh random port here would silently change the
-        # url on every identical call, breaking the byte-identical no-op below.
-        existing = next(
-            (e for e in self.store.list_endpoints() if e["name"] == name), None
-        )
-
-        if is_remote:
-            start = stop = live = None
-            port = None
-        else:
-            port = spec.get("port") or (existing or {}).get("port") or _free_port()
-            url = url or f"http://127.0.0.1:{port}"
-            start = spec.get("start") or spec.get("start_script")
-            stop = spec.get("stop") or spec.get("stop_script")
-            live = spec.get("live") or spec.get("live_route") or "/health"
-
-        credential = spec.get("credential")  # a NAME, not a value
-
-        # byte-identical re-registration is silent; else require approval.
-        new_fingerprint = _endpoint_fingerprint(
-            url, start, stop, live, spec.get("skill"), credential
-        )
-        approval = None
-        if existing is not None:
-            old_fingerprint = _endpoint_fingerprint(
-                existing.get("url"),
-                existing.get("start_script"),
-                existing.get("stop_script"),
-                existing.get("live_route"),
-                existing.get("skill"),
-                existing.get("credential"),
-            )
-            if old_fingerprint == new_fingerprint:
-                return {
-                    "name": name,
-                    "url": url,
-                    "port": port,
-                    "status": existing.get("status", "registered"),
-                    "changed": False,
-                }  # silent no-op
-            # changed scripts -> approval card with the verbatim script text
-            if not spec.get("approved"):
-                approval = {
-                    "required": True,
-                    "reason": "endpoint script changed",
-                    "start_script": start,
-                    "stop_script": stop,
-                }
-
-        status = "registered" if approval is None else "awaiting_approval"
-        self.store.upsert_endpoint(
-            name,
-            url=url,
-            skill=spec.get("skill"),
-            port=port,
-            status=status,
-            credential=credential,
-            start_script=start,
-            stop_script=stop,
-            live_route=live,
-        )
-        out = {
-            "name": name,
-            "url": url,
-            "port": port,
-            "status": status,
-            "remote": is_remote,
-            "changed": True,
-        }
-        if approval is not None:
-            out["approval"] = approval
-        return out
+        return self._endpoint_service.register(spec)
 
     def _m_endpoints_status(self, name: str) -> dict:
-        for ep in self.store.list_endpoints():
-            if ep["name"] == name:
-                return ep
-        raise KeyError(f"no endpoint {name!r}")
+        return self._endpoint_service.status(name)
 
     def _m_endpoints_probe(self, name: str) -> dict:
-        """Poll the live route for HTTP 200 and flip status to 'live'.
-
-        A `compute_provider` cell calls this before dispatch: readiness is a
-        200 on the live ROUTE, never a bare TCP ping.
-        """
-        ep = self._m_endpoints_status(name)
-        url = ep.get("url") or ""
-        if url.startswith("https://"):
-            ready = True  # remote endpoints are assumed managed elsewhere
-        else:
-            ready = _probe_ready(url, ep.get("live_route") or "/health")
-        new_status = "live" if ready else "starting"
-        self.store.upsert_endpoint(name, status=new_status)
-        return {"name": name, "url": url, "ready": ready, "status": new_status}
+        return self._endpoint_service.probe(name)
 
     # --- credentials (never persisted) ----------------------------
     def _m_credentials_set(self, spec: dict) -> dict:
@@ -2107,77 +2014,6 @@ class HostDispatcher:
 
 
 # --- helpers --------------------------------------------------------------
-_FALLBACK_PORT_LOCK = threading.Lock()
-_FALLBACK_PORT_NEXT = 19999
-
-
-def _fallback_port(lo: int, hi: int) -> int:
-    global _FALLBACK_PORT_NEXT
-    with _FALLBACK_PORT_LOCK:
-        if _FALLBACK_PORT_NEXT < lo or _FALLBACK_PORT_NEXT >= hi:
-            _FALLBACK_PORT_NEXT = lo
-        else:
-            _FALLBACK_PORT_NEXT += 1
-        return _FALLBACK_PORT_NEXT
-
-
-def _free_port(lo: int = 20000, hi: int = 29999, tries: int | None = None) -> int:
-    """Pick a free port from the 20000-29999 band.
-
-    The port doubles as the endpoint mutex: a successful bind means no other
-    managed endpoint currently owns it. Scan the band deterministically so a
-    crowded workstation cannot fail just because random probes hit busy ports.
-    """
-    attempts = tries if tries is not None else max(0, hi - lo + 1)
-    permission_denied = False
-    for port in range(lo, hi + 1):
-        if attempts <= 0:
-            break
-        attempts -= 1
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", port))
-            return port
-        except PermissionError:
-            permission_denied = True
-            continue
-        except OSError:
-            continue  # occupied -> skip
-        finally:
-            s.close()
-    if permission_denied:
-        return _fallback_port(lo, hi)
-    raise RuntimeError(f"free_port: no free port found in {lo}-{hi}")
-
-
-def _endpoint_fingerprint(url, start, stop, live, skill, credential) -> str:
-    """Stable hash of the identity-bearing fields of an endpoint.
-
-    Byte-identical re-registration hashes equal -> silent; any change to the
-    url / start / stop / live / skill / credential-name changes the hash and
-    forces an approval card.
-    """
-    blob = "\x00".join(
-        str(x or "") for x in (url, start, stop, live, skill, credential)
-    )
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
-
-def _probe_ready(url: str, live_route: str, timeout: float = 2.0) -> bool:
-    """Readiness routing: poll for an HTTP 200 (NOT a TCP ping)."""
-    import urllib.error
-    import urllib.request
-
-    route = live_route or "/health"
-    probe_url = url.rstrip("/") + "/" + route.lstrip("/")
-    try:
-        with urllib.request.urlopen(probe_url, timeout=timeout) as r:
-            return 200 <= getattr(r, "status", r.getcode()) < 300
-    except (urllib.error.URLError, OSError, ValueError):
-        return False
-
-
 def _rank_artifacts(items: list[dict], query: str) -> list[dict]:
     """Fuzzy ranked search over artifacts (⌘K-style)."""
     q = query.lower().strip()
