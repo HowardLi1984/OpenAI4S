@@ -1,5 +1,6 @@
 """Domain repositories behind the compatibility ``Store`` facade."""
 
+from openai4s.storage.actions import ActionLedgerRepository
 from openai4s.storage.agents import AgentProfileRepository
 from openai4s.storage.annotations import AnnotationRepository
 from openai4s.storage.artifacts import ArtifactRepository
@@ -18,6 +19,7 @@ from openai4s.storage.plans import PlanRepository
 from openai4s.storage.settings import SettingsRepository
 
 __all__ = [
+    "ActionLedgerRepository",
     "AgentProfileRepository",
     "AnnotationRepository",
     "ArtifactRepository",

@@ -4,6 +4,9 @@ openai4s exposes these tables read-only through `host.query`; the host writes th
 as turns/cells/artifacts/compactions happen. Schema and write paths:
 
   frames            turn tree (self-referential), per-turn model/effort/token/cost
+  action_groups     canonical provider/action groups, ordered per branch
+  action_events     append-only proposed/result/lifecycle events within a group
+  execution_attempts  attempt-first code execution lifecycle records
   execution_log     per-cell record (code + usage wall/cpu/rss + error)
   artifacts         logical artifact (filename, content_type)
   artifact_versions versioned bytes (version_id, checksum) -> artifacts
@@ -34,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from openai4s.storage.actions import ActionLedgerRepository
 from openai4s.storage.agents import AgentProfileRepository
 from openai4s.storage.annotations import AnnotationRepository
 from openai4s.storage.artifacts import ArtifactRepository
@@ -347,8 +351,18 @@ CREATE INDEX IF NOT EXISTS ix_perm_scope ON permission_rules(scope, scope_id);
 #   memories          -> memory blocks (surfaced through host.remember, not SQL)
 #   host_call_log     -> RPC audit trail
 #   permission_rules  -> permission broker state
+#   action_* / execution_attempts -> provider wire state and raw action audit
 QUERY_DENYLIST = frozenset(
-    {"settings", "connectors", "memories", "host_call_log", "permission_rules"}
+    {
+        "settings",
+        "connectors",
+        "memories",
+        "host_call_log",
+        "permission_rules",
+        "action_groups",
+        "action_events",
+        "execution_attempts",
+    }
 )
 
 # Single-quoted string literals and SQL comments are stripped before the denylist
@@ -386,6 +400,11 @@ class Store:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._migrate()
+        self._actions = ActionLedgerRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
         self._plans = PlanRepository(
             self._conn,
             self._lock,
@@ -785,6 +804,202 @@ class Store:
 
     def cell_detail(self, producing_cell_id: str) -> dict | None:
         return self._frames.cell_detail(producing_cell_id)
+
+    # --- canonical action ledger ---------------------------------------
+    def append_action_group(
+        self,
+        *,
+        root_frame_id: str,
+        turn_id: str,
+        kind: str,
+        branch_id: str | None = None,
+        ordinal: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        wire_state: Any = None,
+        assistant_content: str | None = None,
+        assistant_message: Any = None,
+        group_id: str | None = None,
+        created_at: int | None = None,
+    ) -> dict:
+        return self._actions.append_group(
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            turn_id=turn_id,
+            ordinal=ordinal,
+            kind=kind,
+            provider=provider,
+            model=model,
+            wire_state=wire_state,
+            assistant_content=assistant_content,
+            assistant_message=assistant_message,
+            group_id=group_id,
+            created_at=created_at,
+        )
+
+    def append_action_event(
+        self,
+        *,
+        group_id: str,
+        type: str,
+        sequence: int | None = None,
+        action_id: str | None = None,
+        tool_call_id: str | None = None,
+        wire_id: str | None = None,
+        canonical_arguments: Any = None,
+        raw_arguments: Any = None,
+        result: Any = None,
+        side_effect_class: str | None = None,
+        resource_keys: list[str] | tuple[str, ...] | None = None,
+        event_id: str | None = None,
+        created_at: int | None = None,
+    ) -> dict:
+        return self._actions.append_event(
+            group_id=group_id,
+            type=type,
+            sequence=sequence,
+            action_id=action_id,
+            tool_call_id=tool_call_id,
+            wire_id=wire_id,
+            canonical_arguments=canonical_arguments,
+            raw_arguments=raw_arguments,
+            result=result,
+            side_effect_class=side_effect_class,
+            resource_keys=resource_keys,
+            event_id=event_id,
+            created_at=created_at,
+        )
+
+    def append_tool_action_group(
+        self,
+        *,
+        root_frame_id: str,
+        turn_id: str,
+        events: list[dict[str, Any]],
+        branch_id: str | None = None,
+        ordinal: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        wire_state: Any = None,
+        assistant_content: str | None = None,
+        assistant_message: Any = None,
+        group_id: str | None = None,
+        created_at: int | None = None,
+    ) -> dict:
+        return self._actions.append_tool_group(
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            turn_id=turn_id,
+            events=events,
+            ordinal=ordinal,
+            provider=provider,
+            model=model,
+            wire_state=wire_state,
+            assistant_content=assistant_content,
+            assistant_message=assistant_message,
+            group_id=group_id,
+            created_at=created_at,
+        )
+
+    def get_action_group(
+        self, group_id: str, *, include_events: bool = True
+    ) -> dict | None:
+        return self._actions.get_group(group_id, include_events=include_events)
+
+    def list_action_groups(
+        self,
+        root_frame_id: str,
+        *,
+        branch_id: str | None = None,
+        turn_id: str | None = None,
+        after_ordinal: int | None = None,
+        limit: int | None = None,
+        include_events: bool = True,
+    ) -> list[dict]:
+        return self._actions.list_groups(
+            root_frame_id,
+            branch_id=branch_id,
+            turn_id=turn_id,
+            after_ordinal=after_ordinal,
+            limit=limit,
+            include_events=include_events,
+        )
+
+    def list_action_events(self, group_id: str) -> list[dict]:
+        return self._actions.list_events(group_id)
+
+    def allocate_execution_attempt(
+        self,
+        *,
+        group_id: str,
+        producing_cell_id: str,
+        generation_id: str | None = None,
+        replayed_from_cell_id: str | None = None,
+        attempt_ordinal: int | None = None,
+        attempt_id: str | None = None,
+        allocated_at: int | None = None,
+    ) -> dict:
+        return self._actions.allocate_attempt(
+            group_id=group_id,
+            producing_cell_id=producing_cell_id,
+            generation_id=generation_id,
+            replayed_from_cell_id=replayed_from_cell_id,
+            attempt_ordinal=attempt_ordinal,
+            attempt_id=attempt_id,
+            allocated_at=allocated_at,
+        )
+
+    def mark_execution_attempt_started(
+        self, attempt_id: str, *, started_at: int | None = None
+    ) -> dict:
+        return self._actions.mark_attempt_started(attempt_id, started_at=started_at)
+
+    def mark_execution_attempt_response(
+        self, attempt_id: str, *, response_at: int | None = None
+    ) -> dict:
+        return self._actions.mark_attempt_response(
+            attempt_id, response_at=response_at
+        )
+
+    def mark_execution_attempt_capture(
+        self, attempt_id: str, *, capture_at: int | None = None
+    ) -> dict:
+        return self._actions.mark_attempt_capture(attempt_id, capture_at=capture_at)
+
+    def finish_execution_attempt(
+        self,
+        attempt_id: str,
+        *,
+        terminal_state: str,
+        error: Any = None,
+        finished_at: int | None = None,
+    ) -> dict:
+        return self._actions.finish_attempt(
+            attempt_id,
+            terminal_state=terminal_state,
+            error=error,
+            finished_at=finished_at,
+        )
+
+    def get_execution_attempt(self, attempt_id: str) -> dict | None:
+        return self._actions.get_attempt(attempt_id)
+
+    def list_execution_attempts(
+        self,
+        *,
+        group_id: str | None = None,
+        producing_cell_id: str | None = None,
+        root_frame_id: str | None = None,
+        branch_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> list[dict]:
+        return self._actions.list_attempts(
+            group_id=group_id,
+            producing_cell_id=producing_cell_id,
+            root_frame_id=root_frame_id,
+            branch_id=branch_id,
+            turn_id=turn_id,
+        )
 
     def delete_frame(self, frame_id: str) -> None:
         self._frames.delete_frame(frame_id)
