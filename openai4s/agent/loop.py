@@ -3,7 +3,8 @@
 The provider-neutral state machine lives in :mod:`openai4s.agent.engine`.
 This module owns local process lifecycle and connects two non-competing action
 channels: native JSON tools for orchestration and persistent Python/R cells for
-scientific execution.  Only ``host.submit_output(...)`` completes a task.
+scientific execution. Structured finalization closes control-only work, while
+``host.submit_output(...)`` remains the completion signal for scientific cells.
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from openai4s.agent.runtime import (
 from openai4s.config import Config, get_config
 from openai4s.host_dispatch import HostDispatcher, build_dispatcher
 from openai4s.kernel import Kernel
+from openai4s.kernel.lazy import LazyKernel
 from openai4s.llm import chat
 from openai4s.security import classify_code, screen_trajectory
 from openai4s.tools import parse_tool_calls, scan_fenced_blocks
@@ -339,54 +341,58 @@ class Agent:
             dispatcher=self.dispatcher,
             cwd=run_cwd,
         )
+
+        def publish_foreground(kernel: object | None) -> None:
+            with self._foreground_lock:
+                self._foreground_kernel = kernel
+
+        def bootstrap(kernel: Any) -> None:
+            if self._skill_loader is None or self._cancelled():
+                return
+            boot = self._skill_loader.bootstrap_code()
+            if boot.strip():
+                kernel.execute(boot, origin="agent")
+
+        lazy_kernel = LazyKernel(
+            lambda: Kernel(dispatcher=self.dispatcher, cwd=run_cwd),
+            bootstrap=bootstrap,
+            publish=publish_foreground,
+        )
         try:
-            with Kernel(dispatcher=self.dispatcher, cwd=run_cwd) as kernel:
-                with self._foreground_lock:
-                    self._foreground_kernel = kernel
-                try:
-                    if self._skill_loader is not None and not self._cancelled():
-                        boot = self._skill_loader.bootstrap_code()
-                        if boot.strip():
-                            kernel.execute(boot, origin="agent")
-                    tool_catalog = self.dispatcher.tool_catalog()
-                    model: Any = ChatModel(
-                        self.cfg.llm,
-                        chat,
-                        tools=lambda messages: with_finalize_response(
-                            tool_catalog.specs_for(messages)
-                        ),
-                    )
-                    if self.cancellation is not None:
-                        model = _CancellationAwareModel(
-                            model,
-                            lambda: bool(self.cancellation.cancelled()),
-                        )
-                    engine = AgentEngine(
+            with lazy_kernel:
+                tool_catalog = self.dispatcher.tool_catalog()
+                model: Any = ChatModel(
+                    self.cfg.llm,
+                    chat,
+                    tools=lambda messages: with_finalize_response(
+                        tool_catalog.specs_for(messages)
+                    ),
+                )
+                if self.cancellation is not None:
+                    model = _CancellationAwareModel(
                         model,
-                        LocalActionExecutor(
-                            kernel,
-                            self.dispatcher,
-                            self._pre_exec_gate,
-                            self._execute_r,
-                            log=self._log,
-                            tool_catalog=tool_catalog,
-                        ),
-                        context_policy=(
-                            self.context_policy
-                            or CompactionPolicy(self.cfg, log=self._log)
-                        ),
-                        event_sink=TranscriptEventSink(transcript, log=self._log),
-                        cancellation=self.cancellation,
-                        completion=CompletionSignal(
-                            lambda: self.dispatcher.last_output
-                        ),
-                        max_turns=self.max_turns,
+                        lambda: bool(self.cancellation.cancelled()),
                     )
-                    result = engine.run(messages)
-                finally:
-                    with self._foreground_lock:
-                        if self._foreground_kernel is kernel:
-                            self._foreground_kernel = None
+                engine = AgentEngine(
+                    model,
+                    LocalActionExecutor(
+                        lazy_kernel,
+                        self.dispatcher,
+                        self._pre_exec_gate,
+                        self._execute_r,
+                        log=self._log,
+                        tool_catalog=tool_catalog,
+                    ),
+                    context_policy=(
+                        self.context_policy
+                        or CompactionPolicy(self.cfg, log=self._log)
+                    ),
+                    event_sink=TranscriptEventSink(transcript, log=self._log),
+                    cancellation=self.cancellation,
+                    completion=CompletionSignal(lambda: self.dispatcher.last_output),
+                    max_turns=self.max_turns,
+                )
+                result = engine.run(messages)
         finally:
             self._close_run()
 

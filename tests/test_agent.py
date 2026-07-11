@@ -133,6 +133,11 @@ def test_cli_non_scientific_finalize_uses_live_catalog_and_engine_result(monkeyp
         }
 
     monkeypatch.setattr(loop_mod, "chat", finalize_chat)
+
+    def unexpected_kernel(*_args, **_kwargs):
+        raise AssertionError("a structured-finalize-only CLI turn spawned a kernel")
+
+    monkeypatch.setattr(loop_mod, "Kernel", unexpected_kernel)
     result = Agent(
         use_skills=False,
         allow_delegate=False,
