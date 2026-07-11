@@ -1,6 +1,14 @@
-"""Synthesise dirty mixture spectra from the library, with known ground truth."""
+"""Synthesise dirty mixture spectra from the library, with known ground truth.
+
+A ``SynthCase`` bundles the observable dirty spectrum together with the hidden
+ground truth. On disk we deliberately split the two: ``spectrum.csv`` holds the
+observable (the only thing the analysis loop may read) and ``truth.json`` holds
+the answer key (used once, after the loop, for evaluation).
+"""
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -75,3 +83,51 @@ def synth_mixture(lib: Library, rng: np.random.Generator, n_components: int = No
         meta={"n_components": n_components, "noise_level": noise_level,
               "n_spikes": n_spikes, "baseline_strength": baseline_strength},
     )
+
+
+# ---------------------------------------------------------------------------
+# Persistence: split observable spectrum from hidden ground truth on disk
+# ---------------------------------------------------------------------------
+SPECTRUM_FILE = "spectrum.csv"
+TRUTH_FILE = "truth.json"
+
+
+def save_case(case: SynthCase, case_dir: str) -> None:
+    """Persist a case to ``case_dir``.
+
+    Writes ``spectrum.csv`` (the observable, blind input) and ``truth.json``
+    (the answer key). The analysis pipeline must only ever read the former.
+    """
+    os.makedirs(case_dir, exist_ok=True)
+
+    arr = np.column_stack([case.grid, case.spectrum])
+    np.savetxt(
+        os.path.join(case_dir, SPECTRUM_FILE), arr,
+        delimiter=",", header="raman_shift,intensity", comments="",
+        fmt="%.6g",
+    )
+
+    truth = {
+        "true_names": list(case.true_names),
+        "true_fractions": {k: float(v) for k, v in case.true_fractions.items()},
+        "meta": case.meta,
+    }
+    with open(os.path.join(case_dir, TRUTH_FILE), "w", encoding="utf-8") as f:
+        json.dump(truth, f, ensure_ascii=False, indent=2)
+
+
+def load_spectrum(case_dir: str):
+    """Blind loader: return ``(grid, spectrum)`` from ``spectrum.csv``.
+
+    This is all the analysis loop is allowed to see — no ground truth.
+    """
+    path = os.path.join(case_dir, SPECTRUM_FILE)
+    arr = np.loadtxt(path, delimiter=",", skiprows=1)
+    grid, spectrum = arr[:, 0], arr[:, 1]
+    return grid, spectrum
+
+
+def load_truth(case_dir: str) -> dict:
+    """Load the hidden answer key. Use ONLY for the final post-loop evaluation."""
+    with open(os.path.join(case_dir, TRUTH_FILE), encoding="utf-8") as f:
+        return json.load(f)
