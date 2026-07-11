@@ -60,6 +60,7 @@ from openai4s.server.agent_run import ProseStreamer as _ProseStreamer
 from openai4s.server.agent_run import WebActionExecutor, WebEventSink
 from openai4s.server.artifacts import ArtifactManager
 from openai4s.server.cell_run import CellExecutionPorts, CellExecutionService
+from openai4s.server.execution_views import ExecutionViewService
 
 # Keep the former gateway helper names as compatibility aliases; plan behavior
 # itself now lives together in PlanService.
@@ -3484,6 +3485,10 @@ def _clean_api_key(value: str | None) -> str:
 
 def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
     store = get_store(cfg.db_path)
+    execution_views = ExecutionViewService(
+        store=store,
+        format_timestamp=lambda value: _iso(value),
+    )
     skill_customization = SkillCustomizationService(SkillLoader(cfg=cfg))
     _disabled_skills = skill_customization.disabled_names
     _disabled_agents: set[str] = set()
@@ -5363,98 +5368,10 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             }
 
         def _exec_log(self, root_frame_id: str) -> dict:
-            cells = store.list_cells(root_frame_id)
-            kernels: list[str] = []
-            entries = []
-            for c in cells:
-                k = c.get("kernel_id") or "python"
-                if k not in kernels:
-                    kernels.append(k)
-                entries.append(
-                    {
-                        "cell_index": c.get("cell_index"),
-                        "kernel_id": k,
-                        "language": c.get("language") or "python",
-                        "source": c.get("code") or "",
-                        "stdout": c.get("stdout") or "",
-                        "stderr": c.get("stderr") or "",
-                        "error": c.get("error") or "",
-                        "status": c.get("status") or "ok",
-                        "figures": c.get("figures") or [],
-                        "files_written": c.get("files_written") or [],
-                        "files_read": c.get("files_read") or [],
-                        "cpu_seconds": c.get("cpu_s"),
-                        "peak_rss_kb": c.get("peak_rss_kb"),
-                    }
-                )
-            return {"kernels": kernels, "entries": entries}
+            return execution_views.execution_log(root_frame_id)
 
         def _lineage(self, artifact_id: str) -> dict:
-            a = store.get_artifact(artifact_id)
-            if not a:
-                return {
-                    "artifact_id": artifact_id,
-                    "filename": None,
-                    "interactions": [],
-                    "dependency_mappings": {"inputs": []},
-                }
-            interactions = []
-            vid = a.get("latest_version_id")
-            cell = None
-            vmeta = None
-            edge_inputs: list[str] = []
-            if vid:
-                vmeta = store.version_meta(vid)
-                for item in store.lineage_inputs(vid):
-                    label = (
-                        item.get("filename")
-                        or item.get("path")
-                        or item.get("version_id")
-                    )
-                    if label:
-                        edge_inputs.append(str(label))
-                pcid = (vmeta or {}).get("producing_cell_id")
-                if pcid:
-                    cell = store.cell_detail(pcid)
-            fw: list[str] = []
-            legacy_reads: list[str] = []
-            if cell:
-                fw = cell.get("files_written") or []
-                legacy_reads = cell.get("files_read") or []
-            known_reads: list[str] = []
-            seen_reads: set[str] = set()
-            for filename in [*legacy_reads, *edge_inputs]:
-                if filename and filename not in seen_reads:
-                    seen_reads.add(filename)
-                    known_reads.append(filename)
-            outputs = set(fw)
-            outputs.add(a["filename"])
-            inputs = [filename for filename in known_reads if filename not in outputs]
-            if cell:
-                interactions.append(
-                    {
-                        "kind": "cell",
-                        "cell_index": cell.get("cell_index"),
-                        "kernel_id": cell.get("kernel_id") or "python",
-                        "language": cell.get("language") or "python",
-                        "exit_status": cell.get("status") or "ok",
-                        "source": cell.get("code") or "",
-                        "files_written": fw,
-                        "files_read": known_reads,
-                    }
-                )
-            interactions.append(
-                {
-                    "kind": "save",
-                    "at": _iso((vmeta or {}).get("created_at") or a.get("created_at")),
-                }
-            )
-            return {
-                "artifact_id": artifact_id,
-                "filename": a.get("filename"),
-                "interactions": interactions,
-                "dependency_mappings": {"inputs": inputs},
-            }
+            return execution_views.artifact_lineage(artifact_id)
 
         def _edit_artifact(self, artifact_id: str, content: str) -> dict:
             """Save edited content as a NEW version. The live workspace file (that

@@ -1051,6 +1051,11 @@ def test_lineage_serializer_producing_cell_and_inputs(tmp_path):
         "interactions": [],
         "dependency_mappings": {"inputs": []},
     }
+    replies = []
+    handler._query = lambda: {}
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._api("GET", "/artifacts/a-does-not-exist/lineage")
+    assert replies[-1] == (200, empty)
 
 
 def test_lineage_serializer_follows_latest_and_restored_version_edges(tmp_path):
