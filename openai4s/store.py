@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from openai4s.storage.annotations import AnnotationRepository
+from openai4s.storage.memories import MemoryRepository
 from openai4s.storage.plans import PlanRepository
 
 _SCHEMA = """
@@ -463,6 +464,11 @@ class Store:
             clock_ms=lambda: _now_ms(),
         )
         self._annotations = AnnotationRepository(
+            self._conn,
+            self._lock,
+            clock_ms=lambda: _now_ms(),
+        )
+        self._memories = MemoryRepository(
             self._conn,
             self._lock,
             clock_ms=lambda: _now_ms(),
@@ -2373,51 +2379,22 @@ class Store:
     def add_memory(
         self, *, content: str, block: str = "general", project_id: str = "default"
     ) -> dict:
-        now = _now_ms()
-        mid = f"mem_{uuid.uuid4().hex[:12]}"
-        self._exec(
-            "INSERT INTO memories(memory_id,project_id,block,content,created_at) "
-            "VALUES(?,?,?,?,?)",
-            (mid, project_id, block, content, now),
+        return self._memories.add(
+            content=content,
+            block=block,
+            project_id=project_id,
         )
-        return {
-            "memory_id": mid,
-            "project_id": project_id,
-            "block": block,
-            "content": content,
-            "created_at": now,
-        }
 
     def list_memories(
         self, project_id: str | None = None, block: str | None = None
     ) -> list[dict]:
-        sql = (
-            "SELECT memory_id,project_id,block,content,created_at FROM memories "
-            "WHERE 1=1"
-        )
-        params: list = []
-        if project_id and project_id != "all":
-            sql += " AND project_id=?"
-            params.append(project_id)
-        if block:
-            sql += " AND block=?"
-            params.append(block)
-        sql += " ORDER BY created_at DESC"
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
-        return [
-            {
-                "memory_id": r["memory_id"],
-                "project_id": r["project_id"],
-                "block": r["block"],
-                "content": r["content"],
-                "created_at": r["created_at"],
-            }
-            for r in rows
-        ]
+        return self._memories.list(project_id=project_id, block=block)
 
     def delete_memory(self, memory_id: str) -> None:
-        self._exec("DELETE FROM memories WHERE memory_id=?", (memory_id,))
+        self._memories.delete(memory_id)
+
+    def memory_blocks(self, project_id: str | None = None) -> list[dict]:
+        return self._memories.blocks(project_id)
 
     # --- feedback (per message) -----------------------------------------
     def set_feedback(self, frame_id: str, key: str, rating: str | None) -> None:
@@ -2675,18 +2652,6 @@ class Store:
 
     def delete_connector(self, connector_id: str) -> None:
         self._exec("DELETE FROM connectors WHERE connector_id=?", (connector_id,))
-
-    def memory_blocks(self, project_id: str | None = None) -> list[dict]:
-        """Category counts for the Memory customize panel."""
-        sql = "SELECT block, COUNT(*) n FROM memories"
-        params: list = []
-        if project_id and project_id != "all":
-            sql += " WHERE project_id=?"
-            params.append(project_id)
-        sql += " GROUP BY block ORDER BY n DESC"
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
-        return [{"block": r["block"] or "general", "count": r["n"]} for r in rows]
 
     # --- compaction ------------------------------------------------------
     def archive_compaction(
