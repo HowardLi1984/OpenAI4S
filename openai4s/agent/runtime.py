@@ -22,6 +22,7 @@ from .actions import (
     NO_CODE_NUDGE,
     Action,
     CodeCell,
+    FinalizeAction,
     NativeToolBatch,
     count_code_blocks,
 )
@@ -36,6 +37,7 @@ from .compaction import (
 )
 from .control import execute_native_batch
 from .events import AgentEvent, OutcomeProduced, ReplyReceived
+from .finalize import execute_finalize_action
 from .models import ExecutionOutcome, ModelReply, RunState
 
 LogFn = Callable[..., None]
@@ -183,6 +185,8 @@ class LocalActionExecutor:
     def execute(
         self, action: Action | None, reply: ModelReply, state: RunState
     ) -> ExecutionOutcome:
+        if isinstance(action, FinalizeAction):
+            return execute_finalize_action(action)
         if isinstance(action, NativeToolBatch):
             return self._execute_native(action)
         if isinstance(action, CodeCell):

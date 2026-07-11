@@ -22,7 +22,13 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from openai4s.tools import get_tool
 
-from .actions import NO_CODE_NUDGE, CodeCell, NativeToolBatch, NativeToolCall
+from .actions import (
+    NO_CODE_NUDGE,
+    CodeCell,
+    FinalizeAction,
+    NativeToolBatch,
+    NativeToolCall,
+)
 from .events import (
     ActionRouted,
     AgentEvent,
@@ -270,7 +276,7 @@ class RuntimeActionLedger:
     current_group_id: str | None = field(default=None, init=False)
     terminal_recorded: bool = field(default=False, init=False)
     _reply: ModelReply | None = field(default=None, init=False, repr=False)
-    _action: CodeCell | NativeToolBatch | None = field(
+    _action: CodeCell | NativeToolBatch | FinalizeAction | None = field(
         default=None, init=False, repr=False
     )
 
@@ -308,13 +314,44 @@ class RuntimeActionLedger:
                 completion=event.result.completion,
             )
 
-    def _append_action(self, action: CodeCell | NativeToolBatch | None) -> None:
+    def _append_action(
+        self, action: CodeCell | NativeToolBatch | FinalizeAction | None
+    ) -> None:
         if self._reply is None:
             raise RuntimeError("ActionRouted arrived before ReplyReceived")
         reply = self._reply
         message, wire_state = _sanitize_reply(reply)
         self._action = action
-        if isinstance(action, NativeToolBatch):
+        if isinstance(action, FinalizeAction):
+            call = action.call
+            canonical, raw = redact_tool_call(call)
+            group = self.store.append_action_group(
+                root_frame_id=self.root_frame_id,
+                branch_id=self.branch_id,
+                turn_id=self.turn_id,
+                kind="finalize",
+                provider=self.provider,
+                model=self.model,
+                wire_state=wire_state,
+                assistant_content=(
+                    message.get("content")
+                    if isinstance(message.get("content"), str)
+                    else _redact_free_text(reply.content, frozenset())
+                ),
+                assistant_message=message,
+            )
+            self.store.append_action_event(
+                group_id=group["group_id"],
+                type="proposed",
+                action_id=call.id,
+                tool_call_id=call.id,
+                wire_id=call.wire_id,
+                canonical_arguments=canonical,
+                raw_arguments=raw,
+                side_effect_class="read_only",
+                resource_keys=["agent:completion"],
+            )
+        elif isinstance(action, NativeToolBatch):
             events: list[dict[str, Any]] = []
             for sequence, call in enumerate(action.calls):
                 canonical, raw = redact_tool_call(call)
@@ -388,13 +425,18 @@ class RuntimeActionLedger:
         group_id = self.current_group_id
         if group_id is None:
             raise RuntimeError("OutcomeProduced arrived without an action group")
-        if isinstance(self._action, NativeToolBatch):
+        if isinstance(self._action, (NativeToolBatch, FinalizeAction)):
+            calls = (
+                self._action.calls
+                if isinstance(self._action, NativeToolBatch)
+                else (self._action.call,)
+            )
             results = {
                 str(message.get("tool_call_id")): dict(message)
                 for message in event.outcome.history_messages
                 if message.get("role") == "tool" and message.get("tool_call_id")
             }
-            for call in self._action.calls:
+            for call in calls:
                 message = results.get(str(call.id))
                 if message is None:
                     # The reducer will close a genuinely interrupted batch.  In
@@ -560,7 +602,7 @@ def reduce_action_groups(groups: Sequence[Mapping[str, Any]]) -> list[dict[str, 
             # A corrupt/incomplete group must not leak a partial action.
             continue
         events = list(group.get("events") or ())
-        if kind == "native_tools":
+        if kind in {"native_tools", "finalize"}:
             raw_calls = message.get("tool_calls")
             if not isinstance(raw_calls, list) or not raw_calls:
                 continue

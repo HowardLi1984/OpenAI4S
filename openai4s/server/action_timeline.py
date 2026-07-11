@@ -174,6 +174,17 @@ def _title(group: Mapping[str, Any], events: Sequence[Mapping[str, Any]]) -> str
             if name and name not in names:
                 names.append(str(name))
         return ", ".join(names) or "Control tools"
+    if kind == "finalize":
+        for event in events:
+            arguments = event.get("arguments")
+            if not isinstance(arguments, Mapping):
+                continue
+            payload = arguments.get("arguments")
+            if isinstance(payload, Mapping):
+                summary = _one_line(payload.get("summary"))
+                if summary:
+                    return summary
+        return "Structured response"
     if kind in {"code", "execution"}:
         for event in events:
             arguments = event.get("arguments")
@@ -223,7 +234,7 @@ def _status(
         for event in results
     ):
         return "failed"
-    if str(group.get("kind") or "") == "native_tools":
+    if str(group.get("kind") or "") in {"native_tools", "finalize"}:
         proposed = sum(event.get("type") == "proposed" for event in events)
         return "completed" if proposed and len(results) >= proposed else "pending"
     for event in reversed(events):

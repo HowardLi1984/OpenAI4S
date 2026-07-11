@@ -11,6 +11,7 @@ from openai4s.agent.actions import (
     NO_CODE_NUDGE,
     Action,
     CodeCell,
+    FinalizeAction,
     NativeToolBatch,
     count_code_blocks,
 )
@@ -23,6 +24,7 @@ from openai4s.agent.events import (
     TextDelta,
     TurnStarted,
 )
+from openai4s.agent.finalize import execute_finalize_action
 from openai4s.agent.models import ExecutionOutcome, ModelReply, RunState
 from openai4s.agent.runtime import format_observation
 from openai4s.server.completions import action_narration, outcome_narration
@@ -290,9 +292,17 @@ class WebActionExecutor:
                 return self._refuse_native(
                     action, "run was cancelled before execution", "cancelled"
                 )
+            if isinstance(action, FinalizeAction):
+                return execute_finalize_action(
+                    action,
+                    refusal="run was cancelled before execution",
+                    stop_reason="cancelled",
+                )
             return ExecutionOutcome(stop_reason="cancelled")
         if self.plan_mode:
             return self._capture_plan(action, reply)
+        if isinstance(action, FinalizeAction):
+            return execute_finalize_action(action)
         if isinstance(action, NativeToolBatch):
             outcome = execute_native_batch(
                 action, self._invoke_native, cancelled=self.cancelled
@@ -318,6 +328,12 @@ class WebActionExecutor:
         if isinstance(action, NativeToolBatch):
             return self._refuse_native(
                 action, "tools are disabled in plan mode", "plan"
+            )
+        if isinstance(action, FinalizeAction):
+            return execute_finalize_action(
+                action,
+                refusal="structured finalization is disabled in plan mode",
+                stop_reason="plan",
             )
         return ExecutionOutcome(stop_reason="plan")
 

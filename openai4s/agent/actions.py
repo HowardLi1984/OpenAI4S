@@ -9,6 +9,8 @@ for that decision (CoreCoder-style: one small core, two thin loop bodies):
   ``r``/``R`` → R kernel) lives only here;
 - structured native tool calls take precedence over code through
   ``route_action`` so the control plane cannot race scientific execution;
+- the engine-owned ``finalize_response`` call is routed as a distinct terminal
+  action only when it is the sole native call in a reply;
 - replies without native calls keep the existing fence extractor, so a quoted
   ```` ```tool ```` inside a cell can never hijack a turn;
 - the one-cell-per-step counter and the no-action nudge text live here so the
@@ -34,6 +36,11 @@ from openai4s.tools import scan_fenced_blocks
 # executable cell. A bare ``` fence still means python — R must be explicit.
 PYTHON_INFOS = ("", "python", "py")
 R_INFOS = ("r",)
+
+# This is an engine protocol name, not a registered control tool.  Keep the
+# literal here, at the routing boundary, so importing actions remains free of
+# registry/finalization implementation side effects.
+FINALIZE_RESPONSE_NAME = "finalize_response"
 
 
 @dataclass(frozen=True)
@@ -71,7 +78,19 @@ class NativeToolBatch:
     calls: tuple[NativeToolCall, ...]
 
 
-Action: TypeAlias = CodeCell | NativeToolBatch
+@dataclass(frozen=True)
+class FinalizeAction:
+    """One engine-owned structured completion declaration.
+
+    Finalization deliberately retains the provider-normalized call so the
+    executor can close the provider tool group with the exact call identity
+    before the engine accepts completion.
+    """
+
+    call: NativeToolCall
+
+
+Action: TypeAlias = CodeCell | NativeToolBatch | FinalizeAction
 
 
 def is_completion_only_cell(cell: CodeCell | str, language: str = "python") -> bool:
@@ -161,6 +180,8 @@ def route_action(
         if tool_calls is not None
         else ()
     )
+    if len(calls) == 1 and calls[0].name == FINALIZE_RESPONSE_NAME:
+        return FinalizeAction(calls[0])
     if calls:
         return NativeToolBatch(calls)
     return extract_action(content)
@@ -195,9 +216,10 @@ def count_code_blocks(text: str) -> int:
 
 # Fed back when a working turn contains neither a cell nor a tool call.
 NO_CODE_NUDGE = (
-    "[system] No code cell found. Reply with a ```python cell (or ```r for R) "
-    "to act, and call host.submit_output(...) from a python cell when the "
-    "task is done."
+    "[system] No executable action found. For a completed conversational or "
+    "tool-only answer, call finalize_response as the ONLY tool call. For "
+    "scientific work, reply with a ```python cell (or ```r for R) and call "
+    "host.submit_output(...) from a python cell when that work is done."
 )
 
 # Appended to the observation when a reply batched several cells (only the

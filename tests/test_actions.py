@@ -12,6 +12,7 @@ from openai4s.agent.actions import (
     NO_CODE_NUDGE,
     Action,
     CodeCell,
+    FinalizeAction,
     NativeToolBatch,
     NativeToolCall,
     count_code_blocks,
@@ -104,8 +105,8 @@ host.submit_output(
     assert not is_completion_only_cell(direct, "r")
 
 
-def test_action_type_covers_cells_and_native_batches():
-    assert set(get_args(Action)) == {CodeCell, NativeToolBatch}
+def test_action_type_covers_cells_native_batches_and_finalization():
+    assert set(get_args(Action)) == {CodeCell, NativeToolBatch, FinalizeAction}
 
 
 def test_structured_native_call_wins_over_code_cell():
