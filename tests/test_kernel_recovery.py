@@ -72,15 +72,15 @@ def _orchestrator(candidate, events, published, executed, *, bootstrap=None):
         hydrate_artifact=lambda current, payload: events.append(
             ("artifact", dict(payload))
         ),
-        execute_cell=lambda current, code, language: executed.append(
-            (language, code)
-        )
+        execute_cell=lambda current, code, language: executed.append((language, code))
         or {"error": None},
         inspect_symbols=lambda current, language: current.symbols.get(language, set()),
         artifact_digest=lambda current, name: current.artifacts.get(name),
         inspect_environment=lambda current: current.environment,
         publish=lambda current: published.append(current.generation_id),
-        journal=lambda event: events.append(("journal", event["phase"], event["status"])),
+        journal=lambda event: events.append(
+            ("journal", event["phase"], event["status"])
+        ),
     )
 
 
@@ -134,9 +134,12 @@ def test_bootstrap_manifest_v2_binds_worker_packages_locale_and_protocol_version
     assert bound.host_capability_version == "host-2"
     assert len(bound.environment_hash or "") == 64
     assert restored == bound
-    assert base.with_observed_environment(
-        {**observed, "package_manifest": [{"name": "Alpha", "version": "9"}]}
-    ).environment_hash != bound.environment_hash
+    assert (
+        base.with_observed_environment(
+            {**observed, "package_manifest": [{"name": "Alpha", "version": "9"}]}
+        ).environment_hash
+        != bound.environment_hash
+    )
 
     legacy = {
         key: value
@@ -238,9 +241,7 @@ def test_sidecar_manifest_rejects_unfrozen_local_imports(source):
         )
 
 
-def test_frozen_sidecar_package_path_cannot_load_changed_sibling(
-    tmp_path, monkeypatch
-):
+def test_frozen_sidecar_package_path_cannot_load_changed_sibling(tmp_path, monkeypatch):
     skill = tmp_path / "frozen_dynamic_skill"
     skill.mkdir()
     (skill / "__init__.py").write_text("", encoding="utf-8")
@@ -305,20 +306,25 @@ def test_sidecar_event_tampering_and_capture_failure_fail_closed():
         ("host.bash('echo unsafe')", (), "bash"),
         ("value = host.unknown_service()", (), "unknown Host method"),
         ("import subprocess\nsubprocess.run(['true'])", (), "process"),
-        ("from pathlib import Path\nPath('x').write_text('x')", (), "external state"),
+        # ``from <module> import ...`` is caught by the import blocklist (the
+        # module, not the imported symbol name); previously it slipped past to
+        # the write-method attribute check.
+        ("from pathlib import Path\nPath('x').write_text('x')", (), "imports a direct"),
+        ("from shutil import rmtree\nrmtree('x')", (), "imports a direct"),
+        ("scores.to_csv('x')", (), "external state"),
         ("open('x', 'w').write('x')", (), "external state"),
         ("x = 1", ("write_file",), "unsafe Host methods"),
     ],
 )
 def test_replay_safety_fails_closed_for_external_side_effects(code, methods, expected):
-    error = replay_safety_error(
-        code, language="python", declared_host_methods=methods
-    )
+    error = replay_safety_error(code, language="python", declared_host_methods=methods)
     assert expected in error
 
 
 def test_replay_safety_allows_pure_computation_and_declared_read_only_host_calls():
-    assert replay_safety_error("scores = [x*x for x in data]", language="python") is None
+    assert (
+        replay_safety_error("scores = [x*x for x in data]", language="python") is None
+    )
     assert (
         replay_safety_error(
             "rows = host.query({'sql': 'select 1'})",
@@ -337,9 +343,7 @@ def test_verified_candidate_is_published_only_after_hydration_replay_and_validat
     orchestrator = _orchestrator(candidate, events, published, executed)
     recipe = RecoveryRecipe(
         steps=(
-            RecoveryStep(
-                "hydrate_workspace", {"tree_id": "tree-1"}, REPLAY_NEVER
-            ),
+            RecoveryStep("hydrate_workspace", {"tree_id": "tree-1"}, REPLAY_NEVER),
             RecoveryStep(
                 "hydrate_artifact",
                 {"version_id": "version-1"},

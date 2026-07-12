@@ -83,6 +83,32 @@ _RISKY_TEXT = re.compile(
     r"(?i)\b(subprocess|os\.system|system2?|shell|requests?\.|urllib\.|"
     r"socket\.|curl\b|wget\b|ssh\b|scp\b|writeLines\s*\(|saveRDS\s*\()"
 )
+# Import roots that reach the process/filesystem/network directly.  A recovery
+# cell that imports any of these is never replay-safe regardless of its label.
+_REPLAY_RISKY_IMPORT_ROOTS = frozenset(
+    {
+        "os",
+        "pathlib",
+        "shutil",
+        "subprocess",
+        "socket",
+        "socketserver",
+        "requests",
+        "urllib",
+        "http",
+        "ftplib",
+        "smtplib",
+        "telnetlib",
+        "asyncio",
+        "multiprocessing",
+        "ctypes",
+        "mmap",
+        "tempfile",
+        "ssl",
+        "webbrowser",
+        "pty",
+    }
+)
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -126,25 +152,26 @@ class SidecarManifest:
                 dont_inherit=True,
             )
         except (SyntaxError, ValueError) as error:
-            raise ValueError(f"sidecar {self.name!r} does not compile: {error}") from error
+            raise ValueError(
+                f"sidecar {self.name!r} does not compile: {error}"
+            ) from error
         package_root = self.name.partition(".")[0]
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 imported = node.module or ""
-                if node.level or imported == package_root or imported.startswith(
-                    package_root + "."
+                if (
+                    node.level
+                    or imported == package_root
+                    or imported.startswith(package_root + ".")
                 ):
                     raise ValueError(
                         f"sidecar {self.name!r} has an unfrozen local import"
                     )
             elif isinstance(node, ast.Import) and any(
-                alias.name == package_root
-                or alias.name.startswith(package_root + ".")
+                alias.name == package_root or alias.name.startswith(package_root + ".")
                 for alias in node.names
             ):
-                raise ValueError(
-                    f"sidecar {self.name!r} has an unfrozen local import"
-                )
+                raise ValueError(f"sidecar {self.name!r} has an unfrozen local import")
 
     @property
     def sha256(self) -> str:
@@ -218,7 +245,10 @@ class BootstrapManifest:
             raise ValueError("bootstrap package manifest must be unique and sorted")
         if any(not name or len(name) > 512 for name, _ in self.package_manifest):
             raise ValueError("bootstrap package name is missing or too long")
-        if any(version is not None and len(version) > 512 for _, version in self.package_manifest):
+        if any(
+            version is not None and len(version) > 512
+            for _, version in self.package_manifest
+        ):
             raise ValueError("bootstrap package version is too long")
         if self.environment_hash is not None and not re.fullmatch(
             r"[0-9a-f]{64}", self.environment_hash
@@ -276,7 +306,10 @@ class BootstrapManifest:
         packages: list[tuple[str, str | None]] = []
         if version >= 2:
             raw_packages = value.get("package_manifest") or ()
-            if not isinstance(raw_packages, (list, tuple)) or len(raw_packages) > 50_000:
+            if (
+                not isinstance(raw_packages, (list, tuple))
+                or len(raw_packages) > 50_000
+            ):
                 raise ValueError("bootstrap package manifest is invalid")
             for item in raw_packages:
                 if not isinstance(item, Mapping):
@@ -300,7 +333,9 @@ class BootstrapManifest:
                 if isinstance(value.get("environment"), Mapping)
                 else {}
             ),
-            sdk_version=(str(value["sdk_version"]) if value.get("sdk_version") else None),
+            sdk_version=(
+                str(value["sdk_version"]) if value.get("sdk_version") else None
+            ),
             provenance_version=(
                 str(value["provenance_version"])
                 if value.get("provenance_version")
@@ -358,10 +393,7 @@ class BootstrapManifest:
         )
         raw_locale = value.get("locale") or {}
         locale_manifest = (
-            {
-                str(key)[:128]: str(item)[:512]
-                for key, item in raw_locale.items()
-            }
+            {str(key)[:128]: str(item)[:512] for key, item in raw_locale.items()}
             if isinstance(raw_locale, Mapping)
             else {}
         )
@@ -377,9 +409,7 @@ class BootstrapManifest:
             self,
             version=2,
             interpreter=str(value.get("interpreter") or self.interpreter),
-            runtime_version=str(
-                value.get("runtime_version") or self.runtime_version
-            ),
+            runtime_version=str(value.get("runtime_version") or self.runtime_version),
             environment=environment,
             sdk_version=(
                 str(value["sdk_version"])
@@ -474,9 +504,7 @@ def merge_bootstrap_sidecar_loads(
         sidecar = sidecar_from_load_event(value)
         if sidecar.order < len(sidecars):
             if sidecars[sidecar.order] != sidecar:
-                raise ValueError(
-                    f"conflicting sidecar load at order {sidecar.order}"
-                )
+                raise ValueError(f"conflicting sidecar load at order {sidecar.order}")
             continue
         if sidecar.order != len(sidecars):
             raise ValueError(
@@ -601,9 +629,7 @@ class RecoveryRecipe:
 
     def __post_init__(self) -> None:
         if self.namespace_coverage not in {"empty", "verified", "unverified"}:
-            raise ValueError(
-                f"unknown namespace coverage: {self.namespace_coverage!r}"
-            )
+            raise ValueError(f"unknown namespace coverage: {self.namespace_coverage!r}")
 
 
 @dataclass(frozen=True)
@@ -621,7 +647,8 @@ class RecoveryResult:
 class Candidate(Protocol):
     generation_id: str
 
-    def shutdown(self) -> None: ...
+    def shutdown(self) -> None:
+        ...
 
 
 JournalSink = Callable[[dict[str, Any]], Any]
@@ -656,22 +683,18 @@ def replay_safety_error(
         except SyntaxError as error:
             return f"cell does not parse: {error}"
         for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.Import):
                 roots = [alias.name.split(".", 1)[0] for alias in node.names]
-                if any(
-                    root
-                    in {
-                        "os",
-                        "pathlib",
-                        "shutil",
-                        "subprocess",
-                        "socket",
-                        "requests",
-                        "urllib",
-                    }
-                    for root in roots
-                ):
-                    return "cell imports a direct process/filesystem/network module"
+            elif isinstance(node, ast.ImportFrom):
+                # ``from <module> import <name>`` — the risky root is the module
+                # (``node.module``), never the imported symbol names.  Inspecting
+                # ``alias.name`` let ``from shutil import rmtree`` slip past.
+                module = (node.module or "").split(".", 1)[0]
+                roots = [module] if module else []
+            else:
+                roots = []
+            if roots and any(root in _REPLAY_RISKY_IMPORT_ROOTS for root in roots):
+                return "cell imports a direct process/filesystem/network module"
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 if node.func.id in {"open", "exec", "eval", "compile"}:
                     return f"recovery cell uses unsafe builtin: {node.func.id}"
@@ -705,9 +728,25 @@ def replay_safety_error(
         lowered = code.lower()
         if any(
             marker in lowered
-            for marker in ("host$", "submit_output", "system(", "system2(")
+            for marker in (
+                "host$",
+                "submit_output",
+                "system(",
+                "system2(",
+                "pipe(",
+                "write.csv",
+                "write.table",
+                "writelines(",
+                "saverds(",
+                "ggsave(",
+                "file.copy",
+                "file.remove",
+                "file.rename",
+                "unlink(",
+                "download.file",
+            )
         ):
-            return "R recovery cell contains Host/shell side effects"
+            return "R recovery cell contains Host/shell/filesystem/network side effects"
     return None
 
 
@@ -928,9 +967,7 @@ class KernelRecoveryOrchestrator:
                 (
                     {
                         "type": (
-                            "publish_journal_failed"
-                            if published
-                            else "recovery_failed"
+                            "publish_journal_failed" if published else "recovery_failed"
                         ),
                         "error": str(error),
                     },

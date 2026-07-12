@@ -97,9 +97,7 @@ _R_RUNTIME_SYMBOLS = frozenset(
     }
 )
 
-_NONDETERMINISTIC_MODULES = frozenset(
-    {"datetime", "random", "secrets", "time", "uuid"}
-)
+_NONDETERMINISTIC_MODULES = frozenset({"datetime", "random", "secrets", "time", "uuid"})
 _NONDETERMINISTIC_CALLS = frozenset(
     {
         "now",
@@ -202,9 +200,7 @@ def build_recovery_recipe(
             "produced_symbols": list(writes),
             "deleted_symbols": list(deletes),
             "host_methods": list(host_methods),
-            "file_dependencies": list(
-                normalize_string_list(cell.get("files_read"))
-            ),
+            "file_dependencies": list(normalize_string_list(cell.get("files_read"))),
         }
         step = {
             "kind": "replay_cell",
@@ -231,9 +227,7 @@ def build_recovery_recipe(
                 live_symbols.setdefault(language, set()).add(name)
 
     required_symbols = {
-        language: sorted(names)
-        for language, names in live_symbols.items()
-        if names
+        language: sorted(names) for language, names in live_symbols.items() if names
     }
     if state_cells == 0:
         coverage = "empty"
@@ -335,16 +329,17 @@ def _environment_requirements(
             for key, value in manifest.environment.items()
             if value is not None and isinstance(value, (str, int, float, bool))
         }
-        if manifest.runtime_version and manifest.runtime_version not in {"?", "unknown"}:
+        if manifest.runtime_version and manifest.runtime_version not in {
+            "?",
+            "unknown",
+        }:
             requirements["runtime_version"] = manifest.runtime_version
         if manifest.sdk_version:
             requirements["sdk_version"] = manifest.sdk_version
         if manifest.provenance_version:
             requirements["provenance_version"] = manifest.provenance_version
         if manifest.host_capability_version:
-            requirements["host_capability_version"] = (
-                manifest.host_capability_version
-            )
+            requirements["host_capability_version"] = manifest.host_capability_version
         if manifest.environment_hash:
             requirements["environment_hash"] = manifest.environment_hash
         result[language] = requirements
@@ -380,7 +375,11 @@ def _python_host_usage(code: str, language: str) -> tuple[tuple[str, ...], str |
             methods.add(function.attr)
             permitted_nodes.add(id(function.value))
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id == "host" and id(node) not in permitted_nodes:
+        if (
+            isinstance(node, ast.Name)
+            and node.id == "host"
+            and id(node) not in permitted_nodes
+        ):
             return tuple(sorted(methods)), (
                 "Host object is aliased or used outside a direct host.method(...) call"
             )
@@ -398,7 +397,15 @@ def _determinism_error(code: str, language: str) -> str | None:
         tree = ast.parse(code, mode="exec")
     except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
         return None
-    module_aliases: dict[str, str] = {}
+    # Seed the canonical nondeterministic module names (and the ubiquitous
+    # numpy alias) so a call like ``random.random()`` / ``np.random.rand()``
+    # whose ``import`` lives in an EARLIER replay cell is still flagged.  The
+    # per-cell scan only ever saw same-cell imports, so the ordinary "import
+    # once, use many" pattern silently defeated determinism detection and let a
+    # nondeterministic cell replay into a divergent namespace.
+    module_aliases: dict[str, str] = {name: name for name in _NONDETERMINISTIC_MODULES}
+    module_aliases["np"] = "numpy"
+    module_aliases["numpy"] = "numpy"
     call_aliases: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -408,7 +415,10 @@ def _determinism_error(code: str, language: str) -> str | None:
                     module_aliases[alias.asname or root] = alias.name
         elif isinstance(node, ast.ImportFrom):
             module = str(node.module or "")
-            if module.split(".", 1)[0] in _NONDETERMINISTIC_MODULES or module == "numpy.random":
+            if (
+                module.split(".", 1)[0] in _NONDETERMINISTIC_MODULES
+                or module == "numpy.random"
+            ):
                 for alias in node.names:
                     if alias.name in _NONDETERMINISTIC_CALLS or module in {
                         "random",
@@ -433,8 +443,7 @@ def _determinism_error(code: str, language: str) -> str | None:
                 chain.reverse()
                 root = chain[0]
                 if root in module_aliases and (
-                    chain[-1] in _NONDETERMINISTIC_CALLS
-                    or "random" in chain[1:]
+                    chain[-1] in _NONDETERMINISTIC_CALLS or "random" in chain[1:]
                 ):
                     return "Cell depends on uncaptured time or random state"
     return None
