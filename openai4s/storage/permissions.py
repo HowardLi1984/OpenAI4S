@@ -41,6 +41,12 @@ DEFAULT_PERMISSION_RULES = (
     ("web_search", "*", "allow"),
     ("skills_edit", "*", "allow"),
     ("mcp_call", "*", "ask"),
+    # Reading a resource / rendering a prompt pulls attacker-controllable
+    # content addressed by a model-chosen URI/name, so it stays "ask" like
+    # mcp_call.  Seeding the rules explicitly (the resolve() fallback is already
+    # "ask") makes them visible and pre-allowable from the UI rules panel.
+    ("mcp_resource_read", "*", "ask"),
+    ("mcp_prompt_get", "*", "ask"),
     ("exec_background", "*", "ask"),
     ("credentials_set", "*", "ask"),
     ("skills_delete", "*", "ask"),
@@ -500,12 +506,51 @@ class PermissionRuleRepository:
             ).fetchone()
         return self._normalize_request(row) if row is not None else None
 
+    def timeout_expired_requests(self, *, now: int | None = None) -> int:
+        """Read-time backstop: resolve pendings whose expires_at has passed.
+
+        The live gate thread enforces the deadline while it blocks, but after a
+        daemon restart that thread is gone and the row stays ``pending`` with a
+        past ``expires_at``.  Route each through ``resolve_request`` (not a bulk
+        UPDATE) so action-group-bound rows still emit their resolved event, and
+        keep the ``WHERE state='pending'`` guard so the sweep races safely with
+        any live gate thread.
+        """
+
+        now = self._clock_ms() if now is None else int(now)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT decision_id FROM permission_requests "
+                "WHERE state='pending' AND expires_at IS NOT NULL "
+                "AND expires_at<=?",
+                (now,),
+            ).fetchall()
+        swept = 0
+        for row in rows:
+            try:
+                self.resolve_request(
+                    row["decision_id"],
+                    state="timed_out",
+                    scope="once",
+                    message="approval timed out",
+                    resolution_context="expired",
+                    resolved_at=now,
+                )
+                swept += 1
+            except (KeyError, RuntimeError):
+                # Resolved concurrently by a live gate thread; that terminal
+                # state stands.
+                continue
+        return swept
+
     def list_requests(
         self,
         *,
         root_frame_id: str | None = None,
         state: str | None = None,
     ) -> list[dict]:
+        if state == "pending":
+            self.timeout_expired_requests()
         clauses: list[str] = []
         params: list[Any] = []
         if root_frame_id is not None:
@@ -545,9 +590,7 @@ class PermissionRuleRepository:
             resource_keys = json.loads(data.get("resource_keys") or "[]")
         except (TypeError, ValueError):
             resource_keys = []
-        data["resource_keys"] = (
-            resource_keys if isinstance(resource_keys, list) else []
-        )
+        data["resource_keys"] = resource_keys if isinstance(resource_keys, list) else []
         return data
 
     def _append_permission_event_locked(
@@ -565,9 +608,12 @@ class PermissionRuleRepository:
     ) -> None:
         """Insert one ledger event inside the caller's open transaction."""
 
-        if self._connection.execute(
-            "SELECT 1 FROM action_groups WHERE group_id=?", (group_id,)
-        ).fetchone() is None:
+        if (
+            self._connection.execute(
+                "SELECT 1 FROM action_groups WHERE group_id=?", (group_id,)
+            ).fetchone()
+            is None
+        ):
             raise KeyError(f"unknown action group {group_id!r}")
         sequence = int(
             self._connection.execute(

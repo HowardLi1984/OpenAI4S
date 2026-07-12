@@ -44,9 +44,9 @@ def _restart_resolution_marker(store, request: dict, *, allow: bool) -> bool:
 
     decision_id = str(request.get("decision_id") or "")
     root = str(request.get("root_frame_id") or "")
-    tool = re.sub(
-        r"[^A-Za-z0-9_.:-]+", "_", str(request.get("tool") or "unknown")
-    )[:120]
+    tool = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(request.get("tool") or "unknown"))[
+        :120
+    ]
     if not decision_id or not root:
         return False
     suffix = hashlib.sha256(decision_id.encode("utf-8")).hexdigest()[:16]
@@ -144,7 +144,9 @@ def suggest_patterns(method: str, target: str) -> list[str]:
             out.append("*." + target.rsplit(".", 1)[-1])
     elif method == "web_fetch" and target:
         out.append(target)  # already a domain
-    elif method == "mcp_call" and "/" in target:
+    elif (
+        method in ("mcp_call", "mcp_resource_read", "mcp_prompt_get") and "/" in target
+    ):
         out.append(target.split("/", 1)[0] + "/*")
     out.append("*")
     # de-dupe preserving order
@@ -370,9 +372,9 @@ class PermissionBroker:
             if chan is not None and chan.get("store") is None:
                 chan["store"] = store
         if chan is None:
-            unattended = os.environ.get(
-                "OPENAI4S_UNATTENDED_APPROVAL", "deny"
-            ).strip().lower()
+            unattended = (
+                os.environ.get("OPENAI4S_UNATTENDED_APPROVAL", "deny").strip().lower()
+            )
             allowed = unattended == "allow"
             state = "allowed" if allowed else "denied"
             message = (
@@ -587,6 +589,25 @@ class PermissionBroker:
                     return {"ok": False, "error": "decision does not belong to frame"}
                 state = str(request.get("state") or "")
                 if state == "pending":
+                    expires_at = request.get("expires_at")
+                    if expires_at is not None and int(expires_at) <= int(
+                        time.time() * 1000
+                    ):
+                        # A pending that outlived its backstop (e.g. it was
+                        # created before a daemon restart) is no longer a valid
+                        # approval; time it out instead of activating a fresh
+                        # grant from a stale, possibly forgotten, prompt.
+                        try:
+                            durable_store.resolve_permission_request(
+                                decision_id,
+                                state="timed_out",
+                                scope="once",
+                                message="approval timed out",
+                                resolution_context="expired",
+                            )
+                        except Exception:  # noqa: BLE001 - best-effort cleanup
+                            pass
+                        return {"ok": False, "error": "approval request expired"}
                     request = durable_store.resolve_permission_request(
                         decision_id,
                         state=terminal,
@@ -605,10 +626,9 @@ class PermissionBroker:
                         "ok": False,
                         "error": f"decision is already {state or 'resolved'}",
                     }
-                if (
-                    _scope(request.get("scope")) != normalized_scope
-                    or (request.get("pattern") or None) != (pattern or None)
-                ):
+                if _scope(request.get("scope")) != normalized_scope or (
+                    request.get("pattern") or None
+                ) != (pattern or None):
                     return {
                         "ok": False,
                         "error": "resolved decision scope or pattern cannot be changed",

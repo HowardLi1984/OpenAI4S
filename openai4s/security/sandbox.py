@@ -134,18 +134,78 @@ def _seatbelt_string(value: str | os.PathLike[str]) -> str:
     return f'"{escaped}"'
 
 
+_DENY_READ_KINDS = ("literal", "prefix", "subpath")
+
+
+def _default_secret_read_denials(
+    workspace: str | os.PathLike[str],
+) -> tuple[tuple[str, str], ...]:
+    """Concrete secret files a cell must never read.
+
+    General filesystem reads stay allowed (legit science reads system/data
+    files); only these specific credential locations are denied.  Read fresh
+    from the environment so the per-test ``OPENAI4S_DATA_DIR`` redirect is
+    honoured — never the ``config`` singleton.
+    """
+
+    entries: list[tuple[str, str]] = []
+    # The daemon SQLite DB: its settings/connectors tables hold the LLM API
+    # keys and MCP tokens that host.query's QUERY_DENYLIST deliberately hides.
+    data_env = os.environ.get("OPENAI4S_DATA_DIR")
+    data_dir = Path(data_env).expanduser() if data_env else Path.home() / ".openai4s"
+    entries.append(("prefix", str(data_dir / "openai4s.db")))
+    # The git-ignored daemon .env, discovered the same way config._load_dotenv
+    # walks for it.
+    try:
+        here = Path(__file__).resolve()
+        for base in (here.parent, *here.parents):
+            candidate = base / ".env"
+            if candidate.is_file():
+                entries.append(("literal", str(candidate)))
+                break
+    except OSError:
+        pass
+    # Ambient user credentials that live outside the workspace.
+    home = Path.home()
+    entries.append(("subpath", str(home / ".ssh")))
+    entries.append(("literal", str(home / ".netrc")))
+    entries.append(("literal", str(home / ".pgpass")))
+    # Canonicalize (follow symlinks): the OS sandbox matches on the real path,
+    # e.g. macOS resolves /var -> /private/var, so an unresolved prefix would
+    # never match the file the cell actually opens.
+    resolved: list[tuple[str, str]] = []
+    for kind, path in entries:
+        try:
+            resolved.append((kind, str(Path(path).resolve())))
+        except OSError:
+            resolved.append((kind, path))
+    try:
+        ws = str(Path(workspace).resolve())
+    except OSError:
+        ws = str(workspace)
+    # Never deny a path that IS or CONTAINS the workspace, or the kernel's own
+    # boundary would be unreadable under a pathological data_dir/workspace layout.
+    return tuple(
+        (kind, path)
+        for kind, path in resolved
+        if not (path == ws or ws.startswith(path + os.sep))
+    )
+
+
 def build_seatbelt_profile(
     workspace: str | os.PathLike[str],
     temp_dir: str | os.PathLike[str],
     *,
     allow_raw_network: bool = False,
+    deny_read: Sequence[tuple[str, str]] = (),
 ) -> str:
     """Return the complete Seatbelt profile for a kernel worker.
 
     ``allow default`` keeps interpreter/runtime IPC compatible while the two
     security-sensitive resource classes are replaced with explicit policy.
     This mirrors Apple's own service profiles: a broad file-write deny followed
-    by narrower path allows.
+    by narrower path allows.  ``deny_read`` appends targeted ``file-read*``
+    denies (SBPL is last-match-wins, so they beat the leading ``allow default``).
     """
 
     workspace_q = _seatbelt_string(workspace)
@@ -162,6 +222,10 @@ def build_seatbelt_profile(
     ]
     if not allow_raw_network:
         lines.insert(2, "(deny network*)")
+    for kind, path in deny_read:
+        if kind not in _DENY_READ_KINDS:
+            raise SandboxConfigurationError(f"unknown deny-read kind: {kind!r}")
+        lines.append(f"(deny file-read* ({kind} {_seatbelt_string(path)}))")
     return "\n".join(lines) + "\n"
 
 
@@ -172,11 +236,38 @@ def wrap_seatbelt_command(
     workspace: str | os.PathLike[str],
     temp_dir: str | os.PathLike[str],
     allow_raw_network: bool = False,
+    deny_read: Sequence[tuple[str, str]] = (),
 ) -> list[str]:
     profile = build_seatbelt_profile(
-        workspace, temp_dir, allow_raw_network=allow_raw_network
+        workspace, temp_dir, allow_raw_network=allow_raw_network, deny_read=deny_read
     )
     return [str(executable), "-p", profile, *[str(part) for part in command]]
+
+
+def _bwrap_read_masks(deny_read: Sequence[tuple[str, str]]) -> list[str]:
+    """Mask concrete secret paths so a bwrap cell cannot read them.
+
+    bwrap cannot deny a subpath under the read-only root bind, so mask each
+    existing target instead: a directory with an empty ``--tmpfs`` and a file
+    with ``--ro-bind /dev/null``.  Non-existent targets are skipped (bwrap
+    cannot create a mount point under the read-only root).
+    """
+
+    masks: list[str] = []
+    seen: set[str] = set()
+    for kind, path in deny_read:
+        targets = [path]
+        if kind == "prefix":
+            targets = [path, path + "-wal", path + "-shm", path + "-journal"]
+        for target in targets:
+            if target in seen:
+                continue
+            seen.add(target)
+            if os.path.isdir(target):
+                masks.extend(["--tmpfs", target])
+            elif os.path.exists(target):
+                masks.extend(["--ro-bind", "/dev/null", target])
+    return masks
 
 
 def wrap_bwrap_command(
@@ -186,6 +277,7 @@ def wrap_bwrap_command(
     workspace: str | os.PathLike[str],
     temp_dir: str | os.PathLike[str],
     allow_raw_network: bool = False,
+    deny_read: Sequence[tuple[str, str]] = (),
 ) -> list[str]:
     """Wrap ``command`` in a read-only-root bubblewrap mount namespace."""
 
@@ -198,7 +290,10 @@ def wrap_bwrap_command(
         # Deliberately keep the host PID namespace.  Kernel.interrupt() targets
         # Popen.pid exactly; without a PID namespace bwrap can exec the worker
         # in place instead of interposing an init/reaper that would weaken that
-        # protocol contract.
+        # protocol contract.  (PID-ns isolation — and the /proc/<daemon>/environ
+        # read it would close — is deferred to a Linux-verified change using
+        # --unshare-pid + --info-fd child-pid parsing; the deny-read masks below
+        # already block the DB/.env/credential-file payloads on both platforms.)
         "--unshare-ipc",
         "--unshare-uts",
     ]
@@ -219,6 +314,13 @@ def wrap_bwrap_command(
             "--bind",
             temp_s,
             temp_s,
+        ]
+    )
+    # Mask secret paths after the workspace/temp binds (so a denial still wins
+    # when the workspace nests a secret) and before --chdir/--.
+    wrapped.extend(_bwrap_read_masks(deny_read))
+    wrapped.extend(
+        [
             "--chdir",
             workspace_s,
             "--",
@@ -376,12 +478,14 @@ class KernelSandbox:
         temp_dir: str | None = None,
         allow_raw_network: bool = False,
         owns_temp_dir: bool = False,
+        deny_read: Sequence[tuple[str, str]] = (),
     ) -> None:
         self.status = status
         self._executable = executable
         self._temp_dir = temp_dir
         self._allow_raw_network = allow_raw_network
         self._owns_temp_dir = owns_temp_dir
+        self._deny_read = tuple(deny_read)
         self._closed = False
 
     def wrap_command(self, command: Sequence[str]) -> list[str]:
@@ -397,6 +501,7 @@ class KernelSandbox:
                 workspace=self.status.workspace,
                 temp_dir=self._temp_dir,
                 allow_raw_network=self._allow_raw_network,
+                deny_read=self._deny_read,
             )
         if self.status.backend == "bubblewrap":
             return wrap_bwrap_command(
@@ -405,6 +510,7 @@ class KernelSandbox:
                 workspace=self.status.workspace,
                 temp_dir=self._temp_dir,
                 allow_raw_network=self._allow_raw_network,
+                deny_read=self._deny_read,
             )
         raise SandboxUnavailableError(
             f"unknown enabled sandbox backend: {self.status.backend!r}"
@@ -435,6 +541,7 @@ def _run_self_test(
     temp_dir: Path,
     allow_raw_network: bool,
     runner: Runner,
+    deny_read: Sequence[tuple[str, str]] = (),
 ) -> tuple[bool, str]:
     token = f"{os.getpid()}-{threading.get_ident()}"
     workspace_file = workspace / f".openai4s-sandbox-test-{token}"
@@ -461,6 +568,7 @@ def _run_self_test(
             workspace=workspace,
             temp_dir=temp_dir,
             allow_raw_network=allow_raw_network,
+            deny_read=deny_read,
         )
     else:
         command = wrap_bwrap_command(
@@ -469,6 +577,7 @@ def _run_self_test(
             workspace=workspace,
             temp_dir=temp_dir,
             allow_raw_network=allow_raw_network,
+            deny_read=deny_read,
         )
     try:
         completed = runner(
@@ -518,9 +627,7 @@ def _run_self_test(
 def _degraded_status(
     *, mode: str, workspace: Path, backend: str | None, detail: str
 ) -> SandboxStatus:
-    warning = (
-        "OPENAI4S SECURITY WARNING: OS kernel sandbox is not enforced; " + detail
-    )
+    warning = "OPENAI4S SECURITY WARNING: OS kernel sandbox is not enforced; " + detail
     return SandboxStatus(
         mode=mode,
         state="unavailable",
@@ -621,6 +728,7 @@ def create_kernel_sandbox(
             raise SandboxUnavailableError(status.warning) from exc
         _warn_once(status.warning or status.detail)
         return KernelSandbox(status=status)
+    deny_read = _default_secret_read_denials(workspace_path)
     passed, self_test_detail = _run_self_test(
         backend=backend,
         executable=executable,
@@ -628,6 +736,7 @@ def create_kernel_sandbox(
         temp_dir=temp_path,
         allow_raw_network=allow_network,
         runner=runner,
+        deny_read=deny_read,
     )
     if not passed:
         shutil.rmtree(temp_path, ignore_errors=True)
@@ -663,6 +772,7 @@ def create_kernel_sandbox(
         temp_dir=str(temp_path),
         allow_raw_network=allow_network,
         owns_temp_dir=True,
+        deny_read=deny_read,
     )
 
 

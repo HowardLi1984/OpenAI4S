@@ -64,10 +64,10 @@ from openai4s.host_dispatch import build_dispatcher
 from openai4s.kernel import Kernel, KernelLease, KernelSupervisor
 from openai4s.llm import ARK_PLAN_MODELS, PROVIDERS, chat, get_model_capabilities
 from openai4s.review import review_evidence
+from openai4s.server.action_timeline import ActionTimelineService
 from openai4s.server.agent_run import EventCancellation
 from openai4s.server.agent_run import ProseStreamer as _ProseStreamer
 from openai4s.server.agent_run import WebActionExecutor, WebEventSink
-from openai4s.server.action_timeline import ActionTimelineService
 from openai4s.server.artifacts import ArtifactManager, ArtifactOperationError
 from openai4s.server.cell_run import CellExecutionPorts, CellExecutionService
 from openai4s.server.completions import completion_message, response_language
@@ -243,13 +243,9 @@ class WSConnection:
     # envelope, with a little room for the execution/approval projections that
     # immediately follow subscription.
     _QUEUE_CAP = (
-        _WS_RESUME_BUFFER_CAP
-        + _WS_REPLAY_ENVELOPE_EVENTS
-        + _WS_REPLAY_QUEUE_HEADROOM
+        _WS_RESUME_BUFFER_CAP + _WS_REPLAY_ENVELOPE_EVENTS + _WS_REPLAY_QUEUE_HEADROOM
     )
-    _QUEUE_BYTE_CAP = (
-        _WS_RESUME_BUFFER_BYTE_CAP + _WS_REPLAY_QUEUE_BYTE_HEADROOM
-    )
+    _QUEUE_BYTE_CAP = _WS_RESUME_BUFFER_BYTE_CAP + _WS_REPLAY_QUEUE_BYTE_HEADROOM
 
     def __init__(self, wfile) -> None:
         self.wfile = wfile
@@ -404,9 +400,7 @@ class WSHub:
     def _event_wire_size(obj: dict) -> int:
         """Exact unmasked server-frame bytes for this event's JSON encoding."""
 
-        payload_size = len(
-            json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        )
+        payload_size = len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
         if payload_size < 126:
             header_size = 2
         elif payload_size <= 0xFFFF:
@@ -421,16 +415,12 @@ class WSHub:
         prepared = obj
         for key in ("chunk", "source", "stdout", "stderr", "error"):
             value = prepared.get(key)
-            if (
-                not isinstance(value, str)
-                or len(value) <= self._MAX_RESUME_FIELD_CHARS
-            ):
+            if not isinstance(value, str) or len(value) <= self._MAX_RESUME_FIELD_CHARS:
                 continue
             if prepared is obj:
                 prepared = dict(obj)
             prepared[key] = (
-                value[: self._MAX_RESUME_FIELD_CHARS]
-                + "\n...(resume field truncated)"
+                value[: self._MAX_RESUME_FIELD_CHARS] + "\n...(resume field truncated)"
             )
 
         size = self._event_wire_size(prepared)
@@ -455,9 +445,7 @@ class WSHub:
             "language",
             "origin",
         )
-        prepared = {
-            key: prepared[key] for key in identity_keys if key in prepared
-        }
+        prepared = {key: prepared[key] for key in identity_keys if key in prepared}
         prepared["resume_truncated"] = True
         size = self._event_wire_size(prepared)
         return prepared, size
@@ -555,9 +543,7 @@ class WSHub:
                 self._new_live_buffer([obj], scope="turn"),
             )
             return
-        if t == "notebook_cell_start" and (
-            buf is None or not buf.get("running")
-        ):
+        if t == "notebook_cell_start" and (buf is None or not buf.get("running")):
             # User-REPL/lifecycle execution has no Agent text_reset.  Its
             # structured Cell start is nevertheless an explicit live boundary,
             # and the matching finish closes this cell-scoped resume window.
@@ -642,16 +628,14 @@ class WSHub:
                 if (
                     candidate.get("type") == "notebook_cell_chunk"
                     and self._cell_event_id(candidate) == cell_id
-                    and candidate.get("stream", "stdout")
-                    == obj.get("stream", "stdout")
+                    and candidate.get("stream", "stdout") == obj.get("stream", "stdout")
                 ):
                     pair_chunk_index = len(buf["events"]) - 2
             if (
                 previous
                 and previous.get("type") == "notebook_cell_chunk"
                 and self._cell_event_id(previous) == cell_id
-                and previous.get("stream", "stdout")
-                == obj.get("stream", "stdout")
+                and previous.get("stream", "stdout") == obj.get("stream", "stdout")
                 and isinstance(previous.get("chunk"), str)
                 and isinstance(chunk, str)
             ):
@@ -660,9 +644,7 @@ class WSHub:
                     -1,
                     {
                         **previous,
-                        "chunk": self._merge_resume_chunk(
-                            previous["chunk"], chunk
-                        ),
+                        "chunk": self._merge_resume_chunk(previous["chunk"], chunk),
                     },
                 )
             elif pair_chunk_index is not None and isinstance(chunk, str):
@@ -758,10 +740,7 @@ class WSHub:
         merged = str(previous or "") + str(chunk or "")
         if len(merged) <= cls._MAX_MERGED_CHUNK_CHARS:
             return merged
-        return (
-            merged[: cls._MAX_MERGED_CHUNK_CHARS]
-            + "\n...(resume output truncated)"
-        )
+        return merged[: cls._MAX_MERGED_CHUNK_CHARS] + "\n...(resume output truncated)"
 
     def _trim_live_events(self, buf: dict) -> None:
         """Bound event count and wire bytes while retaining replay anchors."""
@@ -774,7 +753,9 @@ class WSHub:
         if len(events) <= count_cap and buf["event_bytes"] <= byte_cap:
             return
 
-        head_events = events[:1] if events and events[0].get("type") == "text_reset" else []
+        head_events = (
+            events[:1] if events and events[0].get("type") == "text_reset" else []
+        )
         head_sizes = sizes[:1] if head_events else []
         count_room = count_cap - len(head_events)
         byte_room = byte_cap - sum(head_sizes)
@@ -812,11 +793,7 @@ class WSHub:
             if event.get("type") == "notebook_cell_start"
             and self._cell_event_id(event) in active_ids
         ]
-        tail_offset = (
-            min(start_positions) + 1
-            if start_positions
-            else len(head_events)
-        )
+        tail_offset = min(start_positions) + 1 if start_positions else len(head_events)
         tail_source = [
             (event, size)
             for event, size in zip(events[tail_offset:], sizes[tail_offset:])
@@ -1397,6 +1374,7 @@ _SUBMIT_NUDGE = (
     "host.submit_output(...)."
 )
 
+
 def _submit_nudge_for(llm_cfg) -> str:
     """Choose a completion route the configured endpoint can actually emit."""
 
@@ -1408,11 +1386,7 @@ def _submit_nudge_for(llm_cfg) -> str:
         )
     except Exception:  # noqa: BLE001 - preserve compatible provider behavior
         return _SUBMIT_NUDGE
-    return (
-        _SUBMIT_NUDGE
-        if capabilities.tool_calling
-        else NO_NATIVE_COMPLETION_NUDGE
-    )
+    return _SUBMIT_NUDGE if capabilities.tool_calling else NO_NATIVE_COMPLETION_NUDGE
 
 
 class SessionRunner:
@@ -1491,9 +1465,7 @@ class SessionRunner:
             self.store,
             data_dir=self.cfg.data_dir,
             workspace=self.workspace_for_branch,
-            event_sink=lambda event: self.hub.emitter(event["root_frame_id"])(
-                event
-            ),
+            event_sink=lambda event: self.hub.emitter(event["root_frame_id"])(event),
         )
         self.deletions = SessionDeletionService(
             self.store,
@@ -1545,9 +1517,7 @@ class SessionRunner:
             CellExecutionPorts(
                 prepare_language=self._prepare_language,
                 kernel_id=lambda st, language: (
-                    self._r_kernel_id(st)
-                    if language == "r"
-                    else self._kernel_id(st)
+                    self._r_kernel_id(st) if language == "r" else self._kernel_id(st)
                 ),
                 snapshot=self.artifacts.snapshot,
                 protect_versions=self.artifacts.protect_latest,
@@ -1643,9 +1613,7 @@ class SessionRunner:
         try:
             from openai4s.permissions import broker
 
-            return list(
-                broker().pending_events(root_frame_id, store=self.store)
-            )
+            return list(broker().pending_events(root_frame_id, store=self.store))
         except Exception:  # noqa: BLE001 - status fails closed to no payload
             return []
 
@@ -1679,11 +1647,7 @@ class SessionRunner:
             )
             return bool(
                 not owns_only_recovery_ticket
-                and (
-                    owner
-                    or snapshot.get("queued_count")
-                    or snapshot.get("queue")
-                )
+                and (owner or snapshot.get("queued_count") or snapshot.get("queue"))
             )
         except Exception:  # noqa: BLE001 — unknown coordinator state is occupied
             return True
@@ -1767,16 +1731,12 @@ class SessionRunner:
                     try:
                         # Admission is now closed. Recheck every external blocker
                         # so an optimistic sweeper snapshot cannot win a race.
-                        if self.recovery.blocked(
+                        if self.recovery.blocked(st) or not self.recovery.idle_expired(
                             st
-                        ) or not self.recovery.idle_expired(st):
+                        ):
                             return False
-                        stopped = st.kernels.stop(
-                            "python", manual=False, reason=reason
-                        )
-                        stopped += st.kernels.stop(
-                            "r", manual=False, reason=reason
-                        )
+                        stopped = st.kernels.stop("python", manual=False, reason=reason)
+                        stopped += st.kernels.stop("r", manual=False, reason=reason)
                     finally:
                         st.turn_lock.release()
                     if not stopped:
@@ -1799,7 +1759,9 @@ class SessionRunner:
             except (ExecutionCancelled, TimeoutError):
                 return False
 
-    def drop_session(self, root_frame_id: str, *, reason: str = "session_closed") -> bool:
+    def drop_session(
+        self, root_frame_id: str, *, reason: str = "session_closed"
+    ) -> bool:
         """Cancel and fully detach one in-memory session before deletion/close."""
 
         with self._lock:
@@ -1840,9 +1802,7 @@ class SessionRunner:
     def delete_session(self, root_frame_id: str) -> dict[str, Any]:
         return self.deletions.delete_session(root_frame_id)
 
-    def create_session(
-        self, project_id: str, *, model: str | None = None
-    ) -> str:
+    def create_session(self, project_id: str, *, model: str | None = None) -> str:
         """Create a root frame atomically with project-deletion admission."""
 
         with self._lock:
@@ -1964,9 +1924,7 @@ class SessionRunner:
                     else {}
                 )
                 pins = pins if isinstance(pins, Mapping) else {}
-                st.desired_env = (
-                    str(pins["python"]) if pins.get("python") else None
-                )
+                st.desired_env = str(pins["python"]) if pins.get("python") else None
                 st.r_env_name = str(pins["r"]) if pins.get("r") else None
                 self._seed_messages(st)
                 emit = self.hub.emitter(root_frame_id)
@@ -2058,9 +2016,7 @@ class SessionRunner:
                 candidate.desired_env = (
                     str(pins["python"]) if pins.get("python") else None
                 )
-                candidate.r_env_name = (
-                    str(pins["r"]) if pins.get("r") else None
-                )
+                candidate.r_env_name = str(pins["r"]) if pins.get("r") else None
 
             # The admitted lifecycle ticket guarantees there is no protocol
             # reader left in either old slot before detachment.
@@ -2079,7 +2035,9 @@ class SessionRunner:
             )
             with self._lock:
                 if self._sessions.get(root_frame_id) is not old:
-                    raise RuntimeError("session runtime changed during branch activation")
+                    raise RuntimeError(
+                        "session runtime changed during branch activation"
+                    )
                 self._sessions[root_frame_id] = candidate
 
             # Provider history is rebuilt only from the inherited branch prefix
@@ -2119,9 +2077,7 @@ class SessionRunner:
                         ],
                     }
 
-            status = (
-                str((recovery_result or {}).get("status") or "active").lower()
-            )
+            status = str((recovery_result or {}).get("status") or "active").lower()
             if status not in {"active", "partial", "failed", "cancelled"}:
                 status = "failed"
             metadata = checkpoint.get("metadata") or {}
@@ -2232,11 +2188,7 @@ class SessionRunner:
             reason=f"kernel recovery: {action_id}",
         ) as execution:
             runtime = self._recovery_runtime(st, emit)
-            fresh = (
-                runtime.fresh_manifests()
-                if action_id == "restart_fresh"
-                else ()
-            )
+            fresh = runtime.fresh_manifests() if action_id == "restart_fresh" else ()
             # Re-check enabled/confirmation after FIFO admission, before
             # recovery_scope changes any live generation state.
             plan = self.session_domain.recovery.prepare_action(
@@ -2987,8 +2939,8 @@ class SessionRunner:
 
         owner_kind = owner.get("kind") if isinstance(owner, dict) else owner
         owner_id = (
-            (owner.get("id") if isinstance(owner, dict) else owner_id) or owner_id
-        )
+            owner.get("id") if isinstance(owner, dict) else owner_id
+        ) or owner_id
         if not execution_id or not owner_kind or not owner_id:
             return {
                 "ok": False,
@@ -3078,8 +3030,8 @@ class SessionRunner:
 
         owner_kind = owner.get("kind") if isinstance(owner, dict) else owner
         owner_id = (
-            (owner.get("id") if isinstance(owner, dict) else owner_id) or owner_id
-        )
+            owner.get("id") if isinstance(owner, dict) else owner_id
+        ) or owner_id
         if not execution_id or not owner_kind or not owner_id:
             return {
                 "ok": False,
@@ -3108,9 +3060,7 @@ class SessionRunner:
             return {"status": "failed", "error": "Python kernel is unavailable"}
         metadata = bootstrap_python_generation(target, st.workspace, boot)
         lifecycle_state = (
-            "active"
-            if metadata["status"] in {"active", "skipped"}
-            else "bootstrapping"
+            "active" if metadata["status"] in {"active", "skipped"} else "bootstrapping"
         )
         st.kernels.record_bootstrap_if_current(
             "python", target, metadata, state=lifecycle_state
@@ -3156,7 +3106,8 @@ class SessionRunner:
                     )
             else:
                 lease = st.kernels.restart(
-                    "python", after_restart=lambda kernel: self._run_bootstrap(st, kernel)
+                    "python",
+                    after_restart=lambda kernel: self._run_bootstrap(st, kernel),
                 )
             gen = lease.generation if lease is not None else 0
             self.executions.mark_finalizing(
@@ -3413,9 +3364,7 @@ class SessionRunner:
                     # Wait for the single protocol reader to leave before
                     # detaching and shutting down its exact worker slots.
                     with st.turn_lock:
-                        st.kernels.stop(
-                            "python", manual=True, reason="manual_stop"
-                        )
+                        st.kernels.stop("python", manual=True, reason="manual_stop")
                         st.kernels.stop("r", manual=True, reason="manual_stop")
                     stopped_status = st.kernels.status("python")
                     self.executions.mark_finalizing(
@@ -3787,9 +3736,7 @@ class SessionRunner:
         ledger = getattr(st, "active_action_ledger", None)
         group_id = getattr(ledger, "current_group_id", None)
         call_id = (
-            call.get("id")
-            if isinstance(call, dict)
-            else getattr(call, "id", None)
+            call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
         )
         binder = getattr(st.dispatcher, "bind_action_context", None)
         if callable(binder):
@@ -3800,9 +3747,7 @@ class SessionRunner:
                     "tool_call_id": call_id,
                 }
             ):
-                return self._invoke_control_with_artifacts_bound(
-                    st, call, emit, invoke
-                )
+                return self._invoke_control_with_artifacts_bound(st, call, emit, invoke)
         return self._invoke_control_with_artifacts_bound(st, call, emit, invoke)
 
     def _invoke_control_with_artifacts_bound(self, st, call, emit, invoke):
@@ -3849,16 +3794,12 @@ class SessionRunner:
             self.recovery.touch(st)
 
     def _capture_env_snapshot(self, st=None) -> str | None:
-        return self.artifacts.capture_environment(
-            self._remote_provenance_drain(st)
-        )
+        return self.artifacts.capture_environment(self._remote_provenance_drain(st))
 
     @staticmethod
     def _remote_provenance_drain(st):
         dispatcher = getattr(st, "dispatcher", None)
-        if dispatcher is not None and hasattr(
-            dispatcher, "pop_remote_provenance"
-        ):
+        if dispatcher is not None and hasattr(dispatcher, "pop_remote_provenance"):
             return dispatcher.pop_remote_provenance
         return None
 
@@ -4132,9 +4073,7 @@ class SessionRunner:
             catalog_factory = getattr(st.dispatcher, "tool_catalog", None)
             tool_catalog = catalog_factory() if callable(catalog_factory) else None
             tool_resolver = (
-                getattr(tool_catalog, "get", None)
-                if tool_catalog is not None
-                else None
+                getattr(tool_catalog, "get", None) if tool_catalog is not None else None
             )
             action_ledger = RuntimeActionLedger(
                 self.store,
@@ -4284,11 +4223,7 @@ class SessionRunner:
                 tail = err_text
             elif status == "cancelled" and not had_prose:
                 tail = "_已取消。_"
-            elif (
-                status == "completed"
-                and loop_reason != "submitted"
-                and not had_prose
-            ):
+            elif status == "completed" and loop_reason != "submitted" and not had_prose:
                 tail = "_(no textual response)_"
             if tail:
                 self.store.add_message(
@@ -4374,7 +4309,11 @@ class SessionRunner:
         """Project durable Web runtime identity into Context Policy V2."""
 
         group_id = getattr(action_ledger, "current_group_id", None)
-        group = self.store.get_action_group(group_id, include_events=False) if group_id else None
+        group = (
+            self.store.get_action_group(group_id, include_events=False)
+            if group_id
+            else None
+        )
         if group is None:
             groups = self.store.list_action_groups(
                 st.root_frame_id,
@@ -4536,9 +4475,7 @@ class SessionRunner:
         llm_cfg=None,
     ) -> str:
         """Run one Web turn through the shared provider-neutral AgentEngine."""
-        action_ledger = action_ledger or getattr(
-            st, "active_action_ledger", None
-        )
+        action_ledger = action_ledger or getattr(st, "active_action_ledger", None)
         rid = st.root_frame_id
         max_turns = self.cfg.max_turns or 12
         if st.explore:
@@ -4605,9 +4542,11 @@ class SessionRunner:
         model_tools = ()
         if not st.plan:
             model_tools = (
-                (lambda messages: with_finalize_response(
-                    tool_catalog.specs_for(messages)
-                ))
+                (
+                    lambda messages: with_finalize_response(
+                        tool_catalog.specs_for(messages)
+                    )
+                )
                 if tool_catalog is not None
                 else with_finalize_response(control_tool_specs())
             )
@@ -4626,9 +4565,7 @@ class SessionRunner:
                 prose_nudge=_submit_nudge_for(llm_cfg),
                 explore_nudge=_EXPLORE_NUDGE,
                 native_wrapper=lambda call, invoke: (
-                    self._invoke_control_with_artifacts(
-                        st, call, emit, invoke
-                    )
+                    self._invoke_control_with_artifacts(st, call, emit, invoke)
                 ),
                 explore_mode=st.explore,
                 plan_mode=st.plan,
@@ -4697,8 +4634,7 @@ class SessionRunner:
 
         def permission_pending() -> bool:
             return bool(
-                permission_broker
-                and permission_broker.is_pending(st.root_frame_id)
+                permission_broker and permission_broker.is_pending(st.root_frame_id)
             )
 
         policy = WatchdogPolicy.from_environment(
@@ -5114,21 +5050,23 @@ class SessionRunner:
             # still held here, so reading the current slot cannot race a
             # lifecycle writer.
             state_revision = (
-                info["state_revision"]
-                if "state_revision" in info
-                else info["idx"]
+                info["state_revision"] if "state_revision" in info else info["idx"]
             )
             generation_id = (
                 info["generation_id"]
                 if "generation_id" in info
                 else st.kernels.status(language).get("generation_id")
             )
-            self.executions.mark_finalizing(execution, reason="persisting notebook cell")
+            self.executions.mark_finalizing(
+                execution, reason="persisting notebook cell"
+            )
             emit(
                 {"type": "frame_update", "frame_id": root_frame_id, "status": "success"}
             )
             return {
-                "status": "cancelled" if execution.cancellation.is_set() else "completed",
+                "status": "cancelled"
+                if execution.cancellation.is_set()
+                else "completed",
                 "execution_id": execution.execution_id,
                 "owner": execution.owner.as_dict(),
                 "cell": {
@@ -5153,7 +5091,7 @@ class SessionRunner:
                     "figures": info["figures"],
                     "files_written": info["files_written"],
                     "files_read": [],
-                }
+                },
             }
 
     def submit_repl(
@@ -5836,8 +5774,16 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 # cross-origin writes; reject any mutating /api request whose Origin
                 # is not this same server. Same-origin app fetches + curl (no Origin)
                 # pass through.
-                if method in ("POST", "PUT", "PATCH", "DELETE") and path.startswith(
-                    "/api/"
+                # The /api/ws upgrade is a GET, but WebSocket handshakes are
+                # exempt from CORS entirely and the socket accepts state-changing
+                # commands (cancel_execution) and streams session output plus
+                # pending approval prompts. Apply the same Origin==Host check so a
+                # foreign page cannot open ws://127.0.0.1:.../api/ws cross-origin.
+                # Browsers always send Origin on WS upgrades; non-browser clients
+                # send none and pass.
+                if path == "/api/ws" or (
+                    method in ("POST", "PUT", "PATCH", "DELETE")
+                    and path.startswith("/api/")
                 ):
                     origin = self.headers.get("Origin")
                     if origin:
@@ -6091,9 +6037,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     f"/frames/{frame_mutation.group(1)}"
                 )
                 confirmed_fresh_restart = bool(
-                    re.fullmatch(
-                        r"/frames/[^/]+/recovery/actions/restart_fresh", sub
-                    )
+                    re.fullmatch(r"/frames/[^/]+/recovery/actions/restart_fresh", sub)
                     and method == "POST"
                 )
                 read_only_preview = bool(
@@ -6103,9 +6047,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                         sub,
                     )
                 )
-                if not (
-                    delete_session or confirmed_fresh_restart or read_only_preview
-                ):
+                if not (delete_session or confirmed_fresh_restart or read_only_preview):
                     _require_session_writable(
                         frame_mutation.group(1), "mutating the Session"
                     )
@@ -6510,9 +6452,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                                 "role": mm["role"],
                                 "content": mm["content"],
                                 "created_at": _iso(mm["created_at"]),
-                                "fork_checkpoint_id": mm.get(
-                                    "fork_checkpoint_id"
-                                ),
+                                "fork_checkpoint_id": mm.get("fork_checkpoint_id"),
                             }
                             for mm in msgs
                         ]
@@ -6939,12 +6879,8 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 before = (q.get("before_ordinal") or [None])[0]
                 raw_limit = (q.get("limit") or ["500"])[0]
                 try:
-                    after_ordinal = (
-                        int(after) if after not in (None, "") else None
-                    )
-                    before_ordinal = (
-                        int(before) if before not in (None, "") else None
-                    )
+                    after_ordinal = int(after) if after not in (None, "") else None
+                    before_ordinal = int(before) if before not in (None, "") else None
                     limit = int(raw_limit)
                 except (TypeError, ValueError):
                     self._json(
@@ -6960,9 +6896,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 invalid_cursor = (
                     (after_ordinal is not None and after_ordinal < 0)
                     or (before_ordinal is not None and before_ordinal < 0)
-                    or (
-                        after_ordinal is not None and before_ordinal is not None
-                    )
+                    or (after_ordinal is not None and before_ordinal is not None)
                 )
                 if invalid_cursor or not (1 <= limit <= 500):
                     self._json(
@@ -7021,8 +6955,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 )
                 return
             m = re.fullmatch(
-                r"/frames/([^/]+)/recovery/actions/"
-                r"(restore|retry|restart_fresh)",
+                r"/frames/([^/]+)/recovery/actions/" r"(restore|retry|restart_fresh)",
                 sub,
             )
             if m and method == "POST":
@@ -7047,9 +6980,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
             if m and method == "GET":
                 self._json(runner.session_domain.branches(m.group(1)))
                 return
-            m = re.fullmatch(
-                r"/frames/([^/]+)/branches/([^/]+)/activate", sub
-            )
+            m = re.fullmatch(r"/frames/([^/]+)/branches/([^/]+)/activate", sub)
             if m and method == "POST":
                 frame_id = m.group(1)
                 frame = store.get_frame(frame_id) or {}
@@ -7147,9 +7078,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     }
                 )
                 return
-            m = re.fullmatch(
-                r"/frames/([^/]+)/(?:revert/apply|branches/revert)", sub
-            )
+            m = re.fullmatch(r"/frames/([^/]+)/(?:revert/apply|branches/revert)", sub)
             if m and method == "POST":
                 fid = m.group(1)
                 frame = store.get_frame(fid)
@@ -7246,9 +7175,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                             f'attachment; filename="{exported["filename"]}"'
                         ),
                         "X-Content-SHA256": exported["sha256"],
-                        "X-OpenAI4S-Session-Schema": str(
-                            exported["schema_version"]
-                        ),
+                        "X-OpenAI4S-Session-Schema": str(exported["schema_version"]),
                     },
                 )
                 return
@@ -7288,9 +7215,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                     code,
                     language=language,
                     execution_id=(
-                        str(requested_execution_id)
-                        if requested_execution_id
-                        else None
+                        str(requested_execution_id) if requested_execution_id else None
                     ),
                 )
                 if body.get("wait") is True:
@@ -7363,9 +7288,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 owner = body.get("owner") or body.get("owner_kind")
                 owner_kind = owner.get("kind") if isinstance(owner, dict) else owner
                 owner_id = (
-                    owner.get("id")
-                    if isinstance(owner, dict)
-                    else body.get("owner_id")
+                    owner.get("id") if isinstance(owner, dict) else body.get("owner_id")
                 )
                 if not body.get("execution_id") or not owner_kind or not owner_id:
                     self._json(
@@ -8197,9 +8120,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                 out.append(
                     {
                         **a,
-                        "enabled": capability_state.is_enabled(
-                            "specialist", a["name"]
-                        ),
+                        "enabled": capability_state.is_enabled("specialist", a["name"]),
                         "parameters": {},
                         "systemPrompt": None,
                         "userHidden": False,
@@ -8416,9 +8337,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                             try:
                                 from openai4s.permissions import broker
 
-                                for ev in broker().pending_events(
-                                    rid, store=store
-                                ):
+                                for ev in broker().pending_events(rid, store=store):
                                     conn.send_json(ev)
                             except Exception:  # noqa: BLE001
                                 pass
@@ -8448,9 +8367,7 @@ def make_handler(cfg: Config, hub: WSHub, runner: SessionRunner):
                             owner_id=msg.get("owner_id"),
                             reason=msg.get("reason") or "cancelled over websocket",
                         )
-                        conn.send_json(
-                            {"type": "execution_cancel_result", **result}
-                        )
+                        conn.send_json({"type": "execution_cancel_result", **result})
                     elif t == "unview_session":
                         rid = msg.get("root_frame_id") or msg.get("frame_id")
                         if rid:

@@ -117,6 +117,74 @@ def test_bwrap_raw_network_compatibility_switch_only_removes_network_namespace()
     ]
 
 
+def test_seatbelt_profile_appends_targeted_read_denies():
+    workspace = "/tmp/work"
+    temp_dir = "/tmp/private"
+    deny = (("prefix", "/data/openai4s.db"), ("subpath", "/home/u/.ssh"))
+
+    plain = build_seatbelt_profile(workspace, temp_dir)
+    guarded = build_seatbelt_profile(workspace, temp_dir, deny_read=deny)
+
+    assert "file-read*" not in plain  # no read denies without deny_read
+    assert '(deny file-read* (prefix "/data/openai4s.db"))' in guarded
+    assert '(deny file-read* (subpath "/home/u/.ssh"))' in guarded
+    # last-match-wins: the read denies must follow the leading (allow default)
+    assert guarded.index("(allow default)") < guarded.index("file-read*")
+
+
+def test_seatbelt_profile_rejects_unknown_deny_read_kind():
+    with pytest.raises(sandbox_module.SandboxConfigurationError):
+        build_seatbelt_profile("/w", "/t", deny_read=(("glob", "/x"),))
+
+
+def test_bwrap_masks_secret_reads_after_binds_and_skips_missing(tmp_path):
+    secret_dir = tmp_path / "creds"
+    secret_dir.mkdir()
+    db = tmp_path / "openai4s.db"
+    db.write_text("KEY=1")
+    missing = tmp_path / "nope.db"  # never created -> skipped
+    deny = (
+        ("prefix", str(db)),
+        ("subpath", str(secret_dir)),
+        ("prefix", str(missing)),
+    )
+
+    wrapped = wrap_bwrap_command(
+        ["/bin/true"],
+        executable="bwrap",
+        workspace=str(tmp_path / "ws"),
+        temp_dir=str(tmp_path / "tmp"),
+        deny_read=deny,
+    )
+
+    # A file is masked with /dev/null, a directory with an empty tmpfs.
+    assert ["--ro-bind", "/dev/null", str(db)] == wrapped[
+        wrapped.index(str(db)) - 2 : wrapped.index(str(db)) + 1
+    ]
+    assert ["--tmpfs", str(secret_dir)] == wrapped[
+        wrapped.index(str(secret_dir)) - 1 : wrapped.index(str(secret_dir)) + 1
+    ]
+    assert str(missing) not in wrapped  # non-existent target skipped
+    # Masks land after the workspace/temp binds and before --chdir/--.
+    last_bind = max(i for i, v in enumerate(wrapped) if v == "--bind")
+    assert last_bind < wrapped.index(str(db)) < wrapped.index("--chdir")
+
+
+def test_default_secret_read_denials_uses_data_dir_and_drops_workspace(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENAI4S_DATA_DIR", str(tmp_path))
+    denials = sandbox_module._default_secret_read_denials(tmp_path / "ws")
+    db = str((tmp_path / "openai4s.db").resolve())
+    assert ("prefix", db) in denials
+
+    # An entry that IS the workspace is dropped so the kernel boundary stays
+    # readable: with workspace == ~/.ssh, the ~/.ssh subpath deny is elided.
+    ssh = Path.home() / ".ssh"
+    dropped = sandbox_module._default_secret_read_denials(ssh)
+    assert not any(path == str(ssh.resolve()) for _kind, path in dropped)
+
+
 def test_off_is_explicit_and_skips_detection_and_self_test(tmp_path):
     def unexpected(*args, **kwargs):
         raise AssertionError((args, kwargs))

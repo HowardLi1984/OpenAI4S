@@ -321,8 +321,7 @@ def test_ws_outbound_queue_covers_a_complete_resume_envelope():
         gateway_mod.WSHub._BUFFER_CAP + gateway_mod._WS_REPLAY_ENVELOPE_EVENTS
     )
     assert gateway_mod.WSConnection._QUEUE_BYTE_CAP >= (
-        gateway_mod.WSHub._BUFFER_BYTE_CAP
-        + gateway_mod._WS_REPLAY_QUEUE_BYTE_HEADROOM
+        gateway_mod.WSHub._BUFFER_BYTE_CAP + gateway_mod._WS_REPLAY_QUEUE_BYTE_HEADROOM
     )
 
 
@@ -549,8 +548,7 @@ def test_gateway_plain_answer_is_nudged_to_structured_finalize_without_kernel(
     nudge = next(
         m["content"]
         for m in calls[1]
-        if m["role"] == "user"
-        and "Prose is not a completion signal" in m["content"]
+        if m["role"] == "user" and "Prose is not a completion signal" in m["content"]
     )
     assert "finalize_response" in nudge
     assert "do NOT start a Python/R kernel merely to finish" in nudge
@@ -601,14 +599,12 @@ def test_gateway_projects_submit_only_result_as_live_and_persisted_final_message
     final_text_index = max(
         index
         for index, event in enumerate(hub.events)
-        if event.get("type") == "text_chunk"
-        and "已完成真实数据分析" in event.get("chunk", "")
+        if event.get("type") == "text_chunk" and "已完成真实数据分析" in event.get("chunk", "")
     )
     terminal_index = max(
         index
         for index, event in enumerate(hub.events)
-        if event.get("type") == "frame_update"
-        and event.get("status") == "completed"
+        if event.get("type") == "frame_update" and event.get("status") == "completed"
     )
     assert final_text_index < terminal_index
 
@@ -776,9 +772,7 @@ def test_restore_version_appends_fresh_current_version(tmp_path):
     assert a["latest_version_id"] == restored_version_id
     assert Path(store.resolve_artifact_path(rec1["artifact_id"])).read_text() == "ALPHA"
     assert store.version_meta(rec1["version_id"]) == source_before
-    assert store.lineage_edges_for(restored_version_id, "up") == [
-        rec1["version_id"]
-    ]
+    assert store.lineage_edges_for(restored_version_id, "up") == [rec1["version_id"]]
     assert len(store.list_versions(rec1["artifact_id"])) == 3
     # Both historical versions still serve their own immutable bytes.
     assert Path(store.resolve_artifact_path(rec1["version_id"])).read_text() == "ALPHA"
@@ -811,8 +805,7 @@ def test_restore_route_returns_fresh_identity_and_surfaces_verification_error(
     second = runner._register_file(st, path, "c2", lambda event: None)
 
     route = (
-        f"/artifacts/{first['artifact_id']}/versions/"
-        f"{first['version_id']}/restore"
+        f"/artifacts/{first['artifact_id']}/versions/" f"{first['version_id']}/restore"
     )
     handler._api("POST", route)
 
@@ -1111,7 +1104,9 @@ def test_model_profile_activate_moves_to_front_and_sanitizes_key(tmp_path):
     assert store.get_setting("llm_api_key") == ""
 
 
-def test_local_model_discovery_route_is_explicit_and_non_mutating(monkeypatch, tmp_path):
+def test_local_model_discovery_route_is_explicit_and_non_mutating(
+    monkeypatch, tmp_path
+):
     class Discovery:
         def discover(self, *, force=False):
             return {
@@ -1313,9 +1308,7 @@ def test_plan_restore_and_delete_artifact_created_shapes(tmp_path):
     ev = [e for e in hub.events if e.get("type") == "artifact_created"][-1]
     assert set(ev) == {"type", "root_frame_id", "artifact"}
     assert ev["root_frame_id"] == fid
-    assert ev["artifact"]["id"] == ev["artifact"]["artifact_id"] == r1[
-        "artifact_id"
-    ]
+    assert ev["artifact"]["id"] == ev["artifact"]["artifact_id"] == r1["artifact_id"]
     assert ev["artifact"]["version_id"] == restored["version_id"]
     assert ev["artifact"]["restored_from_version_id"] == r1["version_id"]
 
@@ -1507,6 +1500,46 @@ def test_cross_origin_api_write_is_refused(tmp_path):
     handler._route("POST")
 
     assert replies == [(403, {"error": "cross-origin request refused"})]
+
+
+def test_cross_origin_ws_upgrade_is_refused(tmp_path):
+    """The /api/ws upgrade (a GET) gets the same Origin==Host CSRF check as
+    mutating verbs, since WebSocket handshakes bypass CORS and the socket
+    accepts state-changing commands + streams session output."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    handler = object.__new__(handler_cls)
+    handler.headers = {"Origin": "http://evil.example", "Host": "127.0.0.1:8760"}
+    replies = []
+    upgraded = []
+    handler._json = lambda obj, code=200: replies.append((code, obj))
+    handler._handle_ws = lambda: upgraded.append(True)
+    handler.path = "/api/ws"
+    handler._route("GET")
+
+    assert upgraded == []
+    assert replies == [(403, {"error": "cross-origin request refused"})]
+
+
+def test_ws_upgrade_allows_absent_and_same_origin(tmp_path):
+    """A same-origin browser upgrade (Origin == Host) and an Origin-less client
+    (CLI/tests) both pass the WS CSRF gate."""
+    cfg = _cfg(tmp_path)
+    runner = gateway_mod.SessionRunner(cfg, _Hub())
+    handler_cls = gateway_mod.make_handler(cfg, _Hub(), runner)
+    for headers in (
+        {"Host": "127.0.0.1:8760"},
+        {"Origin": "http://127.0.0.1:8760", "Host": "127.0.0.1:8760"},
+    ):
+        handler = object.__new__(handler_cls)
+        handler.headers = headers
+        upgraded = []
+        handler._json = lambda obj, code=200: None
+        handler._handle_ws = lambda: upgraded.append(True)
+        handler.path = "/api/ws"
+        handler._route("GET")
+        assert upgraded == [True]
 
 
 def test_execution_log_route_serializer_contract(tmp_path):

@@ -152,8 +152,7 @@ def test_scope_projection_and_default_seed_reset_semantics(tmp_path):
     repository.seed_defaults()
     assert repository.resolve(tool="mcp_call", pattern_input="server/tool") == "ask"
     assert not any(
-        rule["tool"] == "mcp_call"
-        for rule in repository.get_rules(scope="global")
+        rule["tool"] == "mcp_call" for rule in repository.get_rules(scope="global")
     )
 
     repository.set_rule(
@@ -264,19 +263,27 @@ def test_store_facade_and_frame_project_cascades_remain_aggregate(tmp_path):
     )
 
     assert isinstance(store._permissions, PermissionRuleRepository)
-    assert store.resolve_permission(
-        root_frame_id=frame_id,
-        project_id=project_id,
-        tool="bash",
-    ) == "deny"
+    assert (
+        store.resolve_permission(
+            root_frame_id=frame_id,
+            project_id=project_id,
+            tool="bash",
+        )
+        == "deny"
+    )
     store.delete_frame(frame_id)
-    assert store.get_permission_rules(
-        scope="conversation",
-        scope_id=frame_id,
-    ) == []
+    assert (
+        store.get_permission_rules(
+            scope="conversation",
+            scope_id=frame_id,
+        )
+        == []
+    )
     remaining = {
         rule["rule_id"]
-        for rules in store.list_permission_rules_for_frame(project_id=project_id).values()
+        for rules in store.list_permission_rules_for_frame(
+            project_id=project_id
+        ).values()
         for rule in rules
     }
     assert conversation_rule not in remaining
@@ -294,10 +301,13 @@ def test_store_facade_and_frame_project_cascades_remain_aggregate(tmp_path):
     all_rules = store.get_permission_rules(scope="global")
     assert global_id in {rule["rule_id"] for rule in all_rules}
     assert store.get_permission_rules(scope="project", scope_id=project_id) == []
-    assert store.get_permission_rules(
-        scope="conversation",
-        scope_id=second_frame,
-    ) == []
+    assert (
+        store.get_permission_rules(
+            scope="conversation",
+            scope_id=second_frame,
+        )
+        == []
+    )
     assert second_conversation != global_id
 
 
@@ -331,9 +341,7 @@ def test_durable_permission_request_is_append_only_and_terminal_is_immutable(tmp
         resolved_at=200,
     )
     assert resolved["state"] == "allowed"
-    assert store.list_permission_requests(
-        root_frame_id="root-1", state="pending"
-    ) == []
+    assert store.list_permission_requests(root_frame_id="root-1", state="pending") == []
     assert [
         item["decision_id"]
         for item in store.list_permission_requests(
@@ -341,11 +349,41 @@ def test_durable_permission_request_is_append_only_and_terminal_is_immutable(tmp
         )
     ] == ["perm-request-1"]
     # Idempotent same-terminal delivery is safe; a rewrite is not.
-    assert store.resolve_permission_request(
-        "perm-request-1", state="allowed"
-    )["resolved_at"] == 200
+    assert (
+        store.resolve_permission_request("perm-request-1", state="allowed")[
+            "resolved_at"
+        ]
+        == 200
+    )
     with pytest.raises(RuntimeError, match="already allowed"):
         store.resolve_permission_request("perm-request-1", state="denied")
+
+
+def test_pending_permission_request_times_out_on_read(tmp_path):
+    """A pending whose expires_at has passed (e.g. it outlived its backstop
+    across a daemon restart) is swept to ``timed_out`` on the next pending read,
+    not re-surfaced to a reconnecting client as a still-valid approval."""
+    store = get_store(Config(data_dir=tmp_path).db_path)
+    store.create_permission_request(
+        decision_id="perm-stale",
+        root_frame_id="root-1",
+        frame_id="root-1",
+        project_id="science",
+        tool="mcp_call",
+        target="lab/send",
+        payload={"type": "await_permission", "decision_id": "perm-stale"},
+        created_at=100,
+        expires_at=500,  # epoch-ms far in the past
+    )
+
+    # Reading the pending list runs the lazy backstop first.
+    assert store.list_permission_requests(root_frame_id="root-1", state="pending") == []
+    assert [
+        item["decision_id"]
+        for item in store.list_permission_requests(
+            root_frame_id="root-1", state="timed_out"
+        )
+    ] == ["perm-stale"]
 
 
 def test_permission_request_is_atomically_bound_to_action_ledger(tmp_path):
@@ -480,9 +518,7 @@ def test_restart_once_grant_is_exact_and_consumed_atomically(tmp_path):
         scope="once",
         resolution_context="after_restart",
     )
-    store.activate_restart_permission_continuation(
-        "perm-restart-expired", expires_at=1
-    )
+    store.activate_restart_permission_continuation("perm-restart-expired", expires_at=1)
     assert (
         store.consume_restart_permission_grant(
             root_frame_id="root-1",
@@ -494,9 +530,7 @@ def test_restart_once_grant_is_exact_and_consumed_atomically(tmp_path):
         is None
     )
     assert (
-        store.get_permission_request("perm-restart-expired")[
-            "continuation_consumed_at"
-        ]
+        store.get_permission_request("perm-restart-expired")["continuation_consumed_at"]
         is None
     )
 
