@@ -137,6 +137,25 @@ class KernelSupervisor:
             }
         return states[language] if language is not None else states
 
+    def inspect_variables(self, language: str, *, limit: int = 200) -> dict:
+        """Inspect one already-running language slot without starting it.
+
+        The concrete ``Kernel`` remains the sole frame reader.  We freeze and
+        later revalidate its lease so a lifecycle replacement can never make
+        an old worker's namespace appear to belong to a new generation.
+        """
+
+        with self._lock:
+            slot = self._slots.get(language)
+            if slot is None or slot.kernel is None or not self._alive(slot.kernel):
+                raise RuntimeError(f"no live {language} kernel to inspect")
+            lease = self._lease(language, slot)
+        response = lease.kernel.inspect_variables(limit=limit)
+        with self._lock:
+            if not self._matches(self._slots.get(language), lease):
+                raise RuntimeError(f"{language} kernel changed during inspection")
+        return response
+
     def interrupt(self, language: str | None = None) -> int:
         with self._lock:
             names = [language] if language is not None else list(self._slots)

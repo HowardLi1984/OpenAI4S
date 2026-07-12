@@ -17,6 +17,7 @@ class FakeKernel:
         self.interrupt_calls = 0
         self.restart_calls = 0
         self.kill_calls = 0
+        self.inspect_calls = 0
 
     def is_alive(self):
         return self.live
@@ -35,6 +36,10 @@ class FakeKernel:
     def kill_worker(self):
         self.kill_calls += 1
         self.live = False
+
+    def inspect_variables(self, *, limit=200):
+        self.inspect_calls += 1
+        return {"type": "variables_response", "variables": [], "limit": limit}
 
 
 def _factory(created: list[FakeKernel], prefix: str):
@@ -84,6 +89,51 @@ def test_failed_factory_preserves_the_current_worker_and_generation():
     assert supervisor.current("python") == current
     assert current.kernel.shutdown_calls == 0
     assert supervisor.status("python")["generation"] == 0
+
+
+def test_variable_inspection_never_creates_a_slot_or_worker():
+    supervisor = KernelSupervisor()
+    with pytest.raises(RuntimeError, match="no live python kernel"):
+        supervisor.inspect_variables("python")
+    assert supervisor.lease("python") is None
+    assert supervisor.status() == {}
+
+    created: list[FakeKernel] = []
+    lease = supervisor.ensure("python", "base", _factory(created, "python"))
+    response = supervisor.inspect_variables("python", limit=7)
+    assert response["limit"] == 7
+    assert lease.kernel.inspect_calls == 1
+
+
+def test_variable_inspection_rejects_a_worker_replaced_mid_read():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowInspector(FakeKernel):
+        def inspect_variables(self, *, limit=200):
+            entered.set()
+            assert release.wait(5)
+            return {"type": "variables_response", "variables": [], "limit": limit}
+
+    supervisor = KernelSupervisor()
+    original = SlowInspector("original")
+    supervisor.ensure("python", "base", lambda: original)
+    result = {}
+
+    def inspect():
+        try:
+            result["value"] = supervisor.inspect_variables("python")
+        except Exception as error:  # noqa: BLE001 - asserted below
+            result["error"] = error
+
+    thread = threading.Thread(target=inspect)
+    thread.start()
+    assert entered.wait(5)
+    supervisor.ensure("python", "other", lambda: FakeKernel("replacement"))
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert "changed during inspection" in str(result["error"])
 
 
 def test_dead_replacement_is_rejected_without_destroying_healthy_current():

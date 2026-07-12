@@ -13,6 +13,7 @@ import sys
 import threading
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,6 +24,10 @@ _WORKER = Path(__file__).resolve().parent / "worker.py"
 
 # A host-call dispatcher: (method:str, args:list) -> data. Raises to signal error.
 Dispatcher = Callable[[str, list], Any]
+
+
+class KernelBusyError(RuntimeError):
+    """The worker protocol is owned by an in-flight cell transaction."""
 
 
 class Kernel:
@@ -56,6 +61,12 @@ class Kernel:
         # remains on the existing pipes and is still serviced by this manager's
         # one synchronous reader loop.
         self._sandbox = sandbox or create_kernel_sandbox(self.cwd)
+        # Exactly one host thread may write a request and consume worker frames
+        # at a time.  ``inspect_variables`` deliberately acquires this lock
+        # without waiting: an inspector is an idle-only read, never a second
+        # reader racing an executing Cell's host_call/response loop.
+        self._protocol_transaction_lock = threading.Lock()
+        self._action_context_local = threading.local()
         self.generation = 0  # bumped on every (re)spawn
         self.authorization_generation = f"kernel:{uuid.uuid4()}"
         try:
@@ -130,6 +141,7 @@ class Kernel:
         on_chunk: Callable[[str], None] | None = None,
         *,
         cell_id: str | None = None,
+        action_context: dict[str, Any] | None = None,
     ) -> dict:
         """Run one cell; block until the response frame, servicing host_calls.
 
@@ -139,35 +151,134 @@ class Kernel:
         kernel protocol, provenance records, artifact versions, and execution
         log all refer to the same identity.
         """
-        cell_id = str(cell_id or uuid.uuid4())
-        self._send({"type": "execute", "id": cell_id, "code": code, "origin": origin})
+        with self._protocol_transaction_lock:
+            marker = object()
+            previous_context = getattr(self, "_active_action_context", marker)
+            inherited_context = getattr(self._action_context_local, "value", None)
+            self._active_action_context = dict(
+                action_context if action_context is not None else inherited_context or {}
+            )
+            try:
+                if not self.is_alive():
+                    raise RuntimeError("kernel worker is not alive")
+                cell_id = str(cell_id or uuid.uuid4())
+                self._send(
+                    {
+                        "type": "execute",
+                        "id": cell_id,
+                        "code": code,
+                        "origin": origin,
+                    }
+                )
 
-        stdout_chunks: list[str] = []
-        while True:
-            frame = self._readline()
-            if frame is None:
-                # Worker died; surface the drained stderr tail for debugging
-                # (the drain thread owns the pipe — never read it here too).
-                import time as _time
+                stdout_chunks: list[str] = []
+                while True:
+                    frame = self._readline()
+                    if frame is None:
+                        # Worker died; surface the drained stderr tail for debugging
+                        # (the drain thread owns the pipe — never read it here too).
+                        import time as _time
 
-                _time.sleep(0.05)  # let the drain thread flush the last lines
-                err = "".join(getattr(self, "_stderr_tail", []) or [])
-                raise RuntimeError(f"kernel worker exited unexpectedly: {err}")
-            ftype = frame.get("type")
-            if ftype == "response":
-                if stdout_chunks and not frame.get("stdout"):
-                    frame["stdout"] = "".join(stdout_chunks)
+                        _time.sleep(0.05)  # let the drain thread flush the last lines
+                        err = "".join(getattr(self, "_stderr_tail", []) or [])
+                        raise RuntimeError(
+                            f"kernel worker exited unexpectedly: {err}"
+                        )
+                    ftype = frame.get("type")
+                    if ftype == "response":
+                        if stdout_chunks and not frame.get("stdout"):
+                            frame["stdout"] = "".join(stdout_chunks)
+                        return frame
+                    if ftype == "host_call":
+                        self._service_host_call(frame)
+                    elif ftype == "stdout_chunk":
+                        text = frame.get("text", "")
+                        stdout_chunks.append(text)
+                        if on_chunk is not None and text:
+                            on_chunk(text)
+                    elif ftype == "log":
+                        # diagnostic from worker; ignore or log
+                        pass
+            finally:
+                if previous_context is marker:
+                    try:
+                        del self._active_action_context
+                    except AttributeError:
+                        pass
+                else:
+                    self._active_action_context = previous_context
+
+    @contextmanager
+    def bind_action_context(self, context: dict[str, Any] | None):
+        """Bind audit identity without changing the compatible execute shape."""
+
+        marker = object()
+        previous = getattr(self._action_context_local, "value", marker)
+        self._action_context_local.value = dict(context or {})
+        try:
+            yield
+        finally:
+            if previous is marker:
+                try:
+                    del self._action_context_local.value
+                except AttributeError:
+                    pass
+            else:
+                self._action_context_local.value = previous
+
+    def inspect_variables(self, *, limit: int = 200) -> dict[str, Any]:
+        """Read a bounded namespace summary from an idle, live worker.
+
+        This is a dedicated protocol request, not a synthetic Cell: it does
+        not compile code, allocate a Cell id/revision, emit stdout, or enter
+        the execution log.  Busy inspection fails immediately so this method
+        can never become a competing frame reader.
+        """
+
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("variable inspection limit must be an integer")
+        if not 1 <= limit <= 500:
+            raise ValueError("variable inspection limit must be between 1 and 500")
+        if not self.is_alive():
+            raise RuntimeError("kernel worker is not alive")
+        if not self._protocol_transaction_lock.acquire(blocking=False):
+            raise KernelBusyError("kernel worker is busy")
+        try:
+            # Re-check after acquiring: the worker may have exited between the
+            # optimistic status probe and ownership of the protocol channel.
+            if not self.is_alive():
+                raise RuntimeError("kernel worker is not alive")
+            request_id = f"variables-{uuid.uuid4()}"
+            self._send(
+                {"type": "inspect_variables", "id": request_id, "limit": limit}
+            )
+            diagnostic_frames = 0
+            while True:
+                frame = self._readline()
+                if frame is None:
+                    raise RuntimeError(
+                        "kernel worker exited during variable inspection"
+                    )
+                if frame.get("type") == "log" and diagnostic_frames < 8:
+                    # A startup audit-hook diagnostic can precede the first
+                    # request.  It is not a second response and is bounded.
+                    diagnostic_frames += 1
+                    continue
+                if (
+                    frame.get("type") != "variables_response"
+                    or frame.get("id") != request_id
+                ):
+                    raise RuntimeError(
+                        "kernel protocol desynchronized during variable inspection"
+                    )
+                error = frame.get("error")
+                if error is not None:
+                    raise RuntimeError(f"variable inspection failed: {error}")
+                if not isinstance(frame.get("variables"), list):
+                    raise RuntimeError("invalid variables response from kernel worker")
                 return frame
-            if ftype == "host_call":
-                self._service_host_call(frame)
-            elif ftype == "stdout_chunk":
-                text = frame.get("text", "")
-                stdout_chunks.append(text)
-                if on_chunk is not None and text:
-                    on_chunk(text)
-            elif ftype == "log":
-                # diagnostic from worker; ignore or log
-                pass
+        finally:
+            self._protocol_transaction_lock.release()
 
     @property
     def pid(self) -> int:
@@ -223,12 +334,21 @@ class Kernel:
             bind_generation = getattr(
                 self.dispatcher, "bind_bash_generation", None
             )
-            if callable(bind_generation):
+            bind_action = getattr(self.dispatcher, "bind_action_context", None)
+            action_context = getattr(self, "_active_action_context", None)
+            if callable(bind_generation) and callable(bind_action):
+                with bind_generation(self.authorization_generation):
+                    with bind_action(action_context):
+                        data = self.dispatcher(method, args)
+            elif callable(bind_generation):
                 # HostDispatcher is shared by the session and can service a
                 # main and background worker on different reader threads.  A
                 # thread-local binding prevents either worker from borrowing
                 # the other's shell capability generation.
                 with bind_generation(self.authorization_generation):
+                    data = self.dispatcher(method, args)
+            elif callable(bind_action):
+                with bind_action(action_context):
                     data = self.dispatcher(method, args)
             else:
                 data = self.dispatcher(method, args)

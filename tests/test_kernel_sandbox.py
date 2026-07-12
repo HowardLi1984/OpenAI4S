@@ -186,6 +186,7 @@ def test_successful_self_test_enables_seatbelt_and_private_temp(tmp_path):
         assert env["TMPDIR"] == str(private_temp)
         assert env["TMP"] == str(private_temp)
         assert env["TEMP"] == str(private_temp)
+        assert env["MPLCONFIGDIR"] == str(private_temp / "matplotlib")
         assert sandbox.wrap_command(["/bin/true"])[0] == "/usr/bin/sandbox-exec"
     finally:
         sandbox.close()

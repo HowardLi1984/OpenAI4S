@@ -61,6 +61,30 @@ while True:
     req = json.loads(line)
     if req.get("type") == "shutdown":
         break
+    if req.get("type") == "inspect_variables":
+        out.write(
+            json.dumps(
+                {
+                    "type": "variables_response",
+                    "id": req.get("id", "unknown"),
+                    "variables": [
+                        {
+                            "name": "counter",
+                            "type": "integer",
+                            "kind": "vector",
+                            "length": 1,
+                            "preview": f"[{counter}]",
+                            "fingerprint": "01234567",
+                        }
+                    ],
+                    "truncated": False,
+                    "limit": req.get("limit", 200),
+                }
+            )
+            + "\n"
+        )
+        out.flush()
+        continue
     if req.get("type") != "execute":
         continue
     rid = req.get("id", "unknown")

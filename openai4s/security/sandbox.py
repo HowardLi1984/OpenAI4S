@@ -416,6 +416,7 @@ class KernelSandbox:
             env["TMPDIR"] = self._temp_dir
             env["TMP"] = self._temp_dir
             env["TEMP"] = self._temp_dir
+            env["MPLCONFIGDIR"] = str(Path(self._temp_dir) / "matplotlib")
         return env
 
     def close(self) -> None:

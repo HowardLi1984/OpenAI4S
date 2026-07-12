@@ -7,7 +7,7 @@ import pytest
 
 from openai4s.config import Config, LLMConfig
 from openai4s.host_dispatch import build_dispatcher
-from openai4s.kernel import Kernel
+from openai4s.kernel import Kernel, KernelBusyError
 from openai4s.kernel.environment import build_kernel_environment
 
 
@@ -51,6 +51,87 @@ def test_persistent_namespace():
         k.execute("x = 41")
         r = k.execute("print(x + 1)")
         assert r["stdout"].strip() == "42"
+
+
+def test_variable_inspector_reads_only_safe_builtins_without_repr_hooks():
+    with Kernel(dispatcher=_echo_dispatcher) as kernel:
+        setup = kernel.execute(
+            "events = []\n"
+            "class Meta(type):\n"
+            "    def __getattribute__(cls, name):\n"
+            "        if name == '__name__': events.append('metaclass-name')\n"
+            "        return super().__getattribute__(name)\n"
+            "class Hostile(metaclass=Meta):\n"
+            "    def __repr__(self): events.append('repr'); raise RuntimeError('repr')\n"
+            "    def __len__(self): events.append('len'); raise RuntimeError('len')\n"
+            "    def __sizeof__(self): events.append('sizeof'); raise RuntimeError('sizeof')\n"
+            "class TrapList(list):\n"
+            "    def __repr__(self): events.append('list-repr'); raise RuntimeError('repr')\n"
+            "    def __iter__(self): events.append('list-iter'); raise RuntimeError('iter')\n"
+            "    def __len__(self): events.append('list-len'); raise RuntimeError('len')\n"
+            "score = 0.93\n"
+            "title = 'protein'\n"
+            "samples = [1, 2, 3]\n"
+            "mixed = [1, Hostile()]\n"
+            "hostile = Hostile()\n"
+            "trap = TrapList([1, 2])"
+        )
+        assert setup["error"] is None
+
+        response = kernel.inspect_variables()
+        variables = {item["name"]: item for item in response["variables"]}
+
+        assert variables["score"]["preview"] == 0.93
+        assert variables["title"]["preview"] == "protein"
+        assert variables["samples"]["length"] == 3
+        assert len(variables["samples"]["fingerprint"]) == 64
+        assert variables["mixed"] == {
+            "name": "mixed",
+            "type": "list",
+            "kind": "container",
+            "length": 2,
+        }
+        assert variables["hostile"] == {"name": "hostile", "type": "Hostile"}
+        assert variables["trap"] == {"name": "trap", "type": "TrapList"}
+        assert "host" not in variables and "openai4s" not in variables
+        assert kernel.execute("print(events)")["stdout"].strip() == "[]"
+
+
+def test_variable_inspector_fails_busy_without_competing_frame_reader():
+    with Kernel(dispatcher=_echo_dispatcher) as kernel:
+        started = threading.Event()
+        result = {}
+
+        def run():
+            result["cell"] = kernel.execute(
+                "print('started')\nimport time\ntime.sleep(30)",
+                on_chunk=lambda _text: started.set(),
+            )
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        # A completely cold optional-science install may build Matplotlib's
+        # font cache before the first user byte is emitted. The cache now has a
+        # stable writable location, but this concurrency assertion should not
+        # mistake that one-time initialization for a protocol deadlock.
+        assert started.wait(60)
+        with pytest.raises(KernelBusyError, match="busy"):
+            kernel.inspect_variables()
+        kernel.interrupt()
+        thread.join(timeout=15)
+        assert not thread.is_alive()
+        assert result["cell"]["interrupted"] is True
+        # The failed busy read consumed no frame; the next request is aligned.
+        assert isinstance(kernel.inspect_variables()["variables"], list)
+
+
+def test_variable_inspector_limit_validation_is_local():
+    with Kernel(dispatcher=_echo_dispatcher) as kernel:
+        with pytest.raises(ValueError, match="between 1 and 500"):
+            kernel.inspect_variables(limit=0)
+        with pytest.raises(TypeError, match="integer"):
+            kernel.inspect_variables(limit=True)
+        assert kernel.execute("print('aligned')")["stdout"].strip() == "aligned"
 
 
 def test_kernel_child_environment_is_rebuilt_from_strict_allowlist(tmp_path):
@@ -103,6 +184,7 @@ def test_kernel_child_environment_is_rebuilt_from_strict_allowlist(tmp_path):
     assert env["LANG"] == "en_US.UTF-8"
     assert env["TMPDIR"] == "/safe/tmp"
     assert env["MPLBACKEND"] == "Agg"
+    assert env["MPLCONFIGDIR"] == "/safe/tmp/openai4s-matplotlib"
     assert env["OPENAI4S_PROVENANCE_OFF"] == "1"
     assert env["OPENAI4S_SAFETY_AUDIT_HOOK"] == "0"
     assert env["OPENAI4S_KERNEL_MODE"] == "python"

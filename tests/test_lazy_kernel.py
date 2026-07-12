@@ -18,6 +18,9 @@ class _Kernel:
     def is_alive(self) -> bool:
         return not self.closed
 
+    def inspect_variables(self, *, limit=200) -> dict:
+        return {"variables": [], "limit": limit}
+
     def interrupt(self) -> None:
         self.cells.append(("system", "interrupt"))
 
@@ -34,6 +37,20 @@ def test_context_without_code_never_creates_a_worker():
         assert lazy.is_alive() is False
 
     assert created == []
+
+
+def test_variable_inspection_preserves_lazy_no_spawn_contract():
+    created: list[_Kernel] = []
+    lazy = LazyKernel(lambda: created.append(_Kernel()) or created[-1])
+
+    with pytest.raises(RuntimeError, match="has not been started"):
+        lazy.inspect_variables()
+    assert created == [] and lazy.spawned is False
+
+    lazy.execute("one", origin="agent")
+    assert lazy.inspect_variables(limit=9) == {"variables": [], "limit": 9}
+    assert len(created) == 1
+    lazy.shutdown()
 
 
 def test_first_cell_bootstraps_once_reuses_and_detaches_worker():

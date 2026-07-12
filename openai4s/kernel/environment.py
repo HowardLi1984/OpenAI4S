@@ -65,6 +65,7 @@ _RUNTIME_ALLOWLIST = frozenset(
         "CURL_CA_BUNDLE",
         # Reproducible/headless scientific runtime controls.
         "MPLBACKEND",
+        "MPLCONFIGDIR",
         "OMP_NUM_THREADS",
         "OMP_THREAD_LIMIT",
         "MKL_NUM_THREADS",
@@ -193,6 +194,14 @@ def build_kernel_environment(
     env["PWD"] = str(workspace)
     env["OPENAI4S_WORKSPACE"] = str(workspace)
     env["OPENAI4S_KERNEL_MODE"] = str(mode)
+    if not env.get("MPLCONFIGDIR"):
+        # Matplotlib otherwise falls back to a new random directory whenever
+        # $HOME is read-only, rebuilding its font cache for every Kernel. Use a
+        # stable, non-secret runtime cache; an enforced OS sandbox replaces it
+        # with its own private temp path in KernelSandbox.apply_environment().
+        runtime_tmp = env.get("TMPDIR") or env.get("TEMP") or env.get("TMP")
+        cache_root = Path(runtime_tmp) if runtime_tmp else workspace / ".openai4s-runtime"
+        env["MPLCONFIGDIR"] = str(cache_root / "openai4s-matplotlib")
     if kernel_generation:
         # Synthesized by the trusted manager for this exact worker spawn.  It
         # is never inherited from the daemon environment and is used only to

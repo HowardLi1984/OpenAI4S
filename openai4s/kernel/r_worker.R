@@ -231,6 +231,168 @@
                  wall, cpu, .oai4s_rss_kb())
 }
 
+# --- read-only variable inspection ------------------------------------------
+
+# Keep inspection code outside the user namespace's lexical lookup chain.
+# Every helper resolves only base functions, and the environment/bindings are
+# locked before the first Cell runs.  The protocol writer is captured now so a
+# later user variable with the same name is never called by the inspector.
+.oai4s_inspector <- new.env(parent = baseenv())
+.oai4s_inspector$write_frame <- .oai4s_write_frame
+evalq({
+  hidden <- c("quit", "q")
+  sample_items <- 12L
+
+  esc <- function(s) {
+    if (is.null(s) || length(s) == 0L) return('""')
+    s <- paste(as.character(s), collapse = "\n")
+    s2 <- tryCatch(iconv(s, from = "", to = "UTF-8", sub = "byte"),
+                   error = function(e) NA_character_)
+    s <- if (is.na(s2)) "(unrepresentable)" else s2
+    s <- gsub("\\", "\\\\", s, fixed = TRUE, useBytes = TRUE)
+    s <- gsub('"', '\\"', s, fixed = TRUE, useBytes = TRUE)
+    s <- gsub("\n", "\\n", s, fixed = TRUE, useBytes = TRUE)
+    s <- gsub("\r", "\\r", s, fixed = TRUE, useBytes = TRUE)
+    s <- gsub("\t", "\\t", s, fixed = TRUE, useBytes = TRUE)
+    for (i in c(1:8, 11L, 12L, 14:31)) {
+      s <- gsub(intToUtf8(i), sprintf("\\u%04x", i), s, fixed = TRUE, useBytes = TRUE)
+    }
+    paste0('"', s, '"')
+  }
+
+  bounded <- function(s, n = 240L) {
+    if (is.na(s)) return("NA")
+    s <- enc2utf8(s)
+    if (nchar(s, type = "chars") <= n) s else paste0(substr(s, 1L, n - 1L), "…")
+  }
+
+  scalar_token <- function(value) {
+    if (is.object(value) || length(value) != 1L) return(NULL)
+    kind <- typeof(value)
+    if (identical(kind, "logical")) {
+      if (is.na(value)) return("logical:NA")
+      return(if (isTRUE(value)) "logical:true" else "logical:false")
+    }
+    if (identical(kind, "integer")) {
+      return(if (is.na(value)) "integer:NA" else paste0("integer:", as.character(value)))
+    }
+    if (identical(kind, "double")) {
+      if (is.nan(value)) return("double:NaN")
+      if (is.na(value)) return("double:NA")
+      if (is.infinite(value)) return(if (value > 0) "double:+Inf" else "double:-Inf")
+      return(paste0("double:", sprintf("%.17g", value)))
+    }
+    if (identical(kind, "character")) {
+      return(if (is.na(value)) "character:NA" else paste0("character:", bounded(value, 128L)))
+    }
+    if (identical(kind, "raw")) return(paste0("raw:", paste(sprintf("%02x", as.integer(value)), collapse = "")))
+    NULL
+  }
+
+  scalar_preview <- function(value) {
+    token <- scalar_token(value)
+    if (is.null(token)) return(NULL)
+    kind <- typeof(value)
+    if (identical(kind, "character")) return(if (is.na(value)) "NA" else bounded(value))
+    if (identical(kind, "raw")) return(paste0("0x", paste(sprintf("%02x", as.integer(value)), collapse = "")))
+    sub("^[^:]+:", "", token)
+  }
+
+  fingerprint <- function(token) {
+    # A bounded deterministic fingerprint without R serialization APIs,
+    # object methods, attributes, files, or optional packages.
+    ints <- utf8ToInt(bounded(token, 4096L))
+    h <- 5381
+    for (code in ints) h <- (h * 33 + code) %% 2147483647
+    sprintf("%08x", as.integer(h))
+  }
+
+  binding_value <- function(name) {
+    env <- globalenv()
+    if (bindingIsActive(name, env)) {
+      return(list(active = TRUE, value = NULL))
+    }
+    # substitute() reads an ordinary binding without invoking repr/print and
+    # returns a delayedAssign promise's expression without forcing it.
+    symbol <- as.name(name)
+    call <- as.call(list(as.name("substitute"), symbol, env))
+    list(active = FALSE, value = eval(call, baseenv()))
+  }
+
+  inspect_one <- function(name) {
+    binding <- binding_value(name)
+    if (isTRUE(binding$active)) return(list(name = name, type = "active_binding"))
+    value <- binding$value
+    kind <- typeof(value)
+    entry <- list(name = name, type = kind)
+    if (is.object(value)) return(entry)
+
+    if (kind %in% c("logical", "integer", "double", "character", "raw")) {
+      n <- length(value)
+      entry$kind <- if (identical(kind, "character")) "text" else if (identical(kind, "raw")) "bytes" else "vector"
+      entry$length <- n
+      take <- min(n, sample_items)
+      values <- if (take > 0L) lapply(seq_len(take), function(i) value[[i]]) else list()
+      tokens <- lapply(values, scalar_token)
+      if (all(vapply(tokens, function(x) !is.null(x), logical(1)))) {
+        previews <- vapply(values, scalar_preview, character(1))
+        entry$preview <- paste0("[", paste(previews, collapse = ", "), if (n > take) ", …" else "", "]")
+        entry$fingerprint <- fingerprint(paste0(kind, ":", n, ":", paste(unlist(tokens), collapse = "|")))
+      }
+      return(entry)
+    }
+
+    if (identical(kind, "list")) {
+      n <- length(value)
+      entry$kind <- "container"; entry$length <- n
+      take <- min(n, sample_items)
+      values <- if (take > 0L) lapply(seq_len(take), function(i) value[[i]]) else list()
+      tokens <- lapply(values, scalar_token)
+      if (all(vapply(tokens, function(x) !is.null(x), logical(1)))) {
+        previews <- vapply(values, scalar_preview, character(1))
+        entry$preview <- paste0("[", paste(previews, collapse = ", "), if (n > take) ", …" else "", "]")
+        entry$fingerprint <- fingerprint(paste0("list:", n, ":", paste(unlist(tokens), collapse = "|")))
+      }
+    }
+    entry
+  }
+
+  entry_json <- function(entry) {
+    fields <- c(paste0('"name":', esc(entry$name)), paste0('"type":', esc(entry$type)))
+    if (!is.null(entry$kind)) fields <- c(fields, paste0('"kind":', esc(entry$kind)))
+    if (!is.null(entry$length)) fields <- c(fields, paste0('"length":', sprintf("%.0f", entry$length)))
+    if (!is.null(entry$preview)) fields <- c(fields, paste0('"preview":', esc(entry$preview)))
+    if (!is.null(entry$fingerprint)) fields <- c(fields, paste0('"fingerprint":', esc(entry$fingerprint)))
+    paste0("{", paste(fields, collapse = ","), "}")
+  }
+
+  inspect <- function(limit) {
+    names <- ls(envir = globalenv(), all.names = TRUE, sorted = TRUE)
+    names <- names[!startsWith(names, ".oai4s_") & !(names %in% hidden)]
+    selected <- head(names, limit)
+    list(
+      variables = lapply(selected, inspect_one),
+      truncated = length(names) > length(selected),
+      limit = limit
+    )
+  }
+
+  respond <- function(id, result = NULL, error = NULL) {
+    variables <- if (is.null(result)) list() else result$variables
+    entries <- vapply(variables, entry_json, character(1))
+    json <- paste0(
+      '{"type":"variables_response","id":', esc(id),
+      ',"variables":[', paste(entries, collapse = ","), "]",
+      ',"truncated":', if (!is.null(result) && isTRUE(result$truncated)) "true" else "false",
+      ',"limit":', if (is.null(result)) "0" else sprintf("%d", as.integer(result$limit)),
+      ',"error":', if (is.null(error)) "null" else esc(error), "}"
+    )
+    write_frame(json)
+  }
+}, .oai4s_inspector)
+lockEnvironment(.oai4s_inspector, bindings = TRUE)
+lockBinding(".oai4s_inspector", globalenv())
+
 # --- protocol channels + main loop -------------------------------------------
 
 .oai4s_out <- tryCatch(file("/dev/fd/3", open = "wt"), error = function(e) NULL)
@@ -280,6 +442,29 @@ assign("q", function(...) stop("q() is disabled inside openai4s R cells; the ker
   }
   type <- as.character(.oai4s_or(frame$type, "execute"))
   if (identical(type, "shutdown")) return("shutdown")
+  if (identical(type, "inspect_variables")) {
+    id <- as.character(.oai4s_or(frame$id, "unknown"))
+    limit <- frame$limit
+    valid_limit <- is.numeric(limit) && length(limit) == 1L && is.finite(limit) &&
+      limit == floor(limit) && limit >= 1 && limit <= 500
+    if (!isTRUE(valid_limit)) {
+      .oai4s_inspector$respond(id, error = "invalid variable inspection limit")
+      .oai4s_responded <<- TRUE
+      return("ok")
+    }
+    inspected <- tryCatch(
+      .oai4s_inspector$inspect(as.integer(limit)),
+      error = function(e) NULL,
+      interrupt = function(e) NULL
+    )
+    if (is.null(inspected)) {
+      .oai4s_inspector$respond(id, error = "variable inspection failed closed")
+    } else {
+      .oai4s_inspector$respond(id, result = inspected)
+    }
+    .oai4s_responded <<- TRUE
+    return("ok")
+  }
   if (identical(type, "execute")) {
     .oai4s_run(
       as.character(.oai4s_or(frame$code, "")),

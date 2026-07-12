@@ -19,6 +19,7 @@ import pytest
 from openai4s.kernel.r_kernel import r_argv, resolve_r_interpreter, spawn_r_kernel
 
 _FAKE = Path(__file__).parent / "fixtures" / "fake_rscript.py"
+_R_WORKER = Path(__file__).parents[1] / "openai4s" / "kernel" / "r_worker.R"
 
 
 @pytest.fixture()
@@ -59,6 +60,49 @@ def test_execute_persistence_and_stray_stdout(fake_rscript, tmp_path):
     finally:
         k.shutdown()
     assert not k.is_alive()
+
+
+def test_r_variable_inspector_uses_dedicated_idle_protocol(fake_rscript, tmp_path):
+    kernel = spawn_r_kernel(cwd=str(tmp_path), rscript=fake_rscript)
+    try:
+        assert kernel.execute("COUNT")["stdout"] == "1"
+        inspected = kernel.inspect_variables()
+        assert inspected["type"] == "variables_response"
+        assert inspected["variables"] == [
+            {
+                "name": "counter",
+                "type": "integer",
+                "kind": "vector",
+                "length": 1,
+                "preview": "[1]",
+                "fingerprint": "01234567",
+            }
+        ]
+        # Inspection is not an execute frame and does not advance namespace.
+        assert kernel.execute("COUNT")["stdout"] == "2"
+    finally:
+        kernel.shutdown()
+
+
+def test_r_variable_inspector_source_fails_closed_on_dynamic_bindings():
+    source = _R_WORKER.read_text("utf-8")
+    inspector = source.split(
+        "# --- read-only variable inspection", 1
+    )[1].split("# --- protocol channels", 1)[0]
+
+    assert "bindingIsActive" in inspector
+    assert "substitute" in inspector
+    assert "lockEnvironment(.oai4s_inspector, bindings = TRUE)" in inspector
+    assert 'lockBinding(".oai4s_inspector", globalenv())' in inspector
+    for forbidden in (
+        "serialize(",
+        "saveRDS(",
+        "object.size(",
+        "deparse(",
+        "capture.output(",
+        " get(",
+    ):
+        assert forbidden not in inspector
 
 
 def test_r_kernel_cannot_inherit_host_api_keys_or_loader_injection(
@@ -225,6 +269,36 @@ def test_real_r_persistent_namespace_error_lineno_and_quit_guard(tmp_path):
         assert r1["usage"]["wall_s"] >= 0
     finally:
         k.shutdown()
+
+
+@pytest.mark.skipif(_REAL_R is None, reason="no Rscript resolvable on this machine")
+def test_real_r_variable_inspector_does_not_force_bindings_or_object_methods(tmp_path):
+    kernel = spawn_r_kernel(cwd=str(tmp_path), rscript=_REAL_R)
+    try:
+        setup = kernel.execute(
+            "forced <- FALSE\n"
+            "delayedAssign('later', { forced <<- TRUE; stop('promise forced') })\n"
+            "makeActiveBinding('active_trap', function(value) stop('active binding called'), .GlobalEnv)\n"
+            "score <- 0.93\n"
+            "samples <- list(1L, 'x')\n"
+            "custom <- structure(list(1L), class='custom_class')"
+        )
+        assert setup["error"] is None
+
+        inspected = kernel.inspect_variables()
+        variables = {item["name"]: item for item in inspected["variables"]}
+        assert variables["active_trap"] == {
+            "name": "active_trap",
+            "type": "active_binding",
+        }
+        assert variables["later"]["type"] == "language"
+        assert "preview" not in variables["later"]
+        assert variables["score"]["length"] == 1
+        assert variables["samples"]["length"] == 2
+        assert variables["custom"] == {"name": "custom", "type": "list"}
+        assert kernel.execute("cat(forced)")["stdout"] == "FALSE"
+    finally:
+        kernel.shutdown()
 
 
 @pytest.mark.skipif(_REAL_R is None, reason="no Rscript resolvable on this machine")

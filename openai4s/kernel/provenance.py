@@ -32,6 +32,7 @@ from typing import Any, Callable
 
 _PROV_ATTR = "_openai4s_src"
 _PROV_JSON_LEAF_CAP = 10_000
+PROVENANCE_VERSION = "1"
 
 _installed = False
 _host_call: Callable[[str, list], Any] | None = None

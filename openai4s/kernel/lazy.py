@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 KernelFactory = Callable[[], Any]
@@ -51,6 +52,25 @@ class LazyKernel:
 
     def execute(self, code: str, **kwargs: Any) -> dict:
         return self._ensure().execute(code, **kwargs)
+
+    @contextmanager
+    def bind_action_context(self, context: dict[str, Any] | None):
+        kernel = self._ensure()
+        binder = getattr(kernel, "bind_action_context", None)
+        if callable(binder):
+            with binder(context):
+                yield
+            return
+        yield
+
+    def inspect_variables(self, *, limit: int = 200) -> dict:
+        """Inspect an existing worker without defeating lazy startup."""
+
+        with self._lock:
+            kernel = self._kernel
+        if kernel is None:
+            raise RuntimeError("kernel worker has not been started")
+        return kernel.inspect_variables(limit=limit)
 
     def is_alive(self) -> bool:
         with self._lock:

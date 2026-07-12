@@ -12,6 +12,16 @@ class CellRequest:
     origin: str
     language: str = "python"
     stream: bool = True
+    # Canonical action declaration that owns this Cell. User-authored Notebook
+    # Cells legitimately leave it unset; agent Cells bind it before execution
+    # so every mid-cell Host RPC can inherit the same audit identity.
+    action_group_id: str | None = None
+    # Notebook is a projection over the immutable execution ledger.  These
+    # labels never suppress persistence; they only describe how a Cell may be
+    # shown and whether recovery is allowed to replay it.
+    visibility: str | None = None
+    pin: bool = False
+    replay_policy: str | None = None
 
 
 @dataclass
