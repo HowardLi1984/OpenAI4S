@@ -80,11 +80,15 @@ const api = async (p, o = {}) => {
   if (!r.ok) throw new Error((j && (j.error || j.detail)) || ("HTTP " + r.status)); return j;
 };
 const S = { projects: [], sessions: [], project: null, currentId: null, ws: null, stream: null, running: false, models: [], defaultModel: null, sandboxOrigin: "", planMode: false, exploreMode: false, planPending: false, planReady: null, planStatus: null, artifacts: [], dock: { open: false, tab: "notebook" }, openTabs: [], activeTab: "notebook", provMode: false, provSub: "code", cells: [], kernels: [], liveCells: [], _liveCell: null, dockArtifact: null, kernelFilter: null, _titleName: "", skillsCatalog: null, _menu: null, annotations: [], _annotDraft: null, filesScope: "frame", projectArtifacts: [], _projArtFor: null,
+  rendererCatalog: null, _rendererCatalogPromise: null, rendererDescriptors: {},
   // The workbench surfaces are projections only. They deliberately keep no
   // provider wire payloads or raw tool arguments in browser state.
   actionTimeline: null, executionQueue: null, executionIdentity: null, recoveryState: null,
-  branchState: null, contextState: null, securityState: null,
-  workbenchErrors: {}, _workbenchReq: 0, _timelineHistoryReq: 0, _timelineHistoryLoading: null };
+  recoveryActions: null, branchState: null, branchUndo: null, contextState: null, securityState: null,
+  delegationState: null,
+  workbenchErrors: {}, _workbenchReq: 0, _timelineHistoryReq: 0, _timelineHistoryLoading: null,
+  _recoveryActionLoading: null, _branchActionLoading: null,
+  variableInspector: { language: "python", results: {}, loading: null, error: "", request: 0 } };
 const ac = { open: false, items: [], idx: 0, trigger: "", start: 0 };
 const TOOL_LABELS = { run_python: "toolLabel.runPython", run_bash: "toolLabel.runBash", search_skills: "toolLabel.searchSkills", read_skill: "toolLabel.readSkill", write_file: "toolLabel.writeFile", read_file: "toolLabel.readFile", list_files: "toolLabel.listFiles", delegate: "toolLabel.delegate" };
 
@@ -312,6 +316,17 @@ Object.assign(I18N.zh, {
   "cust.models.model.placeholder": "模型 id（留空用 provider 默认）",
   "cust.models.modelPlaceholder2": "模型 id（留空用该 provider 默认）",
   "cust.models.namePlaceholder": "名称（如 DeepSeek 生产 / 本地 vLLM）",
+  "cust.models.local.title": "本地推理服务",
+  "cust.models.local.desc": "自动扫描本机固定端口上的 Ollama、LM Studio、vLLM 与 llama.cpp；扫描不会修改当前模型，未知能力默认走保守的 Code-as-Action。",
+  "cust.models.local.scan": "重新扫描",
+  "cust.models.local.scanning": "正在扫描本机…",
+  "cust.models.local.none": "没有发现可用的本地 OpenAI-compatible endpoint。",
+  "cust.models.local.models": "{0} 个模型",
+  "cust.models.local.add": "添加配置",
+  "cust.models.local.configured": "已配置",
+  "cust.models.local.added": "已添加本地模型：{0}",
+  "cust.models.local.error": "本地模型扫描失败：{0}",
+  "cust.models.local.keyless": "本机 · 无需 API Key",
   "cust.models.noKey": "⚠️ 无 Key",
   "cust.models.provider.placeholder": "provider（如 ark / chatgpt / claude / gemini）",
   "cust.models.providerPlaceholder2": "provider（如 ark / chatgpt / claude / gemini）",
@@ -505,12 +520,32 @@ Object.assign(I18N.zh, {
   "nb.interrupt.noOwner": "当前没有可精确中断的 execution owner。",
   "nb.action.queued": "已追加为新的 {0} 单元",
   "nb.cell.current": "Current",
+  "nb.cell.drafting": "模型草稿 · 正在更新",
   "nb.cell.stale": "Stale",
   "nb.cell.nonReplayable": "Non-replayable",
   "nb.cell.historical": "历史版本 · 只读",
   "nb.repl.language": "语言",
   "nb.repl.run": "Shift+Enter 运行",
   "nb.repl.multilineHint": "多行 Python/R 输入只会追加新单元；已执行历史始终只读。",
+  "nb.variables.title": "Variable Inspector",
+  "nb.variables.language": "命名空间",
+  "nb.variables.refresh": "刷新变量",
+  "nb.variables.loading": "正在读取当前命名空间…",
+  "nb.variables.notLoaded": "选择 Python 或 R，然后手动刷新。读取不会运行 Cell。",
+  "nb.variables.empty": "当前命名空间没有可显示的用户变量。",
+  "nb.variables.error": "变量读取失败：{0}",
+  "nb.variables.generation": "Generation {0}",
+  "nb.variables.revision": "State revision S{0}",
+  "nb.variables.stale": "可能已过期 · 请刷新",
+  "nb.variables.truncated": "只显示前 {0} 个变量",
+  "nb.variables.length": "长度 {0}",
+  "nb.variables.fingerprint": "指纹 {0}",
+  "nb.variables.state.busy": "内核正在执行，Variable Inspector 暂不可用。",
+  "nb.variables.state.ended": "该内核 generation 已结束；不会为检查变量而重启。",
+  "nb.variables.state.not_started": "该语言内核从未启动；不会为检查变量而启动。",
+  "nb.variables.state.restoring": "内核正在恢复，完成后再刷新。",
+  "nb.variables.state.unsupported": "当前内核不支持安全变量检查。",
+  "nb.variables.state.failed": "变量检查已安全失败；命名空间未被修改。",
   "runtime.branch": "Branch",
   "runtime.python": "Python",
   "runtime.r": "R",
@@ -524,6 +559,9 @@ Object.assign(I18N.zh, {
   "runtime.status.restoring": "Restoring",
   "runtime.status.partial": "Partial",
   "runtime.status.failed": "Failed",
+  "runtime.trust.quarantined": "隔离导入",
+  "runtime.trust": "信任",
+  "runtime.quarantineHint": "这是未受信任的导入会话，当前仅供查看。请在恢复面板明确确认“全新重启”后再继续。",
   "timeline.title": "Action Timeline",
   "timeline.subtitle": "来自持久 Action Ledger 的安全投影；不显示原始参数、wire state 或 token。",
   "timeline.refresh": "刷新",
@@ -540,6 +578,9 @@ Object.assign(I18N.zh, {
   "timeline.replay": "Replay",
   "timeline.duration": "耗时",
   "timeline.artifacts": "产物",
+  "timeline.tokens": "Tokens",
+  "timeline.tokensValue": "{0} 输入 · {1} 输出",
+  "timeline.cost": "成本",
   "timeline.kind.native_tool": "Native Tool",
   "timeline.kind.python": "Python Cell",
   "timeline.kind.r": "R Cell",
@@ -553,20 +594,58 @@ Object.assign(I18N.zh, {
   "timeline.panel.branches": "Branch · Checkpoint",
   "timeline.panel.context": "Context composition",
   "timeline.panel.security": "Sandbox · Permission",
+  "timeline.panel.delegation": "子代理树",
   "timeline.noBranch": "尚无 branch/checkpoint 投影。",
   "timeline.noContext": "尚无 context composition 投影。",
   "timeline.noSecurity": "尚无 sandbox/permission 状态投影。",
+  "timeline.noDelegation": "本会话尚未创建子代理。",
+  "delegation.budget": "预算 {0}/{1}",
+  "delegation.active": "活动 {0}",
+  "delegation.turns": "边界 {0}/{1}",
+  "delegation.steering": "消息：{0} 待投递 · {1} 已投递",
   "branch.current": "当前",
+  "branch.viewOnly": "未激活 · 仅查看",
+  "branch.currentSummary": "当前分支：{0}",
   "branch.head": "Head {0}",
   "branch.checkpoint": "创建 checkpoint",
+  "branch.fork": "Fork",
+  "branch.forkName": "为新分支命名（可以留空）",
+  "branch.forkDefault": "Fork {0}",
+  "branch.forked": "已从 checkpoint {0} 创建分支",
+  "branch.activate": "激活",
+  "branch.activating": "正在切换…",
+  "branch.activated": "已切换到分支 {0}",
+  "branch.activatedPartial": "已切换到分支 {0}，但部分状态需要修复；请查看 Recovery。",
+  "branch.internalCheckpoints": "内部游标 checkpoint（{0}）",
   "branch.preview": "预览回滚",
   "branch.revert": "回滚并继续",
+  "branch.undo": "撤销上次回滚",
+  "branch.undone": "已撤销上次回滚",
+  "branch.actionFailed": "Branch 操作失败：{0}",
   "branch.conflict": "检测到外部文件冲突，不能直接应用。",
   "branch.previewTitle": "Revert preview",
   "branch.diff": "消息 {0} · Notebook {1} · 文件写入 {2} / 删除 {3} · Artifact +{4}/-{5}",
+  "recovery.title": "Kernel Recovery",
+  "recovery.checkpoint": "Checkpoint {0}",
+  "recovery.action.restore": "恢复 checkpoint",
+  "recovery.action.retry": "重试恢复",
+  "recovery.action.restart_fresh": "全新重启",
+  "recovery.action.ready": "可以执行",
+  "recovery.action.loading": "正在执行…",
+  "recovery.action.unavailable": "当前服务未提供此 Recovery 操作。",
+  "recovery.action.currentOnly": "Recovery 只允许用于当前会话已激活的分支。",
+  "recovery.action.failed": "Recovery 操作失败：{0}",
+  "recovery.action.done": "Recovery 操作已完成；状态与 journal 已刷新。",
+  "recovery.freshConfirm": "全新重启会清空当前 Python/R 内存变量，不会把 checkpoint 当作已恢复的命名空间。对话、Notebook、工作区文件与 Artifact 会保留。确定继续吗？",
   "context.tokens": "{0} tokens",
+  "context.outputReserve": "输出预留 {0}",
+  "context.messages": "{0} 条消息",
   "context.compressed": "已压缩",
   "context.handoff": "Handoff",
+  "context.history": "压缩历史（{0}）",
+  "context.compaction": "Compaction",
+  "context.savings": "{0} → {1} tokens",
+  "context.artifacts": "{0} 个 Artifact 引用",
   "security.sandbox": "Sandbox",
   "security.generation": "Generation",
   "security.generationEnded": "{0} 已结束（{1}）",
@@ -639,6 +718,19 @@ Object.assign(I18N.zh, {
   "proj.menu.downloadArtifacts": "下载产物",
   "proj.menu.settings": "项目设置",
   "proj.menu.newProject": "新建项目",
+  "projectResearch.menu": "项目研究图谱",
+  "projectResearch.title": "{0} · 全局研究视图",
+  "projectResearch.timeline": "Timeline",
+  "projectResearch.lineage": "Lineage",
+  "projectResearch.timelineSummary": "{0} 个会话 · {1} 个行动",
+  "projectResearch.lineageSummary": "{0} 个 Artifact · {1} 个版本 · {2} 条边",
+  "projectResearch.latest": "latest",
+  "projectResearch.noLineage": "还没有项目级血缘数据。",
+  "projectResearch.edges": "血缘边（{0}）",
+  "sessionPackage.import": "导入会话包",
+  "sessionPackage.export": "导出会话包",
+  "sessionPackage.imported": "会话包已安全导入；Kernel 保持结束状态，需显式恢复",
+  "sessionPackage.tooLarge": "会话包超过客户端 128 MiB 限制",
   "projModal.create": "创建",
   "projModal.editTitle": "项目设置",
   "projModal.ctx.label": "智能体上下文",
@@ -710,6 +802,17 @@ Object.assign(I18N.zh, {
   "skill.namePlaceholder": "技能名（英文短横线，如 my-analysis）",
   "skill.newTitle": "新建技能",
   "skill.saveBtn": "保存技能",
+  "skill.historyBtn": "版本历史",
+  "skill.historyTitle": "技能版本 — {0}",
+  "skill.historyEmpty": "这个作用域还没有可回滚的版本。",
+  "skill.scope.personal": "个人",
+  "skill.scope.project": "项目",
+  "skill.scope.bundled": "内置",
+  "skill.versionActive": "当前版本",
+  "skill.rollbackBtn": "回滚到此版本",
+  "skill.rollbackConfirm": "将 {0} 回滚到版本 {1}？当前版本仍会保留。",
+  "skill.rollbackDone": "已将 {0} 回滚到所选版本",
+  "skill.versionSidecar": "Sidecar：{0}",
   "specialist.descPlaceholder": "一句话描述",
   "specialist.editTitle": "编辑专家 — {0}",
   "specialist.label.systemPrompt": "系统提示",
@@ -809,7 +912,23 @@ Object.assign(I18N.zh, {
   "versions.restoring": "恢复中…",
   "viewer.act.fullscreen": "全屏",
   "viewer.act.more": "更多",
+  "viewer.chem.fallback": "当前文件没有可安全绘制的二维坐标，下面保留原始化学表示。",
+  "viewer.chem.source": "原始化学表示",
+  "viewer.downloadOnly": "该二进制产物没有安全的内置预览器。",
   "viewer.empty": "在会话里点击一个文件以查看。",
+  "viewer.genome.features": "{0} 个特征 · {1} 条染色体/序列",
+  "viewer.genome.invalid": "忽略 {0} 条无效记录",
+  "viewer.genome.list": "特征描述",
+  "viewer.latex.preview": "安全预览",
+  "viewer.latex.source": "LaTeX 源码",
+  "viewer.loading": "正在选择安全渲染器…",
+  "viewer.msa.summary": "{0} 条序列 · {1} 列 · {2}",
+  "viewer.renderer.compat": "兼容模式",
+  "viewer.renderer.error": "无法预览此产物，可继续下载原文件。",
+  "viewer.renderer.matched": "匹配：{0}",
+  "viewer.renderer.version": "版本 {0}",
+  "viewer.sequence.omitted": "为保持界面流畅，其余 {0} 个残基未展开。",
+  "viewer.sequence.summary": "{0} 条序列 · {1} 个残基 · {2}",
   "ws.nav.files": "文件",
   "ws.nav.new": "新建",
   "ws.sidebar.collapse": "收起侧栏 (⌘B)",
@@ -997,6 +1116,17 @@ Object.assign(I18N.en, {
   "cust.models.model.placeholder": "Model id (leave blank to use the provider default)",
   "cust.models.modelPlaceholder2": "Model id (leave blank for the provider default)",
   "cust.models.namePlaceholder": "Name (e.g. DeepSeek Prod / Local vLLM)",
+  "cust.models.local.title": "Local inference servers",
+  "cust.models.local.desc": "Automatically scans fixed loopback ports for Ollama, LM Studio, vLLM, and llama.cpp. Scanning never changes the active model; unknown capabilities default to conservative Code-as-Action.",
+  "cust.models.local.scan": "Scan again",
+  "cust.models.local.scanning": "Scanning this machine…",
+  "cust.models.local.none": "No local OpenAI-compatible endpoint was detected.",
+  "cust.models.local.models": "{0} models",
+  "cust.models.local.add": "Add profile",
+  "cust.models.local.configured": "Configured",
+  "cust.models.local.added": "Added local model: {0}",
+  "cust.models.local.error": "Local model discovery failed: {0}",
+  "cust.models.local.keyless": "local · no API key required",
   "cust.models.noKey": "⚠️ No key",
   "cust.models.provider.placeholder": "provider (e.g. ark / chatgpt / claude / gemini)",
   "cust.models.providerPlaceholder2": "provider (e.g. ark / chatgpt / claude / gemini)",
@@ -1190,12 +1320,32 @@ Object.assign(I18N.en, {
   "nb.interrupt.noOwner": "There is no exact execution owner to interrupt.",
   "nb.action.queued": "Appended as a new {0} cell",
   "nb.cell.current": "Current",
+  "nb.cell.drafting": "Model draft · updating",
   "nb.cell.stale": "Stale",
   "nb.cell.nonReplayable": "Non-replayable",
   "nb.cell.historical": "Historical revision · read only",
   "nb.repl.language": "Language",
   "nb.repl.run": "Shift+Enter to run",
   "nb.repl.multilineHint": "Multiline Python/R input only appends new cells; executed history is always read-only.",
+  "nb.variables.title": "Variable Inspector",
+  "nb.variables.language": "Namespace",
+  "nb.variables.refresh": "Refresh variables",
+  "nb.variables.loading": "Reading the current namespace…",
+  "nb.variables.notLoaded": "Choose Python or R, then refresh manually. Inspection never runs a Cell.",
+  "nb.variables.empty": "There are no displayable user variables in this namespace.",
+  "nb.variables.error": "Variable inspection failed: {0}",
+  "nb.variables.generation": "Generation {0}",
+  "nb.variables.revision": "State revision S{0}",
+  "nb.variables.stale": "Possibly stale · refresh",
+  "nb.variables.truncated": "Showing only the first {0} variables",
+  "nb.variables.length": "length {0}",
+  "nb.variables.fingerprint": "fingerprint {0}",
+  "nb.variables.state.busy": "The kernel is executing; Variable Inspector is temporarily unavailable.",
+  "nb.variables.state.ended": "This kernel generation has ended; inspection will not restart it.",
+  "nb.variables.state.not_started": "This language kernel has never started; inspection will not start it.",
+  "nb.variables.state.restoring": "Kernel recovery is in progress; refresh when it finishes.",
+  "nb.variables.state.unsupported": "This kernel does not support safe variable inspection.",
+  "nb.variables.state.failed": "Variable inspection failed closed; the namespace was not changed.",
   "runtime.branch": "Branch",
   "runtime.python": "Python",
   "runtime.r": "R",
@@ -1209,6 +1359,9 @@ Object.assign(I18N.en, {
   "runtime.status.restoring": "Restoring",
   "runtime.status.partial": "Partial",
   "runtime.status.failed": "Failed",
+  "runtime.trust.quarantined": "Quarantined import",
+  "runtime.trust": "Trust",
+  "runtime.quarantineHint": "This imported Session is untrusted and view-only. Explicitly confirm Restart fresh in Recovery before continuing.",
   "timeline.title": "Action Timeline",
   "timeline.subtitle": "Safe projection of the durable Action Ledger; raw arguments, wire state and tokens are never shown.",
   "timeline.refresh": "Refresh",
@@ -1225,6 +1378,9 @@ Object.assign(I18N.en, {
   "timeline.replay": "Replay",
   "timeline.duration": "Duration",
   "timeline.artifacts": "Artifacts",
+  "timeline.tokens": "Tokens",
+  "timeline.tokensValue": "{0} in · {1} out",
+  "timeline.cost": "Cost",
   "timeline.kind.native_tool": "Native Tool",
   "timeline.kind.python": "Python Cell",
   "timeline.kind.r": "R Cell",
@@ -1238,20 +1394,58 @@ Object.assign(I18N.en, {
   "timeline.panel.branches": "Branch · Checkpoint",
   "timeline.panel.context": "Context composition",
   "timeline.panel.security": "Sandbox · Permission",
+  "timeline.panel.delegation": "Sub-agent tree",
   "timeline.noBranch": "No branch/checkpoint projection is available yet.",
   "timeline.noContext": "No context composition projection is available yet.",
   "timeline.noSecurity": "No sandbox/permission projection is available yet.",
+  "timeline.noDelegation": "No sub-agent has been created in this session.",
+  "delegation.budget": "Budget {0}/{1}",
+  "delegation.active": "Active {0}",
+  "delegation.turns": "Boundary {0}/{1}",
+  "delegation.steering": "Messages: {0} queued · {1} delivered",
   "branch.current": "current",
+  "branch.viewOnly": "inactive · view only",
+  "branch.currentSummary": "Current branch: {0}",
   "branch.head": "Head {0}",
   "branch.checkpoint": "Create checkpoint",
+  "branch.fork": "Fork",
+  "branch.forkName": "Name the new branch (optional)",
+  "branch.forkDefault": "Fork {0}",
+  "branch.forked": "Created a branch from checkpoint {0}",
+  "branch.activate": "Activate",
+  "branch.activating": "Switching…",
+  "branch.activated": "Activated branch {0}",
+  "branch.activatedPartial": "Activated branch {0}, but some state needs repair; inspect Recovery.",
+  "branch.internalCheckpoints": "Internal cursor checkpoints ({0})",
   "branch.preview": "Preview revert",
   "branch.revert": "Revert and continue",
+  "branch.undo": "Undo last revert",
+  "branch.undone": "The last revert was undone",
+  "branch.actionFailed": "Branch action failed: {0}",
   "branch.conflict": "External file conflicts prevent this revert from being applied.",
   "branch.previewTitle": "Revert preview",
   "branch.diff": "Messages {0} · Notebook {1} · files write {2} / delete {3} · Artifacts +{4}/-{5}",
+  "recovery.title": "Kernel Recovery",
+  "recovery.checkpoint": "Checkpoint {0}",
+  "recovery.action.restore": "Restore checkpoint",
+  "recovery.action.retry": "Retry recovery",
+  "recovery.action.restart_fresh": "Restart fresh",
+  "recovery.action.ready": "Ready",
+  "recovery.action.loading": "Running…",
+  "recovery.action.unavailable": "This Recovery action is not advertised by the current server.",
+  "recovery.action.currentOnly": "Recovery is available only for the session's active branch.",
+  "recovery.action.failed": "Recovery action failed: {0}",
+  "recovery.action.done": "Recovery finished; status and journal were refreshed.",
+  "recovery.freshConfirm": "A fresh restart clears the current Python/R in-memory variables and does not claim the checkpoint namespace was restored. Conversation, Notebook, workspace files, and Artifacts remain. Continue?",
   "context.tokens": "{0} tokens",
+  "context.outputReserve": "output reserve {0}",
+  "context.messages": "{0} messages",
   "context.compressed": "compressed",
   "context.handoff": "Handoff",
+  "context.history": "Compaction history ({0})",
+  "context.compaction": "Compaction",
+  "context.savings": "{0} → {1} tokens",
+  "context.artifacts": "{0} Artifact refs",
   "security.sandbox": "Sandbox",
   "security.generation": "Generation",
   "security.generationEnded": "{0} ended ({1})",
@@ -1324,6 +1518,19 @@ Object.assign(I18N.en, {
   "proj.menu.downloadArtifacts": "Download artifacts",
   "proj.menu.settings": "Project settings",
   "proj.menu.newProject": "New project",
+  "projectResearch.menu": "Project research map",
+  "projectResearch.title": "{0} · Global research view",
+  "projectResearch.timeline": "Timeline",
+  "projectResearch.lineage": "Lineage",
+  "projectResearch.timelineSummary": "{0} sessions · {1} actions",
+  "projectResearch.lineageSummary": "{0} Artifacts · {1} versions · {2} edges",
+  "projectResearch.latest": "latest",
+  "projectResearch.noLineage": "No project lineage data yet.",
+  "projectResearch.edges": "Lineage edges ({0})",
+  "sessionPackage.import": "Import session",
+  "sessionPackage.export": "Export session package",
+  "sessionPackage.imported": "Session imported safely; its Kernel remains Ended until explicit recovery",
+  "sessionPackage.tooLarge": "Session package exceeds the 128 MiB client limit",
   "projModal.create": "Create",
   "projModal.editTitle": "Project settings",
   "projModal.ctx.label": "Agent Context",
@@ -1395,6 +1602,17 @@ Object.assign(I18N.en, {
   "skill.namePlaceholder": "Skill name (lowercase-hyphenated, e.g. my-analysis)",
   "skill.newTitle": "New skill",
   "skill.saveBtn": "Save skill",
+  "skill.historyBtn": "Version history",
+  "skill.historyTitle": "Skill versions — {0}",
+  "skill.historyEmpty": "This scope has no rollbackable versions yet.",
+  "skill.scope.personal": "personal",
+  "skill.scope.project": "project",
+  "skill.scope.bundled": "bundled",
+  "skill.versionActive": "Active version",
+  "skill.rollbackBtn": "Roll back to this version",
+  "skill.rollbackConfirm": "Roll {0} back to version {1}? The current version will be retained.",
+  "skill.rollbackDone": "Rolled {0} back to the selected version",
+  "skill.versionSidecar": "Sidecar: {0}",
   "specialist.descPlaceholder": "One-line description",
   "specialist.editTitle": "Edit specialist — {0}",
   "specialist.label.systemPrompt": "System prompt",
@@ -1494,7 +1712,23 @@ Object.assign(I18N.en, {
   "versions.restoring": "Restoring…",
   "viewer.act.fullscreen": "Fullscreen",
   "viewer.act.more": "More",
+  "viewer.chem.fallback": "No safe 2D coordinates were found; the original chemical representation is preserved below.",
+  "viewer.chem.source": "Original chemical representation",
+  "viewer.downloadOnly": "This binary artifact has no safe built-in preview.",
   "viewer.empty": "Click a file in the conversation to view it.",
+  "viewer.genome.features": "{0} features · {1} chromosomes/sequences",
+  "viewer.genome.invalid": "Ignored {0} invalid records",
+  "viewer.genome.list": "Feature descriptors",
+  "viewer.latex.preview": "Safe preview",
+  "viewer.latex.source": "LaTeX source",
+  "viewer.loading": "Selecting a safe renderer…",
+  "viewer.msa.summary": "{0} sequences · {1} columns · {2}",
+  "viewer.renderer.compat": "Compatibility mode",
+  "viewer.renderer.error": "This artifact could not be previewed. You can still download the original file.",
+  "viewer.renderer.matched": "Matched by {0}",
+  "viewer.renderer.version": "Version {0}",
+  "viewer.sequence.omitted": "{0} additional residues are collapsed to keep the viewer responsive.",
+  "viewer.sequence.summary": "{0} sequences · {1} residues · {2}",
   "ws.nav.files": "Files",
   "ws.nav.new": "New",
   "ws.sidebar.collapse": "Collapse sidebar (⌘B)",
@@ -1623,13 +1857,24 @@ function timelineOrdinal(value) {
 }
 function sanitizeActionTimeline(payload) {
   const source = payload && (payload.timeline || payload.payload || payload);
+  const usage = value => {
+    const source = value && typeof value === "object" ? value : {};
+    const number = key => Number.isSafeInteger(source[key]) && source[key] >= 0 ? source[key] : 0;
+    return { input_tokens: number("input_tokens"), output_tokens: number("output_tokens"), total_tokens: number("total_tokens") };
+  };
+  const permission = value => value && typeof value === "object"
+    ? publicText([value.state, value.scope].filter(Boolean).join(" · "), 80)
+    : publicText(value, 80);
   const groups = ((source && source.groups) || []).slice(-ACTION_TIMELINE_PAGE_SIZE).map(group => ({
     group_id: publicText(group.group_id, 96), branch_id: publicText(group.branch_id, 96),
     turn_id: publicText(group.turn_id, 96), ordinal: timelineOrdinal(group.ordinal),
     kind: publicText(group.kind, 48), language: publicText(group.language, 24), provider: publicText(group.provider, 48), model: publicText(group.model, 96),
     title: publicText(group.title, 260), status: publicText(group.status, 32), owner: publicText(group.owner || group.owner_kind, 80),
-    permission: publicText(group.permission || group.permission_state, 80), replay_policy: publicText(group.replay_policy, 48),
-    cost: Number.isFinite(+group.cost) ? +group.cost : null, created_at: group.created_at,
+    permission: permission(group.permission || group.permission_state), replay_policy: publicText(group.replay_policy, 48),
+    usage: usage(group.usage), cost: Number.isFinite(+group.cost) && +group.cost >= 0 ? +group.cost : null, created_at: group.created_at,
+    session: group.session && typeof group.session === "object" ? {
+      root_frame_id: publicText(group.session.root_frame_id, 96), name: publicText(group.session.name, 160)
+    } : null,
     events: ((group.events || []).slice(0, 100)).map(event => ({
       event_id: publicText(event.event_id, 96), sequence: event.sequence, type: publicText(event.type, 64),
       action_id: publicText(event.action_id, 96), name: publicText(event.name, 120),
@@ -1651,8 +1896,10 @@ function sanitizeActionTimeline(payload) {
   const hasMoreBefore = !!(source && (source.has_more_before || source.has_earlier));
   const hasMoreAfter = !!(source && (source.has_more_after || source.has_more));
   return {
+    project_id: publicText(source && source.project_id, 120),
     root_frame_id: publicText(source && source.root_frame_id, 96),
     branch_id: publicText(source && source.branch_id, 96), groups,
+    session_count: Number.isFinite(+(source && source.session_count)) ? Math.max(0, +(source && source.session_count)) : null,
     count: Number.isFinite(+(source && source.count)) ? +(source && source.count) : groups.length,
     total_count: Number.isFinite(+(source && source.total_count)) ? +(source && source.total_count) : groups.length,
     truncated: !!(source && source.truncated),
@@ -1737,6 +1984,18 @@ function rememberExecutionState(event) {
   if (identity && ["running", "finalizing"].includes(status)) S.executionIdentity = identity;
   else if (identity && status === "queued" && !S.executionIdentity) S.executionIdentity = identity;
   if (S.executionIdentity && event && event.execution_id === S.executionIdentity.execution_id && ["completed", "failed", "cancelled"].includes(status)) S.executionIdentity = null;
+  const pending = S.pendingReplIdentity;
+  if (pending && event && event.execution_id === pending.execution_id && ["completed", "failed", "cancelled"].includes(status)) {
+    const frameId = pending.frame_id;
+    S.pendingReplIdentity = null;
+    invalidateKernelCache();
+    if (S.currentId === frameId) {
+      loadExecutionLog(frameId).catch(() => {});
+      loadArtifacts(frameId);
+      scheduleWorkbenchRefresh();
+      if (S.dock.open && S.activeTab === "notebook") scheduleNotebookRender();
+    }
+  }
 }
 function identityForOwner(queue, ownerKind) {
   const safe = queue || sanitizeExecutionQueue({}), candidates = [safe.owner].concat(safe.queue || []).filter(Boolean);
@@ -1767,69 +2026,174 @@ async function scopedExecutionRequest(frameId, endpoint, reason, ownerKind) {
 function sanitizeRecovery(payload) {
   const source = payload && (payload.recovery || payload.payload || payload) || {};
   const generations = source.generations || {}, current = source.current || {};
+  const candidateJournal = source.log || source.events || current.events;
+  const journal = Array.isArray(candidateJournal) ? candidateJournal : (/recovery_log/.test(String(source.type || "")) ? [source] : []);
   return {
     status: publicText(source.status || source.state, 48), progress: Number.isFinite(+source.progress) ? Math.max(0, Math.min(1, +source.progress)) : null,
     state_revision: source.state_revision, branch_id: publicText(source.branch_id, 96),
+    view_only: source.view_only === true, trust_state: publicText(source.trust_state, 32), explicit_recovery_required: source.explicit_recovery_required === true,
     python_generation_id: publicText(source.python_generation_id || (generations.python || {}).generation_id || generations.python, 96),
     r_generation_id: publicText(source.r_generation_id || (generations.r || {}).generation_id || generations.r, 96),
     message: publicText(source.message || source.reason || source.error || current.phase, 240),
-    log: (source.log || source.events || current.events || (/recovery_log/.test(String(source.type || "")) ? [source] : [])).slice(-50).map(item => ({
-      status: publicText(item.status || item.state || item.type, 48), message: publicText(item.message || item.reason || item.error, 240), at: item.at || item.created_at
+    log: journal.slice(-50).map(item => ({
+      status: publicText(item.status || item.state || item.type, 48),
+      message: publicText(item.message || item.reason || item.error || [item.phase, item.status].filter(Boolean).join(": "), 240),
+      at: item.at || item.created_at
     }))
+  };
+}
+const RECOVERY_ACTION_IDS = ["restore", "retry", "restart_fresh"];
+function sanitizeRecoveryActions(payload) {
+  const source = payload && (payload.recovery || payload.payload || payload) || {};
+  const advertised = new Map((Array.isArray(source.actions) ? source.actions : []).map(item => [String(item && item.id || ""), item || {}]));
+  return {
+    root_frame_id: publicText(source.root_frame_id, 96), branch_id: publicText(source.branch_id, 96),
+    checkpoint_id: publicText(source.checkpoint_id, 96), state: publicText(source.state, 48),
+    view_only: source.view_only === true, trust_state: publicText(source.trust_state, 32), explicit_recovery_required: source.explicit_recovery_required === true,
+    actions: RECOVERY_ACTION_IDS.map(id => {
+      const item = advertised.get(id);
+      return {
+        id, enabled: !!(item && item.enabled === true),
+        reason: publicText(item ? item.reason : t("recovery.action.unavailable"), 240),
+        requires_confirmation: !!(item && item.requires_confirmation === true),
+        requires_ticket: !!(item && item.requires_ticket === true)
+      };
+    })
   };
 }
 function sanitizeBranches(payload) {
   const source = payload && (payload.branch || payload.payload || payload) || {};
   const capabilities = source.capabilities || source.actions || {};
   const capabilityEnabled = value => value === true || !!(value && typeof value === "object" && value.enabled === true);
-  const checkpoints = items => (items || []).slice(0, 100).map(cp => ({
-    checkpoint_id: publicText(cp.checkpoint_id || cp.id, 96), parent_checkpoint_id: publicText(cp.parent_checkpoint_id, 96),
-    reason: publicText(cp.reason, 80), created_at: cp.created_at, message_cursor: cp.message_cursor,
-    action_cursor: cp.action_cursor, cell_cursor: cp.cell_cursor,
-    requires_kernel_recovery: !!((cp.metadata || {}).requires_kernel_recovery || cp.requires_kernel_recovery)
-  }));
+  const capabilityReason = value => publicText(value && typeof value === "object" ? value.reason : "", 200);
+  const checkpoints = items => (Array.isArray(items) ? items : []).slice(0, 100).map(item => {
+    const cp = item && typeof item === "object" ? item : {}, metadata = cp.metadata && typeof cp.metadata === "object" ? cp.metadata : {};
+    return {
+      checkpoint_id: publicText(cp.checkpoint_id || cp.id, 96), parent_checkpoint_id: publicText(cp.parent_checkpoint_id, 96),
+      reason: publicText(cp.reason, 80), created_at: cp.created_at, message_cursor: cp.message_cursor,
+      action_cursor: cp.action_cursor, cell_cursor: cp.cell_cursor,
+      internal: cp.internal === true || cp.internal === 1,
+      source_kind: publicText(cp.source_kind, 24), source_id: publicText(cp.source_id, 96),
+      requires_kernel_recovery: !!(metadata.requires_kernel_recovery || cp.requires_kernel_recovery),
+      undo_revert_checkpoint_id: publicText(metadata.undo_checkpoint_id ? (cp.checkpoint_id || cp.id) : "", 96)
+    };
+  });
   return {
+    root_frame_id: publicText(source.root_frame_id, 96),
     branch_id: publicText(source.branch_id || source.current_branch_id, 96),
     capabilities: {
       checkpoint: capabilityEnabled(capabilities.checkpoint), fork: capabilityEnabled(capabilities.fork),
       fork_from_cell: capabilityEnabled(capabilities.fork && capabilities.fork.fork_from_cell),
+      fork_from_message: capabilityEnabled(capabilities.fork && capabilities.fork.fork_from_message),
       revert_preview: capabilityEnabled(capabilities.revert_preview || capabilities.preview_revert),
-      revert: capabilityEnabled(capabilities.revert), promote: capabilityEnabled(capabilities.promote || capabilities.promote_artifact)
+      revert: capabilityEnabled(capabilities.revert), activate: capabilityEnabled(capabilities.activate),
+      promote: capabilityEnabled(capabilities.promote || capabilities.promote_artifact)
     },
-    branches: (source.branches || []).slice(0, 100).map(branch => ({
-      branch_id: publicText(branch.branch_id || branch.id, 96), name: publicText(branch.name, 120),
-      head_checkpoint_id: publicText(branch.head_checkpoint_id, 96), created_at: branch.created_at,
-      checkpoints: checkpoints(branch.checkpoints)
-    })),
+    capability_reasons: {
+      checkpoint: capabilityReason(capabilities.checkpoint), fork: capabilityReason(capabilities.fork),
+      fork_from_cell: publicText((capabilities.fork || {}).fork_from_cell_reason, 200),
+      fork_from_message: publicText((capabilities.fork || {}).fork_from_message_reason, 200),
+      revert_preview: capabilityReason(capabilities.revert_preview || capabilities.preview_revert),
+      revert: capabilityReason(capabilities.revert), activate: capabilityReason(capabilities.activate)
+    },
+    branches: (Array.isArray(source.branches) ? source.branches : []).slice(0, 100).map(item => {
+      const branch = item && typeof item === "object" ? item : {};
+      return {
+        branch_id: publicText(branch.branch_id || branch.id, 96), name: publicText(branch.name, 120),
+        head_checkpoint_id: publicText(branch.head_checkpoint_id, 96), created_at: branch.created_at,
+        active: branch.active === true, view_only: branch.view_only === true, activatable: branch.activatable === true,
+        checkpoints: checkpoints(branch.checkpoints)
+      };
+    }),
     revert_preview: sanitizeRevertPreview(source.revert_preview)
   };
+}
+function branchUndoFromProjection(state) {
+  if (!state || !state.branch_id) return null;
+  const branch = (state.branches || []).find(item => item.branch_id === state.branch_id);
+  const checkpoint = branch && (branch.checkpoints || []).find(item => item.checkpoint_id === branch.head_checkpoint_id);
+  return checkpoint && checkpoint.undo_revert_checkpoint_id ? {
+    branch_id: state.branch_id, revert_checkpoint_id: checkpoint.undo_revert_checkpoint_id
+  } : null;
 }
 function sanitizeRevertPreview(source) {
   if (!source || typeof source !== "object") return null;
   const workspace = source.workspace || {};
-  const setDelta = value => ({ added: publicList((value || {}).added), removed: publicList((value || {}).removed) });
+  const count = value => Array.isArray(value) ? Math.min(value.length, 1000000) : 0;
+  const delta = value => Number.isFinite(Number(value)) ? Math.max(-1000000, Math.min(1000000, Number(value))) : 0;
+  const setDelta = value => ({ added_count: count((value || {}).added), removed_count: count((value || {}).removed) });
   return {
     branch_id: publicText(source.branch_id, 96), current_checkpoint_id: publicText(source.current_checkpoint_id, 96),
     target_checkpoint_id: publicText(source.target_checkpoint_id, 96), can_apply: !!source.can_apply,
-    messages: { delta: Number((source.messages || {}).delta || 0) },
-    notebook: { delta: Number((source.notebook || {}).delta || 0) },
-    actions: { delta: Number((source.actions || {}).delta || 0) },
-    workspace: { writes: publicList(workspace.writes), deletes: publicList(workspace.deletes), conflicts: publicList(workspace.conflicts) },
+    messages: { delta: delta((source.messages || {}).delta) },
+    notebook: { delta: delta((source.notebook || {}).delta) },
+    actions: { delta: delta((source.actions || {}).delta) },
+    workspace: { writes_count: count(workspace.writes), deletes_count: count(workspace.deletes), conflicts_count: count(workspace.conflicts) },
     artifacts: setDelta(source.artifacts), environment: source.environment ? { changed: true } : null,
     permissions: source.permissions ? { changed: true } : null
+  };
+}
+function sanitizeRevertMutationResult(source) {
+  const checkpoint = source && source.checkpoint || {};
+  return {
+    ok: !!(source && source.ok === true), branch_id: publicText(checkpoint.branch_id, 96),
+    revert_checkpoint_id: publicText(checkpoint.checkpoint_id, 96),
+    requires_kernel_recovery: !!(source && source.requires_kernel_recovery === true)
+  };
+}
+function sanitizeVariableInspection(payload, frameId, language) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  const allowedStates = ["active", "busy", "ended", "not_started", "restoring", "unsupported", "failed"];
+  const state = allowedStates.includes(String(source.state || "")) ? String(source.state) : "failed";
+  const activeBranch = publicText(S.branchState && S.branchState.branch_id, 96) || frameId;
+  const exactScope = publicText(source.root_frame_id, 96) === frameId && publicText(source.branch_id, 96) === activeBranch && source.language === language;
+  const primitive = value => {
+    if (value === null || typeof value === "boolean") return value;
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") return publicText(value, 240);
+    return undefined;
+  };
+  const variables = (Array.isArray(source.variables) ? source.variables : []).slice(0, 500).map(raw => {
+    const item = raw && typeof raw === "object" ? raw : {};
+    const safe = { name: publicText(item.name, 160), type: publicText(item.type, 160) };
+    const kind = publicText(item.kind, 32); if (kind) safe.kind = kind;
+    if (Number.isSafeInteger(item.length) && item.length >= 0) safe.length = Math.min(item.length, 1000000000000);
+    const preview = primitive(item.preview); if (preview !== undefined) safe.preview = preview;
+    const fingerprint = publicText(item.fingerprint, 128).toLowerCase(); if (/^[a-f0-9]{8,128}$/.test(fingerprint)) safe.fingerprint = fingerprint;
+    return safe;
+  }).filter(item => item.name && item.type);
+  const available = !!(source.available === true && exactScope && state === "active");
+  return {
+    available,
+    root_frame_id: exactScope ? frameId : "", branch_id: exactScope ? activeBranch : "", language,
+    state: exactScope ? state : "failed", generation_id: publicText(source.generation_id, 96),
+    state_revision: Number.isSafeInteger(source.state_revision) && source.state_revision >= 0 ? source.state_revision : 0,
+    variables: available ? variables : [], truncated: available && !!source.truncated, reason: publicText(source.reason, 200)
   };
 }
 function sanitizeContext(payload) {
   const source = payload && (payload.context || payload.payload || payload) || {};
   const layers = source.layers || source.segments || source.composition || [];
+  const history = Array.isArray(source.compaction_history) ? source.compaction_history : [];
   return {
     token_count: Number.isFinite(+source.token_count) ? +source.token_count : null,
     token_limit: Number.isFinite(+source.token_limit) ? +source.token_limit : null,
+    output_reserve: Number.isFinite(+source.output_reserve) ? +source.output_reserve : null,
+    message_count: Number.isFinite(+source.message_count) ? +source.message_count : null,
+    compaction_count: Number.isFinite(+source.compaction_count) ? Math.max(0, +source.compaction_count) : history.length,
     handoff: !!(source.handoff || source.handoff_id), compressed: !!(source.compressed || source.compaction_count),
     layers: (Array.isArray(layers) ? layers : []).slice(0, 100).map(layer => ({
       name: publicText(layer.name || layer.kind || layer.type, 120), kind: publicText(layer.kind || layer.type, 64),
       token_count: Number.isFinite(+layer.token_count) ? +layer.token_count : null,
       status: publicText(layer.status, 48), compressed: !!layer.compressed
+    })),
+    compaction_history: history.slice(0, 50).map(item => ({
+      archive_id: publicText(item && item.archive_id, 120), branch_id: publicText(item && item.branch_id, 120),
+      generation_id: publicText(item && item.generation_id, 120), created_at: Number(item && item.created_at) || 0,
+      message_count: Number.isFinite(+(item && item.message_count)) ? Math.max(0, +(item && item.message_count)) : 0,
+      tokens_before: Number.isFinite(+(item && item.tokens_before)) ? Math.max(0, +(item && item.tokens_before)) : 0,
+      tokens_after: Number.isFinite(+(item && item.tokens_after)) ? Math.max(0, +(item && item.tokens_after)) : 0,
+      artifact_count: Array.isArray(item && item.artifact_refs) ? Math.min(item.artifact_refs.length, 100) : 0
     }))
   };
 }
@@ -1854,6 +2218,43 @@ function sanitizeSecurity(payload) {
       pending_count: Number.isFinite(+permission.pending_count) ? +permission.pending_count : 0,
       unattended: publicText(permission.unattended, 48)
     }
+  };
+}
+function sanitizeDelegations(payload) {
+  const source = payload && (payload.delegation || payload.payload || payload) || {};
+  const count = value => Number.isSafeInteger(+value) && +value >= 0 ? Math.min(+value, 1000000) : 0;
+  const budgetSource = source.budget && typeof source.budget === "object" ? source.budget : null;
+  const budget = budgetSource ? {
+    limit: count(budgetSource.limit), spawned: count(budgetSource.spawned),
+    active: count(budgetSource.active), remaining: count(budgetSource.remaining),
+  } : null;
+  const children = (Array.isArray(source.children) ? source.children : []).slice(0, 1000).map(raw => {
+    const item = raw && typeof raw === "object" ? raw : {};
+    const progress = item.progress && typeof item.progress === "object" ? item.progress : {};
+    const steering = item.steering && typeof item.steering === "object" ? item.steering : {};
+    const overrides = item.overrides && typeof item.overrides === "object" ? item.overrides : {};
+    return {
+      child_id: publicText(item.child_id, 96), parent_child_id: publicText(item.parent_child_id, 96),
+      frame_id: publicText(item.frame_id, 96), name: publicText(item.name, 160),
+      status: publicText(item.status, 32), depth: Math.min(count(item.depth), 16),
+      stop_reason: publicText(item.stop_reason, 160), error: publicText(item.error, 240),
+      created_at: item.created_at, started_at: item.started_at, finished_at: item.finished_at,
+      progress: { turn_boundary: count(progress.turn_boundary), max_turns: count(progress.max_turns) || null },
+      steering: { queued: count(steering.queued), delivered: count(steering.delivered), discarded: count(steering.discarded) },
+      overrides: {
+        model: publicText(overrides.model, 120), steps: count(overrides.steps) || null,
+        permission_count: Array.isArray(overrides.permissions) ? Math.min(overrides.permissions.length, 100) : 0,
+        capability_count: Array.isArray(overrides.capabilities) ? Math.min(overrides.capabilities.length, 100) : 0,
+      },
+    };
+  }).filter(item => item.child_id);
+  return {
+    root_frame_id: publicText(source.root_frame_id, 96), initialized: source.initialized === true,
+    budget, stats: source.stats && typeof source.stats === "object" ? {
+      total: count(source.stats.total), pending: count(source.stats.pending), running: count(source.stats.running),
+      done: count(source.stats.done), failed: count(source.stats.failed), stopped: count(source.stats.stopped),
+    } : { total: children.length, pending: 0, running: 0, done: 0, failed: 0, stopped: 0 },
+    children,
   };
 }
 async function optionalApi(paths) {
@@ -1888,26 +2289,32 @@ async function loadWorkbenchState(id, force = false) {
   const request = S._workbenchReq = (S._workbenchReq || 0) + 1;
   S._workbenchLoading = id;
   const base = `/frames/${id}`;
-  const [timeline, execution, branches, context, security, recovery] = await Promise.all([
+  const [timeline, execution, branches, context, security, delegation, recovery, recoveryActions] = await Promise.all([
     optionalApi([base + `/action-timeline?limit=${ACTION_TIMELINE_PAGE_SIZE}`]),
     optionalApi([base + "/execution-queue", base + "/execution"]),
-    optionalApi([base + "/branches"]), optionalApi([base + "/context"]), optionalApi([base + "/security"]),
-    optionalApi([base + "/recovery"])
+    optionalApi([base + "/branches"]), optionalApi([base + "/context"]), optionalApi([base + "/security"]), optionalApi([base + "/delegations"]),
+    optionalApi([base + "/recovery"]), optionalApi([base + "/recovery/actions"])
   ]);
   if (request !== S._workbenchReq || id !== S.currentId) return;
   S._workbenchLoading = null;
   if (timeline) S.actionTimeline = mergeActionTimelines(S.actionTimeline, sanitizeActionTimeline(timeline), "latest");
   if (execution) rememberExecutionQueue(execution);
-  if (branches) S.branchState = sanitizeBranches(branches);
+  if (branches) { S.branchState = sanitizeBranches(branches); S.branchUndo = branchUndoFromProjection(S.branchState); }
   if (context) S.contextState = sanitizeContext(context);
   if (security) S.securityState = sanitizeSecurity(security);
+  if (delegation) S.delegationState = sanitizeDelegations(delegation);
   if (recovery) S.recoveryState = sanitizeRecovery(recovery);
+  if (recoveryActions) S.recoveryActions = sanitizeRecoveryActions(recoveryActions);
   if (S.activeTab === "timeline") renderActionTimeline();
   if (S.activeTab === "notebook") renderNotebook();
 }
 function scheduleWorkbenchRefresh(delay = 180) {
   clearTimeout(S._workbenchTimer);
   S._workbenchTimer = setTimeout(() => loadWorkbenchState(S.currentId, true), delay);
+}
+function scheduleBranchConversationResync(fid, delay = 120) {
+  clearTimeout(S._branchConversationTimer);
+  S._branchConversationTimer = setTimeout(() => { if (S.currentId === fid) openConversation(fid, S.project); }, delay);
 }
 function latestCellForLanguage(language) {
   return (S.cells || []).concat(S.liveCells || []).filter(cell => String(cell.language || cell.kernel_id || "python").toLowerCase().startsWith(language)).slice(-1)[0] || null;
@@ -1918,6 +2325,8 @@ function runtimeSummary() {
   const owner = ownerTicket && ownerTicket.owner || {};
   const recovery = S.recoveryState || {};
   const recoveryStatus = String(recovery.status || "").toLowerCase();
+  const trustState = publicText(recovery.trust_state || (S.recoveryActions || {}).trust_state || (_kc.st || {}).trust_state, 32);
+  const viewOnly = recovery.view_only === true || (S.recoveryActions || {}).view_only === true || (_kc.st || {}).view_only === true;
   let status = "ended";
   if (/fail|error/.test(recoveryStatus)) status = "failed";
   else if (/partial/.test(recoveryStatus)) status = "partial";
@@ -1931,6 +2340,7 @@ function runtimeSummary() {
   const rGeneration = recovery.r_generation_id || (rCell && rCell.generation_id);
   return {
     status, branch: publicText(branch, 96), python: publicText(pyGeneration, 96), r: publicText(rGeneration, 96),
+    viewOnly, trustState,
     revision: stateRevision || null, owner: publicText(owner.kind || (ownerTicket && ownerTicket.owner_kind), 48),
     ownerId: publicText(owner.id || (ownerTicket && ownerTicket.owner_id), 96),
     queue: Number(queue.queued_count || (queue.queue || []).length || 0)
@@ -1948,6 +2358,7 @@ function runtimeSummaryNode(compact = false) {
   item("runtime.revision", runtime.revision == null ? t("runtime.none") : "S" + runtime.revision);
   item("runtime.owner", runtime.owner ? runtime.owner + (runtime.ownerId ? " · " + shortRuntime(runtime.ownerId) : "") : t("runtime.none"), runtime.ownerId);
   item("runtime.queue", String(runtime.queue));
+  if (runtime.viewOnly && runtime.trustState === "quarantined") item("runtime.trust", t("runtime.trust.quarantined"));
   return root;
 }
 function timelineKind(group) {
@@ -1973,6 +2384,11 @@ function timelineDuration(attempt) {
   if (start == null || end == null || end < start) return "";
   const ms = end - start; return ms < 1000 ? Math.round(ms) + " ms" : (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + " s";
 }
+function timelineCost(value) {
+  if (value == null || !Number.isFinite(+value) || +value < 0) return "";
+  const amount = +value;
+  return "$" + (amount < 0.01 ? amount.toFixed(6) : amount.toFixed(4));
+}
 function timelineMeta(label, value) {
   if (value == null || value === "" || (Array.isArray(value) && !value.length)) return null;
   const row = el("div", "timeline-meta"); row.appendChild(el("span", "timeline-meta-key", label));
@@ -1997,16 +2413,59 @@ function actionTimelineCard(group) {
     timelineMeta(t("timeline.artifacts"), artifacts),
     timelineMeta(t("timeline.generation"), latest && latest.generation_id),
     timelineMeta(t("timeline.replay"), group.replay_policy || (latest && latest.replayed_from_cell_id ? "replayed" : "original")),
-    timelineMeta(t("timeline.duration"), timelineDuration(latest))
+    timelineMeta(t("timeline.duration"), timelineDuration(latest)),
+    timelineMeta(t("timeline.tokens"), t("timeline.tokensValue", (group.usage || {}).input_tokens || 0, (group.usage || {}).output_tokens || 0)),
+    timelineMeta(t("timeline.cost"), timelineCost(group.cost))
   ].filter(Boolean).forEach(node => card.appendChild(node));
   if (latest && latest.error) card.appendChild(el("div", "timeline-error", latest.error));
   return card;
 }
-function recoveryTimelineCard(state) {
-  const card = el("article", "timeline-card kind-recovery status-" + publicText(state.status || "recovery", 32)); card.setAttribute("data-action-kind", "recovery");
-  const head = el("div", "timeline-card-head"), kind = el("span", "timeline-kind"); kind.appendChild(iconEl("refresh", 14)); kind.appendChild(el("span", null, t("timeline.kind.recovery"))); head.appendChild(kind); head.appendChild(el("span", "timeline-status", publicText(state.status || "recovery", 32))); card.appendChild(head);
+function recoveryIsCurrentBranch(actions) {
+  if (!actions || !S.currentId) return false;
+  const projectedBranch = publicText(S.branchState && S.branchState.branch_id, 96) || S.currentId;
+  return actions.root_frame_id === S.currentId && actions.branch_id === projectedBranch;
+}
+async function executeRecoveryAction(actionId) {
+  const projection = S.recoveryActions;
+  const action = projection && (projection.actions || []).find(item => item.id === actionId);
+  if (!RECOVERY_ACTION_IDS.includes(actionId) || !action || !action.enabled || !recoveryIsCurrentBranch(projection) || S._recoveryActionLoading) return;
+  if (actionId === "restart_fresh" && !confirm(t("recovery.freshConfirm"))) return;
+  const frameId = S.currentId;
+  S._recoveryActionLoading = actionId; delete S.workbenchErrors.recoveryAction; renderActionTimeline();
+  try {
+    await api(`/frames/${frameId}/recovery/actions/${actionId}`, {
+      method: "POST", body: JSON.stringify({ branch_id: projection.branch_id, confirm: actionId === "restart_fresh" })
+    });
+    await Promise.all([loadWorkbenchState(frameId, true), loadExecutionLog(frameId)]);
+    if (S.currentId === frameId) hint(t("recovery.action.done"));
+  } catch (error) {
+    if (S.currentId === frameId) S.workbenchErrors.recoveryAction = publicText(error && error.message, 240);
+  } finally {
+    if (S.currentId === frameId && S._recoveryActionLoading === actionId) {
+      S._recoveryActionLoading = null; renderActionTimeline();
+    }
+  }
+}
+function recoveryTimelineCard(state, actionsState) {
+  const hasActionsProjection = !!actionsState;
+  state = state || {}; actionsState = actionsState || sanitizeRecoveryActions({});
+  const status = publicText(state.status || actionsState.state || "none", 32);
+  const statusClass = String(status).toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+  const card = el("article", "timeline-card kind-recovery status-" + statusClass); card.setAttribute("data-action-kind", "recovery");
+  const head = el("div", "timeline-card-head"), kind = el("span", "timeline-kind"); kind.appendChild(iconEl("refresh", 14)); kind.appendChild(el("span", null, t("recovery.title"))); head.appendChild(kind); head.appendChild(el("span", "timeline-status", status)); card.appendChild(head);
   if (state.message) card.appendChild(el("div", "timeline-card-title", state.message));
+  if (actionsState.checkpoint_id) card.appendChild(el("div", "recovery-checkpoint", t("recovery.checkpoint", shortRuntime(actionsState.checkpoint_id))));
   if (state.progress != null) { const track = el("div", "recovery-progress"); const bar = el("span"); bar.style.width = Math.round(state.progress * 100) + "%"; track.appendChild(bar); card.appendChild(track); }
+  const currentBranch = recoveryIsCurrentBranch(actionsState), list = el("div", "recovery-action-list");
+  (actionsState.actions || []).forEach(action => {
+    const row = el("div", "recovery-action-row");
+    const loading = S._recoveryActionLoading === action.id;
+    const reason = !hasActionsProjection ? t("recovery.action.unavailable") : (!currentBranch ? t("recovery.action.currentOnly") : (action.reason || t("recovery.action.ready")));
+    row.appendChild(disabledWorkbenchButton(loading ? t("recovery.action.loading") : t("recovery.action." + action.id), !!(currentBranch && action.enabled && !S._recoveryActionLoading), () => executeRecoveryAction(action.id), reason));
+    row.appendChild(el("span", "recovery-action-reason", reason)); list.appendChild(row);
+  });
+  card.appendChild(list);
+  if (S.workbenchErrors.recoveryAction) card.appendChild(el("div", "timeline-error", t("recovery.action.failed", S.workbenchErrors.recoveryAction)));
   (state.log || []).slice(-12).forEach(entry => { const row = el("div", "recovery-log-row"); row.appendChild(el("span", "timeline-pill", entry.status || "event")); row.appendChild(el("span", "recovery-log-message", entry.message || "")); card.appendChild(row); });
   return card;
 }
@@ -2014,51 +2473,121 @@ function panelShell(title, className) {
   const panel = el("section", "workbench-panel " + className); panel.appendChild(el("div", "workbench-panel-title", title)); return panel;
 }
 function branchCapability(name) { return !!(S.branchState && S.branchState.capabilities && S.branchState.capabilities[name]); }
-function disabledWorkbenchButton(label, enabled, action) {
-  const button = el("button", "outline-btn small", label); button.disabled = !enabled; button.title = enabled ? label : t("nb.action.unavailable"); if (enabled) button.onclick = action; return button;
+function branchCapabilityReason(name) { return publicText(S.branchState && S.branchState.capability_reasons && S.branchState.capability_reasons[name], 200); }
+function disabledWorkbenchButton(label, enabled, action, disabledReason) {
+  const button = el("button", "outline-btn small", label); button.disabled = !enabled; button.title = enabled ? label : (disabledReason || t("nb.action.unavailable")); if (enabled) button.onclick = action; return button;
 }
 async function createSessionCheckpoint() {
-  if (!S.currentId || !branchCapability("checkpoint")) return;
-  try { await api(`/frames/${S.currentId}/branches/checkpoints`, { method: "POST", body: JSON.stringify({ branch_id: (S.branchState || {}).branch_id }) }); await loadWorkbenchState(S.currentId, true); }
-  catch (error) { hint(t("nb.action.failed", error.message), true); }
+  if (!S.currentId || !branchCapability("checkpoint") || S._branchActionLoading) return;
+  const frameId = S.currentId; S._branchActionLoading = "checkpoint"; delete S.workbenchErrors.branchAction; renderActionTimeline();
+  try { await api(`/frames/${frameId}/branches/checkpoints`, { method: "POST", body: JSON.stringify({ branch_id: (S.branchState || {}).branch_id }) }); await loadWorkbenchState(frameId, true); }
+  catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); } }
+}
+async function forkSessionCheckpoint(checkpointId) {
+  if (!S.currentId || !branchCapability("fork") || !checkpointId || S._branchActionLoading) return;
+  checkpointId = publicText(checkpointId, 96);
+  const requestedName = prompt(t("branch.forkName"), t("branch.forkDefault", shortRuntime(checkpointId)));
+  if (requestedName === null) return;
+  const name = publicText(String(requestedName).trim(), 120), frameId = S.currentId;
+  S._branchActionLoading = "fork:" + checkpointId; delete S.workbenchErrors.branchAction; renderActionTimeline();
+  try {
+    const body = { from_checkpoint_id: checkpointId }; if (name) body.name = name;
+    await api(`/frames/${frameId}/branches/fork`, { method: "POST", body: JSON.stringify(body) });
+    await loadWorkbenchState(frameId, true); if (S.currentId === frameId) hint(t("branch.forked", shortRuntime(checkpointId)));
+  } catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); } }
+}
+async function activateSessionBranch(branchId) {
+  branchId = publicText(branchId, 96);
+  if (!S.currentId || !branchId || !branchCapability("activate") || S._branchActionLoading) return;
+  const frameId = S.currentId; S._branchActionLoading = "activate:" + branchId; delete S.workbenchErrors.branchAction; renderActionTimeline();
+  try {
+    const result = await api(`/frames/${encodeURIComponent(frameId)}/branches/${encodeURIComponent(branchId)}/activate`, { method: "POST", body: "{}" });
+    invalidateKernelCache(); S.cells = []; S.liveCells = []; S._liveCell = null; S.pendingReplIdentity = null;
+    await openConversation(frameId, S.project);
+    if (S.currentId === frameId) {
+      const partial = String(result && result.status || "").toLowerCase() !== "active";
+      hint(t(partial ? "branch.activatedPartial" : "branch.activated", shortRuntime(branchId)), partial);
+    }
+  } catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); renderNotebook(); } }
 }
 async function previewSessionRevert(checkpointId) {
-  if (!S.currentId || !branchCapability("revert_preview")) return;
+  if (!S.currentId || !branchCapability("revert_preview") || S._branchActionLoading) return;
+  const frameId = S.currentId; S._branchActionLoading = "preview:" + checkpointId; delete S.workbenchErrors.branchAction; renderActionTimeline();
   try {
-    const preview = await api(`/frames/${S.currentId}/branches/revert-preview`, { method: "POST", body: JSON.stringify({ branch_id: (S.branchState || {}).branch_id, target_checkpoint_id: checkpointId }) });
-    S.branchState.revert_preview = sanitizeRevertPreview(preview.preview || preview); renderActionTimeline();
-  } catch (error) { hint(t("nb.action.failed", error.message), true); }
+    const preview = await api(`/frames/${frameId}/branches/revert-preview`, { method: "POST", body: JSON.stringify({ branch_id: (S.branchState || {}).branch_id, target_checkpoint_id: checkpointId }) });
+    if (S.currentId === frameId && S.branchState) S.branchState.revert_preview = sanitizeRevertPreview(preview.preview || preview);
+  } catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); } }
 }
 async function applySessionRevert() {
   const preview = S.branchState && S.branchState.revert_preview;
-  if (!preview || !preview.can_apply || !branchCapability("revert")) return;
+  if (!preview || !preview.can_apply || !branchCapability("revert") || S._branchActionLoading) return;
+  const frameId = S.currentId; S._branchActionLoading = "revert"; delete S.workbenchErrors.branchAction; renderActionTimeline();
   try {
-    await api(`/frames/${S.currentId}/branches/revert`, { method: "POST", body: JSON.stringify({ branch_id: preview.branch_id, target_checkpoint_id: preview.target_checkpoint_id }) });
-    await loadWorkbenchState(S.currentId, true); loadExecutionLog(S.currentId);
-  } catch (error) { hint(t("nb.action.failed", error.message), true); }
+    const response = await api(`/frames/${frameId}/branches/revert`, { method: "POST", body: JSON.stringify({ branch_id: preview.branch_id, target_checkpoint_id: preview.target_checkpoint_id }) });
+    const safe = sanitizeRevertMutationResult(response);
+    const undo = safe.ok && safe.revert_checkpoint_id ? { branch_id: safe.branch_id || preview.branch_id, revert_checkpoint_id: safe.revert_checkpoint_id } : null;
+    await openConversation(frameId, S.project);
+    if (S.currentId === frameId && undo && undo.branch_id === (S.branchState || {}).branch_id) { S.branchUndo = undo; renderActionTimeline(); }
+  } catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); } }
+}
+async function undoSessionRevert() {
+  const undo = S.branchUndo;
+  if (!S.currentId || !undo || undo.branch_id !== (S.branchState || {}).branch_id || !undo.revert_checkpoint_id || S._branchActionLoading) return;
+  const frameId = S.currentId; S._branchActionLoading = "undo"; delete S.workbenchErrors.branchAction; renderActionTimeline();
+  try {
+    await api(`/frames/${frameId}/revert/undo`, { method: "POST", body: JSON.stringify({ branch_id: undo.branch_id, revert_checkpoint_id: undo.revert_checkpoint_id }) });
+    S.branchUndo = null; await openConversation(frameId, S.project);
+    if (S.currentId === frameId) hint(t("branch.undone"));
+  } catch (error) { if (S.currentId === frameId) S.workbenchErrors.branchAction = publicText(error && error.message, 240); }
+  finally { if (S.currentId === frameId) { S._branchActionLoading = null; renderActionTimeline(); } }
 }
 function renderBranchPanel() {
   const panel = panelShell(t("timeline.panel.branches"), "branch-panel"), state = S.branchState;
-  const controls = el("div", "workbench-controls"); controls.appendChild(disabledWorkbenchButton(t("branch.checkpoint"), branchCapability("checkpoint"), createSessionCheckpoint)); panel.appendChild(controls);
+  const busy = !!S._branchActionLoading, controls = el("div", "workbench-controls");
+  controls.appendChild(disabledWorkbenchButton(S._branchActionLoading === "checkpoint" ? t("common.loading") : t("branch.checkpoint"), !!(branchCapability("checkpoint") && !busy), createSessionCheckpoint, branchCapabilityReason("checkpoint")));
+  if (S.branchUndo && S.branchUndo.branch_id === (state || {}).branch_id) controls.appendChild(disabledWorkbenchButton(S._branchActionLoading === "undo" ? t("common.loading") : t("branch.undo"), !busy, undoSessionRevert));
+  panel.appendChild(controls);
+  if (state && state.branch_id) panel.appendChild(el("div", "branch-current-summary", t("branch.currentSummary", shortRuntime(state.branch_id))));
+  if (S.workbenchErrors.branchAction) panel.appendChild(el("div", "timeline-error", t("branch.actionFailed", S.workbenchErrors.branchAction)));
   if (!state || !(state.branches || []).length) { panel.appendChild(el("div", "workbench-empty", t("timeline.noBranch"))); return panel; }
   (state.branches || []).forEach(branch => {
     const row = el("div", "branch-row" + (branch.branch_id === state.branch_id ? " current" : ""));
     const head = el("div", "branch-head"); head.appendChild(el("span", "branch-name", branch.name || shortRuntime(branch.branch_id)));
     if (branch.branch_id === state.branch_id) head.appendChild(el("span", "timeline-pill", t("branch.current")));
+    else {
+      head.appendChild(el("span", "timeline-pill", t("branch.viewOnly")));
+      head.appendChild(disabledWorkbenchButton(S._branchActionLoading === "activate:" + branch.branch_id ? t("branch.activating") : t("branch.activate"), !!(branch.activatable && branchCapability("activate") && !busy), () => activateSessionBranch(branch.branch_id), branchCapabilityReason("activate")));
+    }
     if (branch.head_checkpoint_id) head.appendChild(el("span", "branch-head-id", t("branch.head", shortRuntime(branch.head_checkpoint_id)))); row.appendChild(head);
-    const cps = el("div", "checkpoint-list"); (branch.checkpoints || []).slice(-8).reverse().forEach(cp => {
+    const cps = el("div", "checkpoint-list"), allCheckpoints = branch.checkpoints || [];
+    const checkpointRow = cp => {
       const cpRow = el("div", "checkpoint-row"); cpRow.appendChild(el("span", "checkpoint-id", shortRuntime(cp.checkpoint_id)));
       cpRow.appendChild(el("span", "checkpoint-reason", cp.reason || "checkpoint"));
-      cpRow.appendChild(disabledWorkbenchButton(t("branch.preview"), branchCapability("revert_preview"), () => previewSessionRevert(cp.checkpoint_id))); cps.appendChild(cpRow);
-    }); row.appendChild(cps); panel.appendChild(row);
+      const actions = el("span", "checkpoint-actions");
+      actions.appendChild(disabledWorkbenchButton(S._branchActionLoading === "fork:" + cp.checkpoint_id ? t("common.loading") : t("branch.fork"), !!(branchCapability("fork") && !busy), () => forkSessionCheckpoint(cp.checkpoint_id), branchCapabilityReason("fork")));
+      actions.appendChild(disabledWorkbenchButton(S._branchActionLoading === "preview:" + cp.checkpoint_id ? t("common.loading") : t("branch.preview"), !!(branchCapability("revert_preview") && !busy), () => previewSessionRevert(cp.checkpoint_id), branchCapabilityReason("revert_preview")));
+      cpRow.appendChild(actions); return cpRow;
+    };
+    allCheckpoints.filter(cp => !cp.internal).slice(0, 8).forEach(cp => cps.appendChild(checkpointRow(cp)));
+    const internalCheckpoints = allCheckpoints.filter(cp => cp.internal);
+    if (internalCheckpoints.length) {
+      const collapsed = el("details", "internal-checkpoints"); collapsed.appendChild(el("summary", null, t("branch.internalCheckpoints", internalCheckpoints.length)));
+      const internalList = el("div", "checkpoint-list"); internalCheckpoints.slice(0, 20).forEach(cp => internalList.appendChild(checkpointRow(cp))); collapsed.appendChild(internalList); cps.appendChild(collapsed);
+    }
+    row.appendChild(cps); panel.appendChild(row);
   });
   const preview = state.revert_preview;
   if (preview) {
     const box = el("div", "revert-preview"); box.appendChild(el("div", "revert-preview-title", t("branch.previewTitle") + " · " + shortRuntime(preview.target_checkpoint_id)));
-    const arts = preview.artifacts || { added: [], removed: [] }, ws = preview.workspace || { writes: [], deletes: [], conflicts: [] };
-    box.appendChild(el("div", "revert-diff", t("branch.diff", (preview.messages || {}).delta || 0, (preview.notebook || {}).delta || 0, ws.writes.length, ws.deletes.length, arts.added.length, arts.removed.length)));
-    if (ws.conflicts.length) box.appendChild(el("div", "timeline-error", t("branch.conflict")));
-    box.appendChild(disabledWorkbenchButton(t("branch.revert"), !!(preview.can_apply && branchCapability("revert")), applySessionRevert)); panel.appendChild(box);
+    const arts = preview.artifacts || {}, ws = preview.workspace || {};
+    box.appendChild(el("div", "revert-diff", t("branch.diff", (preview.messages || {}).delta || 0, (preview.notebook || {}).delta || 0, ws.writes_count || 0, ws.deletes_count || 0, arts.added_count || 0, arts.removed_count || 0)));
+    if (ws.conflicts_count) box.appendChild(el("div", "timeline-error", t("branch.conflict")));
+    box.appendChild(disabledWorkbenchButton(S._branchActionLoading === "revert" ? t("common.loading") : t("branch.revert"), !!(preview.can_apply && branchCapability("revert") && !busy), applySessionRevert, branchCapabilityReason("revert"))); panel.appendChild(box);
   }
   return panel;
 }
@@ -2067,9 +2596,24 @@ function renderContextPanel() {
   if (!state || !(state.layers || []).length) { panel.appendChild(el("div", "workbench-empty", t("timeline.noContext"))); return panel; }
   const summary = el("div", "context-summary");
   if (state.token_count != null) summary.appendChild(el("span", "timeline-pill", t("context.tokens", state.token_count) + (state.token_limit ? " / " + state.token_limit : "")));
+  if (state.output_reserve) summary.appendChild(el("span", "timeline-pill", t("context.outputReserve", state.output_reserve)));
+  if (state.message_count != null) summary.appendChild(el("span", "timeline-pill", t("context.messages", state.message_count)));
   if (state.compressed) summary.appendChild(el("span", "timeline-pill", t("context.compressed")));
   if (state.handoff) summary.appendChild(el("span", "timeline-pill", t("context.handoff"))); panel.appendChild(summary);
-  state.layers.forEach(layer => { const row = el("div", "context-layer"); row.appendChild(el("span", "context-layer-name", layer.name || layer.kind || "context")); if (layer.token_count != null) row.appendChild(el("span", "context-layer-tokens", t("context.tokens", layer.token_count))); if (layer.status) row.appendChild(el("span", "timeline-pill", layer.status)); panel.appendChild(row); }); return panel;
+  state.layers.forEach(layer => { const row = el("div", "context-layer"); row.appendChild(el("span", "context-layer-name", layer.name || layer.kind || "context")); if (layer.token_count != null) row.appendChild(el("span", "context-layer-tokens", t("context.tokens", layer.token_count))); if (layer.status) row.appendChild(el("span", "timeline-pill", layer.status)); panel.appendChild(row); });
+  if ((state.compaction_history || []).length) {
+    const history = el("details", "context-history"); history.appendChild(el("summary", null, t("context.history", state.compaction_count || state.compaction_history.length)));
+    state.compaction_history.forEach(item => {
+      const row = el("div", "context-history-row");
+      row.appendChild(el("span", "context-history-id", shortRuntime(item.archive_id) || t("context.compaction")));
+      row.appendChild(el("span", "context-layer-tokens", t("context.savings", item.tokens_before, item.tokens_after)));
+      if (item.message_count) row.appendChild(el("span", "timeline-pill", t("context.messages", item.message_count)));
+      if (item.artifact_count) row.appendChild(el("span", "timeline-pill", t("context.artifacts", item.artifact_count)));
+      history.appendChild(row);
+    });
+    panel.appendChild(history);
+  }
+  return panel;
 }
 function renderSecurityPanel() {
   const panel = panelShell(t("timeline.panel.security"), "security-panel"), state = S.securityState;
@@ -2085,13 +2629,41 @@ function renderSecurityPanel() {
   row(t("security.permission"), [permission.mode || "unknown", permission.pending_count ? t("security.pending", permission.pending_count) : ""]);
   if (sandbox.detail) panel.appendChild(el("div", "security-detail", sandbox.detail)); return panel;
 }
+function renderDelegationPanel() {
+  const panel = panelShell(t("timeline.panel.delegation"), "delegation-panel"), state = S.delegationState;
+  if (!state || !(state.children || []).length) {
+    panel.appendChild(el("div", "workbench-empty", t("timeline.noDelegation")));
+    return panel;
+  }
+  const summary = el("div", "delegation-summary"), budget = state.budget || {};
+  if (state.budget) summary.appendChild(el("span", "timeline-pill", t("delegation.budget", budget.spawned || 0, budget.limit || 0)));
+  summary.appendChild(el("span", "timeline-pill", t("delegation.active", budget.active || (state.stats || {}).running || 0)));
+  panel.appendChild(summary);
+  (state.children || []).forEach(child => {
+    const row = el("div", "delegation-child status-" + String(child.status || "unknown").toLowerCase());
+    row.style.setProperty("--delegation-indent", Math.min(child.depth || 0, 4) * 10 + "px");
+    const head = el("div", "delegation-child-head");
+    head.appendChild(el("span", "delegation-child-name", child.name || shortRuntime(child.child_id)));
+    head.appendChild(el("span", "timeline-status " + String(child.status || "unknown").toLowerCase(), child.status || "unknown"));
+    row.appendChild(head);
+    const details = el("div", "delegation-child-details");
+    if (child.progress && child.progress.max_turns) details.appendChild(el("span", "timeline-pill", t("delegation.turns", child.progress.turn_boundary || 0, child.progress.max_turns)));
+    if (child.overrides && child.overrides.model) details.appendChild(el("span", "timeline-pill", child.overrides.model));
+    if (child.overrides && child.overrides.steps) details.appendChild(el("span", "timeline-pill", "steps " + child.overrides.steps));
+    if (child.steering && (child.steering.queued || child.steering.delivered)) details.appendChild(el("span", "timeline-pill", t("delegation.steering", child.steering.queued || 0, child.steering.delivered || 0)));
+    row.appendChild(details);
+    if (child.error || child.stop_reason) row.appendChild(el("div", "delegation-child-message", child.error || child.stop_reason));
+    panel.appendChild(row);
+  });
+  return panel;
+}
 function renderActionTimeline() {
   const root = $("#dock-timeline"); if (!root) return; root.innerHTML = "";
   const top = el("div", "timeline-top"); const heading = el("div"); heading.appendChild(el("div", "timeline-title", t("timeline.title"))); heading.appendChild(el("div", "timeline-subtitle", t("timeline.subtitle"))); top.appendChild(heading);
   const refresh = ghostIconBtn("refresh", t("timeline.refresh")); refresh.onclick = () => loadWorkbenchState(S.currentId, true); top.appendChild(refresh); root.appendChild(top);
   root.appendChild(runtimeSummaryNode(false));
   const layout = el("div", "workbench-layout"), side = el("div", "workbench-side"), actions = el("section", "timeline-actions");
-  side.appendChild(renderBranchPanel()); side.appendChild(renderContextPanel()); side.appendChild(renderSecurityPanel()); layout.appendChild(side);
+  side.appendChild(renderBranchPanel()); side.appendChild(renderDelegationPanel()); side.appendChild(renderContextPanel()); side.appendChild(renderSecurityPanel()); layout.appendChild(side);
   const timeline = S.actionTimeline || {}, groups = timeline.groups || [];
   if (timeline.has_more_before) {
     const controls = el("div", "workbench-controls timeline-history-controls");
@@ -2103,7 +2675,7 @@ function renderActionTimeline() {
   }
   if (S.workbenchErrors.timelineHistory) actions.appendChild(el("div", "timeline-error", t("timeline.loadEarlierFailed", S.workbenchErrors.timelineHistory)));
   if (timeline.history_limit_reached) actions.appendChild(el("div", "workbench-empty", t("timeline.historyLimit", ACTION_TIMELINE_MAX_GROUPS)));
-  if (S.recoveryState && (S.recoveryState.status || (S.recoveryState.log || []).length)) actions.appendChild(recoveryTimelineCard(S.recoveryState));
+  if (S.recoveryActions || (S.recoveryState && (S.recoveryState.status || (S.recoveryState.log || []).length))) actions.appendChild(recoveryTimelineCard(S.recoveryState, S.recoveryActions));
   if (!groups.length && !actions.children.length) actions.appendChild(el("div", "workbench-empty timeline-empty", S._workbenchLoading ? t("timeline.loading") : t("timeline.empty")));
   else groups.slice().sort((a, b) => (+a.ordinal || 0) - (+b.ordinal || 0)).forEach(group => actions.appendChild(actionTimelineCard(group)));
   layout.appendChild(actions); root.appendChild(layout);
@@ -2126,6 +2698,7 @@ function onEvent(m) {
   if (m.type === "replay_begin") { if (mine(fid)) { if (S.stream && S.stream.wrap) S.stream.wrap.remove(); S.stream = null; S.liveCells = []; S._liveCell = null; } }
   else if (m.type === "replay_end") { if (mine(fid)) down(); }
   else if (m.type === "text_reset") { if (mine(fid)) startStream(); }
+  else if (m.type === "notebook_cell_draft") { if (mine(fid)) nbCellDraft(m); }
   else if (m.type === "notebook_cell_start") { if (mine(fid)) nbCellStart(m); }
   else if (m.type === "notebook_cell_chunk") { if (mine(fid)) nbCellChunk(m); }
   else if (m.type === "notebook_cell_finished") { if (mine(fid)) { nbCellFinished(m); scheduleWorkbenchRefresh(); } }
@@ -2147,12 +2720,18 @@ function onEvent(m) {
     const next = sanitizeRecovery(m), previous = S.recoveryState;
     if (previous && m.type === "recovery_log") S.recoveryState = { ...previous, ...Object.fromEntries(Object.entries(next).filter(([, value]) => value != null && value !== "")), log: (previous.log || []).concat(next.log || []).slice(-50) };
     else S.recoveryState = next;
+    if (m.type === "recovery_state" || ["completed", "failed", "partial", "cancelled"].includes(String(m.status || m.state || "").toLowerCase())) scheduleWorkbenchRefresh(120);
     if (S.activeTab === "timeline") renderActionTimeline(); if (S.activeTab === "notebook") renderNotebook();
   } }
-  else if (["branch", "branch_state", "checkpoint", "checkpoint_created", "branch_created", "branch_reverted", "branch_revert_conflict"].includes(m.type)) { if (mine(fid)) {
-    if (m.branches || (m.payload && m.payload.branches)) S.branchState = sanitizeBranches(m);
-    else scheduleWorkbenchRefresh(80);
+  else if (["branch", "branch_state", "branch_activation_state", "branch_projection_restored", "checkpoint", "checkpoint_created", "branch_created", "branch_reverted", "branch_revert_conflict"].includes(m.type)) { if (mine(fid)) {
+    if (m.type === "branch_projection_restored" || (m.type === "branch_activation_state" && m.branch_id)) { scheduleBranchConversationResync(fid); return; }
+    if (m.type === "branch_reverted" && m.ok === true && publicText(m.branch_id, 96) === publicText(S.branchState && S.branchState.branch_id, 96) && publicText(m.checkpoint_id, 96)) S.branchUndo = { branch_id: publicText(m.branch_id, 96), revert_checkpoint_id: publicText(m.checkpoint_id, 96) };
+    if (m.branches || (m.payload && m.payload.branches)) { S.branchState = sanitizeBranches(m); S.branchUndo = branchUndoFromProjection(S.branchState); }
+    else scheduleWorkbenchRefresh(m.type === "branch_activation_state" ? 0 : 80);
     if (S.activeTab === "timeline") renderActionTimeline(); if (S.activeTab === "notebook") renderNotebook();
+  } }
+  else if (["delegation_child_event", "delegation_state", "delegation_progress", "delegation_steering"].includes(m.type)) { if (mine(fid)) {
+    scheduleWorkbenchRefresh(60); if (S.activeTab === "timeline") renderActionTimeline();
   } }
   else if (["sandbox", "sandbox_status", "security_status"].includes(m.type)) { if (mine(fid)) { S.securityState = sanitizeSecurity(m); if (S.activeTab === "timeline") renderActionTimeline(); } }
   else if (m.type === "text_chunk") { if (mine(fid)) feed(m.block_type || "text", m.chunk || "", m); }
@@ -2216,6 +2795,17 @@ function onEvent(m) {
 const mine = (f) => f && S.currentId && f === S.currentId;
 
 /* ---------- streaming ---------- */
+const LIVE_OUTPUT_CHAR_CAP = 1000000;
+const LIVE_OUTPUT_TRUNCATION = "\n...(live output truncated)";
+function appendLiveOutput(current, chunk) {
+  const existing = String(current || ""), addition = String(chunk || "");
+  if (existing.includes(LIVE_OUTPUT_TRUNCATION)) return existing;
+  if (existing.length >= LIVE_OUTPUT_CHAR_CAP) return existing.slice(0, LIVE_OUTPUT_CHAR_CAP) + LIVE_OUTPUT_TRUNCATION;
+  const remaining = LIVE_OUTPUT_CHAR_CAP - existing.length;
+  return addition.length > remaining
+    ? existing + addition.slice(0, remaining) + LIVE_OUTPUT_TRUNCATION
+    : existing + addition;
+}
 // Batch markdown re-renders onto animation frames: a fast token stream would
 // otherwise reparse the whole message on every chunk (janky, and it makes the
 // caret strobe as the subtree is torn down each token).
@@ -2276,7 +2866,7 @@ function feed(kind, chunk, event) {
       if (!suba && !structuredCellId) nbLiveStart(tool, raw, event && event.kernel_id, event && event.cell_index, event && event.language);
     } else if (st.toolPre) {
       const add = chunk.replace(/^↳\s*/, "");
-      st.toolPre.textContent += add;
+      st.toolPre.textContent = appendLiveOutput(st.toolPre.textContent, add);
       if (st.toolMeta) { const n = (st.toolPre.textContent.match(/\n/g) || []).length; st.toolMeta.textContent = n > 1 ? (n + (n === 1 ? " line" : " lines")) : "done"; }
       if (!structuredCellId) nbLiveAppend(add);
     }
@@ -2956,6 +3546,76 @@ function stopDashPoll() { if (S._dashPoll) { clearInterval(S._dashPoll); S._dash
 
 /* ---------- projects ---------- */
 async function loadProjects() { try { const d = await api("/projects?limit=100&offset=0"); S.projects = (d && d.projects) || []; } catch { S.projects = []; } }
+function sanitizeProjectLineage(payload) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  const nodes = (Array.isArray(source.nodes) ? source.nodes : []).slice(0, 5000).map(item => ({
+    id: publicText(item && item.id, 160), kind: publicText(item && item.kind, 48),
+    artifact_id: publicText(item && item.artifact_id, 120), version_id: publicText(item && item.version_id, 120),
+    filename: publicText(item && item.filename, 240), root_frame_id: publicText(item && item.root_frame_id, 120),
+    cell_id: publicText(item && (item.cell_id || item.producing_cell_id), 120), created_at: item && item.created_at,
+    latest: !!(item && item.latest)
+  })).filter(item => item.id);
+  const ids = new Set(nodes.map(item => item.id));
+  const edges = (Array.isArray(source.edges) ? source.edges : []).slice(0, 10000).map(item => ({
+    from: publicText(item && item.from, 160), to: publicText(item && item.to, 160), kind: publicText(item && item.kind, 48)
+  })).filter(item => ids.has(item.from) && ids.has(item.to));
+  return {
+    project_id: publicText(source.project_id, 120), nodes, edges,
+    artifact_count: Number.isFinite(+source.artifact_count) ? Math.max(0, +source.artifact_count) : 0,
+    version_count: Number.isFinite(+source.version_count) ? Math.max(0, +source.version_count) : 0,
+    truncated: !!source.truncated
+  };
+}
+async function openProjectResearchView(initialTab = "timeline") {
+  if (!S.project) return;
+  const projectId = S.project, mode = "project-research:" + projectId;
+  S._modalMode = mode; $("#modal-title").textContent = t("projectResearch.title", projName(projectId));
+  $("#modal-download").style.display = "none"; const body = $("#modal-body"); body.innerHTML = ""; $("#modal").classList.remove("hidden");
+  const tabs = el("div", "project-research-tabs"), content = el("div", "project-research-content"); body.appendChild(tabs); body.appendChild(content);
+  const cache = { timeline: null, lineage: null };
+  const renderTimeline = data => {
+    content.innerHTML = "";
+    const summary = el("div", "project-research-summary", t("projectResearch.timelineSummary", data.session_count || 0, data.total_count || data.count || 0)); content.appendChild(summary);
+    if (!(data.groups || []).length) { content.appendChild(el("div", "dock-empty", t("timeline.empty"))); return; }
+    (data.groups || []).forEach(group => {
+      const wrapper = el("div", "project-timeline-entry");
+      if (group.session) wrapper.appendChild(el("div", "project-session-label", group.session.name || shortRuntime(group.session.root_frame_id)));
+      wrapper.appendChild(actionTimelineCard(group)); content.appendChild(wrapper);
+    });
+  };
+  const renderLineage = data => {
+    content.innerHTML = "";
+    content.appendChild(el("div", "project-research-summary", t("projectResearch.lineageSummary", data.artifact_count, data.version_count, data.edges.length)));
+    const byId = new Map((data.nodes || []).map(item => [item.id, item]));
+    (data.nodes || []).filter(item => item.kind === "artifact_version").forEach(item => {
+      const row = el("div", "project-lineage-node"); row.appendChild(el("span", "project-lineage-name", item.filename || shortRuntime(item.version_id)));
+      if (item.latest) row.appendChild(el("span", "timeline-pill", t("projectResearch.latest")));
+      if (item.cell_id) row.appendChild(el("span", "project-lineage-cell", shortRuntime(item.cell_id))); content.appendChild(row);
+    });
+    if (!(data.nodes || []).some(item => item.kind === "artifact_version")) content.appendChild(el("div", "dock-empty", t("projectResearch.noLineage")));
+    if ((data.edges || []).length) {
+      const edges = el("details", "project-lineage-edges"); edges.appendChild(el("summary", null, t("projectResearch.edges", data.edges.length)));
+      data.edges.slice(0, 500).forEach(edge => {
+        const from = byId.get(edge.from), to = byId.get(edge.to);
+        edges.appendChild(el("div", "project-lineage-edge", (from && (from.filename || from.cell_id) || shortRuntime(edge.from)) + " → " + (to && (to.filename || to.cell_id) || shortRuntime(edge.to))));
+      }); content.appendChild(edges);
+    }
+  };
+  const select = async tab => {
+    if (S._modalMode !== mode) return;
+    Array.from(tabs.children).forEach(button => button.classList.toggle("active", button.dataset.tab === tab));
+    content.innerHTML = ""; content.appendChild(el("div", "dock-empty", t("common.loading")));
+    try {
+      if (!cache[tab]) cache[tab] = tab === "timeline"
+        ? sanitizeActionTimeline(await api(`/projects/${encodeURIComponent(projectId)}/action-timeline?limit=500`))
+        : sanitizeProjectLineage(await api(`/projects/${encodeURIComponent(projectId)}/lineage?limit=2000`));
+      if (S._modalMode !== mode) return;
+      (tab === "timeline" ? renderTimeline : renderLineage)(cache[tab]);
+    } catch (error) { if (S._modalMode === mode) { content.innerHTML = ""; content.appendChild(el("div", "timeline-error", publicText(error && error.message, 240))); } }
+  };
+  [["timeline", t("projectResearch.timeline")], ["lineage", t("projectResearch.lineage")]].forEach(([key, label]) => { const button = el("button", "seg-btn", label); button.dataset.tab = key; button.onclick = () => select(key); tabs.appendChild(button); });
+  select(initialTab === "lineage" ? "lineage" : "timeline");
+}
 function renderProjMenu() {
   $("#proj-current").textContent = S.project ? projName(S.project) : t("proj.current.allSessions");
   const m = $("#proj-menu"); m.innerHTML = "";
@@ -2967,6 +3627,8 @@ function renderProjMenu() {
   if (S.project) {
     const current = S.projects.find(p => (p.project_id || p.id) === S.project);
     if (current) item(t("proj.menu.settings"), "settings", () => openProjectModal(current));
+    item(t("projectResearch.menu"), "provenance", () => openProjectResearchView("timeline"));
+    item(t("sessionPackage.import"), "cloud-upload", chooseSessionPackage);
     item(t("proj.menu.downloadArtifacts"), "download", () => downloadArtifactBundle(`/api/projects/${encodeURIComponent(S.project)}/artifacts.zip`, `${projName(S.project)}-artifacts.zip`));
     m.appendChild(el("div", "ctx-sep"));
   }
@@ -3126,6 +3788,7 @@ function resumeWatch(fid, gen) {
   S._resumeTimer = setTimeout(tick, 2000);
 }
 async function openConversation(fid, pid) {
+  clearTimeout(S._branchConversationTimer);
   const previousFid = S.currentId;
   if (previousFid && previousFid !== fid) unsub(previousFid);
   if (pid && pid !== S.project) { S.project = pid; S._projArtFor = null; }  // new project → drop cached project-wide Files
@@ -3140,9 +3803,11 @@ async function openConversation(fid, pid) {
   clearTimeout(S._resumeTimer);  // stop any resume-watchdog from the previously open session
   const gen = S._openGen = (S._openGen || 0) + 1;  // guard async continuations against fast session-switching
   S.cells = []; S.kernels = []; S.liveCells = []; S._liveCell = null; S.dockArtifact = null; S.kernelFilter = null;
-  S.actionTimeline = null; S.executionQueue = null; S.executionIdentity = null; S.recoveryState = null;
-  S.branchState = null; S.contextState = null; S.securityState = null;
+  S.actionTimeline = null; S.executionQueue = null; S.executionIdentity = null; S.recoveryState = null; S.recoveryActions = null; S.delegationState = null;
+  S.branchState = null; S.branchUndo = null; S.contextState = null; S.securityState = null;
   S.workbenchErrors = {}; S._timelineHistoryReq = (S._timelineHistoryReq || 0) + 1; S._timelineHistoryLoading = null;
+  S._recoveryActionLoading = null; S._branchActionLoading = null;
+  S.variableInspector = { language: "python", results: {}, loading: null, error: "", request: 0 };
   clearTimeout(S._workbenchTimer); S._workbenchReq = (S._workbenchReq || 0) + 1; S._workbenchLoading = null;
   S._tbl = {}; invalidateKernelCache();  // drop the prior session's table + kernel-state caches
   S.openTabs = []; S.activeTab = "notebook"; S.provMode = false; S.lineage = null; S._lineageFor = null;
@@ -3304,6 +3969,7 @@ function sessionMenu(anchor, fid) {
   } });
   items.push(
     { label: t("sessionMenu.exportMarkdown"), icon: "download", onClick: () => exportSession(fid) },
+    { label: t("sessionPackage.export"), icon: "archive", onClick: () => exportSessionPackage(fid, frame) },
     { label: t("sessionMenu.downloadArtifacts"), icon: "files", onClick: () => downloadArtifactBundle(`/api/frames/${encodeURIComponent(fid)}/artifacts.zip`, `${frame.name || frame.task_summary || "session"}-artifacts.zip`) },
     { label: t("sessionMenu.viewNotebook"), icon: "notebook", onClick: async () => { if (fid !== S.currentId) await openConversation(fid, frame.project_id); setActiveTab("notebook"); } },
     { sep: true },
@@ -3312,6 +3978,37 @@ function sessionMenu(anchor, fid) {
     { label: t("common.delete"), icon: "trash-2", danger: true, onClick: () => { if (confirm(t("confirm.deleteSession"))) deleteSession(fid); } },
   );
   openMenu(anchor, items);
+}
+function exportSessionPackage(fid, frame = {}) {
+  const label = frame.name || frame.task_summary || "session";
+  downloadArtifactBundle(
+    `/api/frames/${encodeURIComponent(fid)}/session/export`,
+    label.replace(/[^\w一-龥-]+/g, "_") + ".openai4s-session.zip",
+  );
+}
+function chooseSessionPackage() {
+  const input = $("#session-package-input");
+  if (input) input.click();
+}
+async function importSessionPackage(file) {
+  if (!file) return;
+  if (file.size > 128 * 1024 * 1024) { hint(t("sessionPackage.tooLarge"), true); return; }
+  try {
+    const response = await fetch("/api/sessions/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.openai4s.session+zip" },
+      body: file,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.root_frame_id || !result.project_id) {
+      throw new Error(result.error || `HTTP ${response.status}`);
+    }
+    await loadProjects();
+    hint(t("sessionPackage.imported"));
+    await openConversation(result.root_frame_id, result.project_id);
+  } catch (error) {
+    hint(t("toast.importFailed", error.message), true);
+  }
 }
 function downloadArtifactBundle(url, filename) {
   const link = document.createElement("a"); link.href = url; link.download = filename || "artifacts.zip";
@@ -3415,6 +4112,11 @@ async function cancelTurn() {
 async function send(text, opts) {
   text = (text || "").trim(); opts = opts || {};
   if (S.running) return;
+  const runtime = runtimeSummary();
+  if (S.currentId && runtime.viewOnly && runtime.trustState === "quarantined") {
+    hint(t("runtime.quarantineHint"), true);
+    return;
+  }
   const anns = openAnnotations();                 // pinned image comments to ride along
   if (!text && !anns.length) return;              // nothing to send
   const planNow = S.planMode && !opts.execute;
@@ -3745,15 +4447,296 @@ function tileThumbBig(a) { const t = tileThumb(a); t.className = "a-thumb"; retu
 
 /* Shared artifact body renderer (used by dock Viewer + fullscreen modal). */
 function artUrl(a) { const b = (S._artBust || {})[a.id]; return `/api/artifacts/${a.id}` + (b ? `?_=${b}` : ""); }
+function scientificRenderers() { return window.OpenAI4SScientificRenderers || null; }
+function artifactRendererVersion(a) { return a && (a.version_id || a.latest_version_id) || ""; }
+function loadRendererCatalog() {
+  if (Array.isArray(S.rendererCatalog)) return Promise.resolve(S.rendererCatalog);
+  if (S._rendererCatalogPromise) return S._rendererCatalogPromise;
+  S._rendererCatalogPromise = api("/renderers").then(result => {
+    const catalog = result && Array.isArray(result.renderers) ? result.renderers.filter(item => item && typeof item.renderer_id === "string") : [];
+    S.rendererCatalog = catalog;
+    return catalog;
+  }).catch(() => {
+    S.rendererCatalog = [];
+    return [];
+  });
+  return S._rendererCatalogPromise;
+}
+function compatibilityRendererDescriptor(a) {
+  const ct = String(a.content_type || "").toLowerCase().split(";", 1)[0];
+  const nm = String(a.filename || "").toLowerCase();
+  let id = "download";
+  if (ct.startsWith("image/") || /\.(png|jpe?g|gif|webp|svg)$/i.test(nm)) id = "image";
+  else if (ct === "application/pdf" || nm.endsWith(".pdf")) id = "pdf";
+  else if (ct === "text/html" || /\.html?$/i.test(nm)) id = "html-preview";
+  else if (/\.(pdb|cif|mmcif|ent|xyz)$/i.test(nm)) id = "molecule-3d";
+  else if (/\.(mol|mol2|sdf|smi|smiles)$/i.test(nm)) id = "chemistry-2d";
+  else if (/\.(bed|bedgraph|gff3?|gtf|vcf)$/i.test(nm)) id = "genome-track";
+  else if (/\.(aln|a2m|a3m|sto|stockholm)$/i.test(nm)) id = "msa";
+  else if (/\.(fa|fasta|faa|fna|fastq|fq)$/i.test(nm)) id = "sequence";
+  else if (/\.(md|markdown|rst)$/i.test(nm)) id = "markdown";
+  else if (/\.tex$/i.test(nm)) id = "latex";
+  else if (/csv|tab-separated/.test(ct) || /\.(csv|tsv)$/i.test(nm)) id = "table";
+  else if (ct.startsWith("text/") || /json/.test(ct) || TEXT_EXT.test(nm)) id = "text";
+  return { artifact_id: a.id, version_id: artifactRendererVersion(a), matched_by: "compatibility", renderer: { renderer_id: id, label: id }, trusted_html: false };
+}
+function artifactRendererDescriptor(a) {
+  const version = artifactRendererVersion(a);
+  const key = `${a.id}:${version || "latest"}`;
+  S.rendererDescriptors = S.rendererDescriptors || {};
+  if (S.rendererDescriptors[key]) return S.rendererDescriptors[key];
+  const suffix = version ? `?version=${encodeURIComponent(version)}` : "";
+  const request = Promise.all([
+    loadRendererCatalog(),
+    api(`/artifacts/${encodeURIComponent(a.id)}/renderer${suffix}`),
+  ]).then(([catalog, descriptor]) => {
+    if (!descriptor || descriptor.artifact_id !== a.id) throw new Error("renderer descriptor does not match artifact");
+    if (version && descriptor.version_id && descriptor.version_id !== version) throw new Error("renderer descriptor does not match artifact version");
+    const runtime = scientificRenderers();
+    const rendererId = runtime ? runtime.rendererIdFromDescriptor(descriptor, catalog) : "download";
+    const catalogRenderer = catalog.find(item => item.renderer_id === rendererId);
+    return {
+      ...descriptor,
+      renderer: catalogRenderer || { renderer_id: rendererId, label: rendererId, capabilities: ["view"], sandboxed: true },
+    };
+  }).catch(error => {
+    delete S.rendererDescriptors[key];
+    throw error;
+  });
+  S.rendererDescriptors[key] = request;
+  return request;
+}
 function renderArtifactBody(body, a) {
-  body.innerHTML = ""; const ct = a.content_type || ""; const nm = (a.filename || "").toLowerCase(); const url = artUrl(a);
-  if (ct.startsWith("image/") || /\.(png|jpe?g|gif|webp|svg)$/i.test(nm)) { renderAnnotatableImage(body, a, url); }
-  else if (ct === "application/pdf" || nm.endsWith(".pdf")) { const f = el("iframe"); f.src = url; body.appendChild(f); }
-  else if (ct === "text/html" || nm.endsWith(".html") || nm.endsWith(".htm")) { const f = el("iframe"); f.setAttribute("sandbox", "allow-scripts allow-forms"); f.src = (S.sandboxOrigin || "") + `/preview/${a.id}`; body.appendChild(f); }
-  else if (/\.(pdb|cif|mol|mol2|sdf|xyz)$/i.test(nm)) molecule(body, url, nm);
-  else if (/\.(md|markdown)$/i.test(nm)) fetch(url).then(r => r.text()).then(t => { const d = el("div", "md"); d.style.padding = "18px"; d.innerHTML = renderMd(t); body.appendChild(d); }).catch(() => {});
-  else if (/csv|json/.test(ct) || /\.(csv|json|tsv)$/i.test(nm)) fetch(url).then(r => r.text()).then(t => { const rows = parseTable(t, a); if (rows && rows.length) { const tbl = el("table", "sheet"); const hr = el("tr"); Object.keys(rows[0]).forEach(k => hr.appendChild(el("th", null, k))); tbl.appendChild(hr); rows.forEach(row => { const tr = el("tr"); Object.keys(rows[0]).forEach(k => tr.appendChild(el("td", null, String(row[k] ?? "")))); tbl.appendChild(tr); }); body.appendChild(tbl); } else { const p = el("pre"); p.textContent = t; body.appendChild(p); } }).catch(() => {});
-  else fetch(url).then(r => r.text()).then(t => { const p = el("pre"); p.textContent = t.slice(0, 300000); body.appendChild(p); }).catch(() => {});
+  const request = body._rendererRequest = (body._rendererRequest || 0) + 1;
+  body.innerHTML = "";
+  const loading = el("div", "renderer-loading"); loading.appendChild(iconEl("loader", 16, "spin")); loading.appendChild(el("span", null, t("viewer.loading"))); body.appendChild(loading);
+  artifactRendererDescriptor(a).then(descriptor => {
+    if (body._rendererRequest !== request) return;
+    renderArtifactDescriptor(body, a, descriptor);
+  }).catch(() => {
+    if (body._rendererRequest !== request) return;
+    renderArtifactDescriptor(body, a, compatibilityRendererDescriptor(a));
+  });
+}
+function renderArtifactDescriptor(body, a, descriptor) {
+  body.innerHTML = "";
+  const renderer = descriptor.renderer || {};
+  const rendererId = renderer.renderer_id || "download";
+  const shell = el("div", "renderer-shell"); shell.dataset.rendererId = rendererId;
+  const meta = el("div", "renderer-meta");
+  meta.appendChild(el("span", "renderer-name", publicText(renderer.label || rendererId, 80)));
+  const match = descriptor.matched_by === "compatibility" ? t("viewer.renderer.compat") : t("viewer.renderer.matched", publicText(descriptor.matched_by || "metadata", 30));
+  meta.appendChild(el("span", "renderer-detail", match));
+  if (descriptor.version_id) meta.appendChild(el("span", "renderer-version", t("viewer.renderer.version", publicText(String(descriptor.version_id).slice(0, 10), 12))));
+  shell.appendChild(meta);
+  const content = el("div", "renderer-content"); shell.appendChild(content); body.appendChild(shell);
+  const url = artUrl(a); const nm = String(a.filename || "").toLowerCase();
+  if (rendererId === "image") renderAnnotatableImage(content, a, url);
+  else if (rendererId === "pdf") { const frame = el("iframe"); frame.src = url; content.appendChild(frame); }
+  else if (rendererId === "html-preview") { const frame = el("iframe"); frame.setAttribute("sandbox", "allow-scripts allow-forms"); frame.src = (S.sandboxOrigin || "") + `/preview/${encodeURIComponent(a.id)}`; content.appendChild(frame); }
+  else if (rendererId === "molecule-3d") molecule(content, url, nm);
+  else if (rendererId === "chemistry-2d") renderChemistry2D(content, a, url);
+  else if (rendererId === "genome-track") renderGenomeTrack(content, a, url);
+  else if (rendererId === "sequence") renderSequenceArtifact(content, a, url);
+  else if (rendererId === "msa") renderAlignmentArtifact(content, a, url);
+  else if (rendererId === "latex") renderLatexArtifact(content, a, url);
+  else if (rendererId === "markdown") renderMarkdownArtifact(content, url);
+  else if (rendererId === "table") renderTableArtifact(content, a, url);
+  else if (rendererId === "text") renderTextArtifact(content, a, url);
+  else renderDownloadArtifact(content, a, url);
+}
+function fetchArtifactText(url) {
+  return fetch(url).then(response => {
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.text();
+  });
+}
+function rendererFailure(container, a, url) {
+  container.innerHTML = "";
+  const card = el("div", "renderer-fallback"); card.appendChild(iconEl("alert-triangle", 18));
+  card.appendChild(el("div", "renderer-fallback-text", t("viewer.renderer.error")));
+  const download = el("a", "outline-btn small", t("common.download")); download.href = url; download.setAttribute("download", a.filename || "artifact"); card.appendChild(download);
+  container.appendChild(card);
+}
+function renderMarkdownArtifact(container, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const markdown = el("div", "md renderer-markdown"); markdown.innerHTML = renderMd(text.slice(0, 1000000)); container.appendChild(markdown);
+  }).catch(() => rendererFailure(container, { filename: "artifact" }, url));
+}
+function renderTextArtifact(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    if (looksBinary(text)) return renderDownloadArtifact(container, a, url);
+    const ct = String(a.content_type || "").toLowerCase(); const nm = String(a.filename || "").toLowerCase();
+    if (/json/.test(ct) || /\.json$/i.test(nm)) return renderStructuredText(container, a, text);
+    const pre = el("pre", "renderer-source"); pre.textContent = text.slice(0, 300000); container.appendChild(pre);
+  }).catch(() => rendererFailure(container, a, url));
+}
+function renderStructuredText(container, a, text) {
+  const rows = parseTable(text, a);
+  if (!rows || !rows.length) { const pre = el("pre", "renderer-source"); pre.textContent = text.slice(0, 300000); container.appendChild(pre); return; }
+  renderSheet(container, rows);
+}
+function renderTableArtifact(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    if (looksBinary(text)) return renderDownloadArtifact(container, a, url);
+    const rows = parseTable(text, a);
+    if (rows && rows.length) renderSheet(container, rows);
+    else { const pre = el("pre", "renderer-source"); pre.textContent = text.slice(0, 300000); container.appendChild(pre); }
+  }).catch(() => rendererFailure(container, a, url));
+}
+function renderSheet(container, rows) {
+  const safeRows = rows.slice(0, 5000); const columns = Object.keys(safeRows[0] || {}).slice(0, 100);
+  const table = el("table", "sheet"); const head = el("tr"); columns.forEach(key => head.appendChild(el("th", null, key))); table.appendChild(head);
+  safeRows.forEach(row => { const tr = el("tr"); columns.forEach(key => tr.appendChild(el("td", null, String(row[key] ?? "")))); table.appendChild(tr); });
+  container.appendChild(table);
+}
+function appendResidues(container, sequence, alphabet, limit) {
+  const runtime = scientificRenderers(); const fragment = document.createDocumentFragment();
+  const shown = String(sequence || "").slice(0, Math.max(0, limit));
+  for (const residue of shown) {
+    const span = el("span", "bio-residue " + (runtime ? runtime.residueClass(residue, alphabet) : "other"), residue);
+    fragment.appendChild(span);
+  }
+  container.appendChild(fragment); return shown.length;
+}
+function renderSequenceArtifact(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const runtime = scientificRenderers(); const parsed = runtime && runtime.parseSequence(text, a.filename);
+    if (!parsed || !parsed.records.length) return renderTextArtifact(container, a, url);
+    const summary = el("div", "bio-summary", t("viewer.sequence.summary", parsed.records.length, parsed.total_length.toLocaleString(), parsed.alphabet)); container.appendChild(summary);
+    const list = el("div", "sequence-list"); let remaining = 30000; let shown = 0;
+    parsed.records.slice(0, 100).forEach(record => {
+      if (remaining <= 0) return;
+      const card = el("section", "sequence-record"); const head = el("div", "sequence-head");
+      head.appendChild(el("strong", null, record.name || "sequence"));
+      head.appendChild(el("span", null, `${record.sequence.length.toLocaleString()} ${parsed.alphabet === "protein" ? "aa" : "nt"}`));
+      card.appendChild(head); if (record.description) card.appendChild(el("div", "sequence-description", record.description));
+      const sequence = el("div", "bio-sequence"); const used = appendResidues(sequence, record.sequence, parsed.alphabet, Math.min(remaining, 10000));
+      remaining -= used; shown += used; card.appendChild(sequence); list.appendChild(card);
+    });
+    container.appendChild(list);
+    if (shown < parsed.total_length) container.appendChild(el("div", "renderer-note", t("viewer.sequence.omitted", (parsed.total_length - shown).toLocaleString())));
+  }).catch(() => rendererFailure(container, a, url));
+}
+function renderAlignmentArtifact(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const runtime = scientificRenderers(); const parsed = runtime && runtime.parseAlignment(text, a.filename);
+    if (!parsed || !parsed.records.length) return renderTextArtifact(container, a, url);
+    container.appendChild(el("div", "bio-summary", t("viewer.msa.summary", parsed.records.length, parsed.columns.toLocaleString(), parsed.format)));
+    const viewport = el("div", "msa-viewport");
+    parsed.records.slice(0, 48).forEach(record => {
+      const row = el("div", "msa-row"); const label = el("div", "msa-label", record.name || "sequence"); label.title = record.name || "sequence"; row.appendChild(label);
+      const sequence = el("div", "msa-sequence"); appendResidues(sequence, record.sequence, parsed.alphabet || "protein", 1200); row.appendChild(sequence); viewport.appendChild(row);
+    });
+    container.appendChild(viewport);
+    const omitted = parsed.records.reduce((sum, record, index) => sum + (index >= 48 ? record.sequence.length : Math.max(0, record.sequence.length - 1200)), 0);
+    if (omitted) container.appendChild(el("div", "renderer-note", t("viewer.sequence.omitted", omitted.toLocaleString())));
+  }).catch(() => rendererFailure(container, a, url));
+}
+function svgElement(name, attrs) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+  Object.entries(attrs || {}).forEach(([key, value]) => node.setAttribute(key, String(value)));
+  return node;
+}
+function renderGenomeTrack(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const runtime = scientificRenderers(); const parsed = runtime && runtime.parseGenome(text, a.filename);
+    if (!parsed || !parsed.features.length) return renderTextArtifact(container, a, url);
+    container.appendChild(el("div", "bio-summary", `${parsed.format} · ${t("viewer.genome.features", parsed.features.length.toLocaleString(), parsed.chromosomes.length)}`));
+    if (parsed.invalid) container.appendChild(el("div", "renderer-note", t("viewer.genome.invalid", parsed.invalid.toLocaleString())));
+    const grouped = new Map(); parsed.features.forEach(feature => { if (!grouped.has(feature.chrom)) grouped.set(feature.chrom, []); grouped.get(feature.chrom).push(feature); });
+    const tracks = el("div", "genome-tracks"); let budget = 500;
+    parsed.chromosomes.slice(0, 24).forEach(chromosome => {
+      const row = el("section", "genome-row"); const head = el("div", "genome-head");
+      head.appendChild(el("strong", null, chromosome.chrom)); head.appendChild(el("span", null, `${chromosome.start.toLocaleString()}–${chromosome.end.toLocaleString()} · ${chromosome.count}`)); row.appendChild(head);
+      const svg = svgElement("svg", { viewBox: "0 0 1000 58", role: "img", "aria-label": `${chromosome.chrom} genome track` });
+      svg.appendChild(svgElement("line", { x1: 18, y1: 29, x2: 982, y2: 29, class: "genome-axis" }));
+      const span = Math.max(1, chromosome.end - chromosome.start); const features = (grouped.get(chromosome.chrom) || []).slice(0, Math.max(0, budget)); budget -= features.length;
+      features.forEach((feature, index) => {
+        const x = 18 + 964 * ((feature.start - chromosome.start) / span); const width = Math.max(2, 964 * ((feature.end - feature.start) / span));
+        const rect = svgElement("rect", { x: x.toFixed(2), y: 9 + (index % 5) * 8, width: Math.min(982 - x, width).toFixed(2), height: 6, rx: 2, class: `genome-feature genome-${String(feature.type || "feature").replace(/[^a-z0-9_-]/gi, "").toLowerCase()}` });
+        const title = svgElement("title"); title.textContent = `${feature.label} · ${feature.chrom}:${feature.start + 1}-${feature.end} · ${feature.type}`; rect.appendChild(title); svg.appendChild(rect);
+      });
+      row.appendChild(svg); tracks.appendChild(row);
+    });
+    container.appendChild(tracks);
+    const details = el("details", "genome-descriptors"); details.appendChild(el("summary", null, t("viewer.genome.list")));
+    parsed.features.slice(0, 300).forEach(feature => {
+      const row = el("div", "genome-descriptor"); row.appendChild(el("code", null, `${feature.chrom}:${feature.start + 1}-${feature.end}`)); row.appendChild(el("span", "genome-type", feature.type)); row.appendChild(el("span", "genome-label", feature.label)); details.appendChild(row);
+    });
+    container.appendChild(details);
+  }).catch(() => rendererFailure(container, a, url));
+}
+function chemistryElementColor(element) {
+  return ({ C: "#38434f", N: "#2563eb", O: "#dc2626", S: "#ca8a04", P: "#ea580c", F: "#16a34a", CL: "#16a34a", BR: "#9a3412", I: "#7e22ce", H: "#64748b" })[String(element || "").toUpperCase()] || "#475569";
+}
+function molecule2dSvg(model) {
+  if (!model || !model.atoms.length) return null;
+  const xs = model.atoms.map(atom => atom.x); const ys = model.atoms.map(atom => atom.y);
+  const minX = Math.min(...xs); const maxX = Math.max(...xs); const minY = Math.min(...ys); const maxY = Math.max(...ys);
+  if (model.atoms.length > 1 && Math.abs(maxX - minX) < 1e-8 && Math.abs(maxY - minY) < 1e-8) return null;
+  const width = 900, height = 520, pad = 64; const sx = Math.max(1e-6, maxX - minX); const sy = Math.max(1e-6, maxY - minY);
+  const scale = Math.min((width - pad * 2) / sx, (height - pad * 2) / sy); const usedW = sx * scale; const usedH = sy * scale;
+  const point = atom => ({ x: (width - usedW) / 2 + (atom.x - minX) * scale, y: height - ((height - usedH) / 2 + (atom.y - minY) * scale) });
+  const svg = svgElement("svg", { viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": model.title || "2D molecule" });
+  model.bonds.forEach(bond => {
+    const p1 = point(model.atoms[bond.a]); const p2 = point(model.atoms[bond.b]); const dx = p2.x - p1.x; const dy = p2.y - p1.y; const length = Math.max(1, Math.hypot(dx, dy)); const nx = -dy / length * 4; const ny = dx / length * 4;
+    const count = Math.max(1, Math.min(3, bond.order));
+    for (let index = 0; index < count; index++) {
+      const offset = (index - (count - 1) / 2); svg.appendChild(svgElement("line", { x1: p1.x + nx * offset, y1: p1.y + ny * offset, x2: p2.x + nx * offset, y2: p2.y + ny * offset, class: "chem-bond" }));
+    }
+  });
+  model.atoms.forEach(atom => {
+    const p = point(atom); svg.appendChild(svgElement("circle", { cx: p.x, cy: p.y, r: 13, class: "chem-atom-bg" }));
+    const label = svgElement("text", { x: p.x, y: p.y + 5, class: "chem-atom", fill: chemistryElementColor(atom.element), "text-anchor": "middle" }); label.textContent = atom.element; svg.appendChild(label);
+  });
+  return svg;
+}
+function renderChemistry2D(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const runtime = scientificRenderers(); const model = runtime && runtime.parseMolfile(text); const drawing = molecule2dSvg(model);
+    const wrap = el("div", "chemistry-view");
+    if (drawing) {
+      const head = el("div", "bio-summary", `${model.title} · ${model.atoms.length} atoms · ${model.bonds.length} bonds`); wrap.appendChild(head); wrap.appendChild(drawing);
+    } else {
+      wrap.appendChild(el("div", "renderer-note", t("viewer.chem.fallback")));
+      const smiles = runtime ? runtime.smilesLines(text) : [];
+      if (/\.(smi|smiles)$/i.test(String(a.filename || "")) && smiles.length) {
+        const list = el("div", "smiles-list"); smiles.forEach(item => { const row = el("div", "smiles-row"); row.appendChild(el("span", "smiles-name", item.name)); row.appendChild(el("code", "smiles-code", item.smiles)); list.appendChild(row); }); wrap.appendChild(list);
+      }
+    }
+    const details = el("details", "chem-source"); details.appendChild(el("summary", null, t("viewer.chem.source"))); const pre = el("pre"); pre.textContent = text.slice(0, 300000); details.appendChild(pre); wrap.appendChild(details); container.appendChild(wrap);
+  }).catch(() => rendererFailure(container, a, url));
+}
+function renderLatexArtifact(container, a, url) {
+  fetchArtifactText(url).then(text => {
+    if (!container.isConnected) return;
+    const runtime = scientificRenderers(); const blocks = runtime ? runtime.latexPreview(text) : [];
+    const wrap = el("div", "latex-view"); const tabs = el("div", "latex-tabs"); const previewButton = el("button", "latex-tab active", t("viewer.latex.preview")); const sourceButton = el("button", "latex-tab", t("viewer.latex.source")); tabs.appendChild(previewButton); tabs.appendChild(sourceButton); wrap.appendChild(tabs);
+    const preview = el("article", "latex-preview");
+    blocks.forEach(block => {
+      const node = block.kind === "heading" ? el(`h${Math.max(2, Math.min(4, (block.level || 1) + 1))}`) : el(block.kind === "math" ? "div" : "p", block.kind === "math" ? "latex-math" : null);
+      node.textContent = block.text; preview.appendChild(node);
+    });
+    if (!blocks.length) preview.appendChild(el("div", "renderer-note", t("viewer.chem.fallback")));
+    const source = el("pre", "renderer-source latex-source"); source.textContent = text.slice(0, 500000); source.classList.add("hidden"); wrap.appendChild(preview); wrap.appendChild(source);
+    const show = mode => { const isPreview = mode === "preview"; preview.classList.toggle("hidden", !isPreview); source.classList.toggle("hidden", isPreview); previewButton.classList.toggle("active", isPreview); sourceButton.classList.toggle("active", !isPreview); };
+    previewButton.onclick = () => show("preview"); sourceButton.onclick = () => show("source"); container.appendChild(wrap);
+  }).catch(() => rendererFailure(container, a, url));
+}
+function renderDownloadArtifact(container, a, url) {
+  container.innerHTML = "";
+  const ct = String(a.content_type || "").toLowerCase(); const nm = String(a.filename || "").toLowerCase();
+  if (ct.startsWith("text/") || /json|xml|javascript/.test(ct) || TEXT_EXT.test(nm)) return renderTextArtifact(container, a, url);
+  const card = el("div", "download-artifact"); card.appendChild(iconEl("package", 28)); card.appendChild(el("strong", null, a.filename || "artifact")); card.appendChild(el("span", null, t("viewer.downloadOnly")));
+  const link = el("a", "solid-btn small", t("common.download")); link.href = url; link.setAttribute("download", a.filename || "artifact"); card.appendChild(link); container.appendChild(card);
 }
 
 /* ---------- image annotations (figure review → message → remote edit) ---------- */
@@ -4330,21 +5313,56 @@ function nbFindCell(producingCellId) {
     || (S.cells || []).find(cell => nbCellKey(cell) === key)
     || null;
 }
+function nbCellDraft(event) {
+  const draftId = publicText(event && event.draft_id, 160);
+  if (!draftId) return;
+  const revision = Math.max(0, Number(event.revision) || 0);
+  const previous = nbFindCell(draftId);
+  if (previous && Number(previous._draftRevision || 0) > revision) return;
+  if (event.status === "discarded") {
+    S.liveCells = (S.liveCells || []).filter(cell => nbCellKey(cell) !== draftId);
+    S._liveCell = (S.liveCells || [])[S.liveCells.length - 1] || null;
+    nbRender(); return;
+  }
+  const language = String(event.language || "").toLowerCase() === "r" ? "r" : "python";
+  const status = event.status === "ready" ? "ready" : "drafting";
+  const cell = {
+    producing_cell_id: draftId, cell_id: draftId, cell_index: null,
+    kernel_id: language, language, origin: "agent",
+    source: typeof event.source === "string" ? event.source.slice(0, 200000) : "",
+    stdout: "", stderr: "", error: "", status,
+    figures: [], files_written: [], files_read: [],
+    complete: event.complete === true, draft: true, live: true,
+    _draftRevision: revision
+  };
+  // One Agent writer owns the session. A new turn replaces any stale draft
+  // left by a dropped terminal event instead of appending another partial Cell.
+  S.liveCells = (S.liveCells || []).filter(candidate => !candidate.draft || nbCellKey(candidate) === draftId);
+  S.liveCells = mergeNotebookCells([cell], S.liveCells);
+  S._liveCell = cell; nbRender();
+}
 function nbCellStart(event) {
   const id = nbEventCellId(event);
   if (!id) return;
+  // The transient model draft becomes this immutable server-identified Cell.
+  S.liveCells = (S.liveCells || []).filter(candidate => !candidate.draft);
   const previous = nbFindCell(id) || {};
+  // A persisted finished Cell may still be present when a live-turn replay
+  // begins.  Never inherit its complete output and then append replay chunks a
+  // second time; only an already-live in-memory Cell may continue its stream.
+  const inheritLiveOutput = previous.live === true && previous.status === "running";
   const cell = {
     ...previous, producing_cell_id: String(id), cell_id: String(event.cell_id || previous.cell_id || id),
     cell_index: event.cell_index != null ? event.cell_index : previous.cell_index,
     kernel_id: event.kernel_id || previous.kernel_id || "python", language: event.language || previous.language || "python",
     origin: event.origin || previous.origin || null,
     source: event.source != null ? event.source : (previous.source || ""),
-    stdout: previous.stdout || "", stderr: previous.stderr || "", error: "",
+    stdout: inheritLiveOutput ? (previous.stdout || "") : "", stderr: inheritLiveOutput ? (previous.stderr || "") : "", error: "",
     status: "running", figures: previous.figures || [], files_written: previous.files_written || [], files_read: previous.files_read || [],
     generation_id: event.generation_id || previous.generation_id, state_revision: event.state_revision != null ? event.state_revision : previous.state_revision,
     attempt_group_id: event.attempt_group_id || previous.attempt_group_id, revision_of: event.revision_of || previous.revision_of,
-    replay_policy: event.replay_policy || previous.replay_policy, visibility: event.visibility || previous.visibility, live: true
+    replay_policy: event.replay_policy || previous.replay_policy, visibility: event.visibility || previous.visibility,
+    _seenChunks: inheritLiveOutput ? previous._seenChunks : undefined, live: true
   };
   // Replayed starts and reconnects upsert by the server identity; they never
   // create a duplicate temporary Cell.
@@ -4363,7 +5381,7 @@ function nbCellChunk(event) {
     cell._seenChunks = cell._seenChunks || Object.create(null);
     const seenKey = stream + ":" + String(chunkId); if (cell._seenChunks[seenKey]) return; cell._seenChunks[seenKey] = true;
   }
-  cell[stream] = (cell[stream] || "") + (event.chunk || "");
+  cell[stream] = appendLiveOutput(cell[stream], event.chunk || "");
   nbRender();
 }
 function nbCellFinished(event) {
@@ -4373,8 +5391,8 @@ function nbCellFinished(event) {
   const cell = {
     ...active, ...event, producing_cell_id: String(id), cell_id: String(event.cell_id || active.cell_id || id),
     source: event.source != null ? event.source : (active.source || ""),
-    stdout: event.stdout != null ? event.stdout : (active.stdout || ""),
-    stderr: event.stderr != null ? event.stderr : (active.stderr || ""),
+    stdout: event.stdout != null ? appendLiveOutput("", event.stdout) : (active.stdout || ""),
+    stderr: event.stderr != null ? appendLiveOutput("", event.stderr) : (active.stderr || ""),
     error: event.error || "", status: event.status || (event.error ? "error" : "ok"),
     figures: event.figures || active.figures || [],
     files_written: event.files_written || active.files_written || [],
@@ -4436,14 +5454,21 @@ async function executeNotebookCode(code, language, controls) {
   const executionId = "repl-" + randomId, frameId = S.currentId;
   S.pendingReplIdentity = { frame_id: frameId, execution_id: executionId, owner: { kind: "user_repl", id: executionId } };
   if (runButton) runButton.disabled = true; if (input) input.disabled = true; if (stop) stop.classList.remove("hidden");
+  let accepted = false;
   try {
-    await api(`/frames/${frameId}/kernel/execute`, { method: "POST", body: JSON.stringify({ code, language, execution_id: executionId }) });
+    const response = await api(`/frames/${frameId}/kernel/execute`, { method: "POST", body: JSON.stringify({ code, language, execution_id: executionId }) });
+    accepted = response && response.status === "accepted";
+    if (accepted && S.pendingReplIdentity && S.pendingReplIdentity.execution_id === executionId) {
+      S.pendingReplIdentity.owner = response.owner && response.owner.kind && response.owner.id ? response.owner : S.pendingReplIdentity.owner;
+    }
     hint(t("nb.action.queued", language === "r" ? "R" : "Python"));
-    if (S.currentId === frameId) { invalidateKernelCache(); await loadExecutionLog(frameId); loadArtifacts(frameId); scheduleWorkbenchRefresh(); } return true;
+    if (!accepted && S.currentId === frameId) { invalidateKernelCache(); await loadExecutionLog(frameId); loadArtifacts(frameId); scheduleWorkbenchRefresh(); }
+    else if (accepted && S.currentId === frameId) scheduleWorkbenchRefresh();
+    return true;
   } catch (error) { hint(t("nb.repl.execFailed", error.message), true); return false; }
   finally {
-    if (S.pendingReplIdentity && S.pendingReplIdentity.execution_id === executionId) S.pendingReplIdentity = null;
-    if (runButton) runButton.disabled = false; if (input) input.disabled = false; if (stop) stop.classList.add("hidden");
+    if (!accepted && S.pendingReplIdentity && S.pendingReplIdentity.execution_id === executionId) S.pendingReplIdentity = null;
+    if (!accepted) { if (runButton) runButton.disabled = false; if (input) input.disabled = false; if (stop) stop.classList.add("hidden"); }
     // Execution-owner and live-cell events rebuild the Notebook while this
     // request is pending, so the controls captured above may be detached.
     // Repaint once more from authoritative queue/pending state after cleanup.
@@ -4472,10 +5497,14 @@ function _paintKernel(els, st) {
     ["live", "busy", "ended", "restoring", "partial", "failed", "ready", "idle"].forEach(name => badge.root.classList.toggle(name, name === mode));
     badge.label.textContent = t("runtime.status." + mode);
   }
+  const quarantined = st.view_only === true && st.trust_state === "quarantined";
   if (bStop) bStop.disabled = !st.alive;
-  if (bStart) bStart.disabled = st.alive;
+  if (bStart) bStart.disabled = st.alive || quarantined;
   // Revive banner: only when the kernel is stopped/absent and no turn is running.
-  if (revive) revive.classList.toggle("hidden", st.alive || st.turn_running);
+  if (revive) {
+    revive.classList.toggle("hidden", st.alive || st.turn_running || quarantined);
+    revive.title = quarantined ? t("runtime.quarantineHint") : "";
+  }
   if (strip) _paintStatusStrip(strip, st);
 }
 // Read-only Notebook status strip: a passive live/ended indicator + runtime
@@ -4502,7 +5531,7 @@ async function refreshKernelState(els, _b, _c) {
   let st; try { st = await api(`/frames/${sid}/kernel`); } catch { _kc.stBusy = false; return; }
   _kc.stBusy = false;
   if (sid !== S.currentId) return;  // session switched during the fetch — drop the stale result
-  const previousRuntimeKey = _kc.st && [_kc.st.state, _kc.st.alive, _kc.st.turn_running, _kc.st.generation_id, _kc.st.generation].join(":");
+  const previousRuntimeKey = _kc.st && [_kc.st.state, _kc.st.alive, _kc.st.turn_running, _kc.st.generation_id, _kc.st.generation, _kc.st.view_only, _kc.st.trust_state].join(":");
   if (_kc.id !== sid) { _kc.id = sid; _kc.envs = null; }
   _kc.st = st; _kc.stAt = Date.now();
   _paintKernel(els, st);  // els may be stale (a newer render replaced it); harmless — the next render repaints from cache
@@ -4511,7 +5540,7 @@ async function refreshKernelState(els, _b, _c) {
   // rebuild once now that `repl_enabled` is authoritative (and vice versa if a
   // runtime/config reload disabled it).
   const modeChanged = (!!st.repl_enabled && !!els.strip) || (!st.repl_enabled && !!els.state);
-  const runtimeKey = [st.state, st.alive, st.turn_running, st.generation_id, st.generation].join(":");
+  const runtimeKey = [st.state, st.alive, st.turn_running, st.generation_id, st.generation, st.view_only, st.trust_state].join(":");
   if ((modeChanged || runtimeKey !== previousRuntimeKey) && S.dock.open && S.activeTab === "notebook") requestAnimationFrame(renderNotebook);
 }
 
@@ -4617,6 +5646,74 @@ function notebookExportLink(frameId) {
   dl.setAttribute("download", `${frameId}.notebooks.zip`);
   return dl;
 }
+async function refreshVariableInspector() {
+  const inspector = S.variableInspector, frameId = S.currentId;
+  if (!inspector || !frameId || inspector.loading) return;
+  const language = inspector.language === "r" ? "r" : "python";
+  const request = inspector.request = (inspector.request || 0) + 1;
+  inspector.loading = language; inspector.error = ""; renderNotebook();
+  try {
+    const payload = await api(`/frames/${encodeURIComponent(frameId)}/kernel/variables?language=${language}`);
+    if (frameId !== S.currentId || request !== S.variableInspector.request) return;
+    S.variableInspector.results[language] = sanitizeVariableInspection(payload, frameId, language);
+  } catch (error) {
+    if (frameId === S.currentId && request === S.variableInspector.request) S.variableInspector.error = publicText(error && error.message, 240);
+  } finally {
+    if (frameId === S.currentId && request === S.variableInspector.request) {
+      S.variableInspector.loading = null; renderNotebook();
+    }
+  }
+}
+function variablePreviewText(value) {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (value === null) return "null";
+  if (typeof value === "boolean" || typeof value === "number") return String(value);
+  return "";
+}
+function renderVariableInspector() {
+  const inspector = S.variableInspector || { language: "python", results: {}, loading: null, error: "" };
+  const language = inspector.language === "r" ? "r" : "python", data = (inspector.results || {})[language] || null;
+  const panel = el("section", "nb-variables"); panel.setAttribute("data-variable-inspector", language);
+  const head = el("div", "nb-variables-head"); head.appendChild(el("span", "nb-variables-title", t("nb.variables.title")));
+  const controls = el("div", "nb-variables-controls"), label = el("label", "nb-variables-language", t("nb.variables.language"));
+  const select = el("select", "nb-variables-select");
+  [["python", "Python"], ["r", "R"]].forEach(([value, text]) => { const option = el("option", null, text); option.value = value; select.appendChild(option); });
+  select.value = language; select.disabled = !!inspector.loading;
+  select.onchange = () => { inspector.language = select.value === "r" ? "r" : "python"; inspector.error = ""; renderNotebook(); };
+  label.appendChild(select); controls.appendChild(label);
+  const refresh = el("button", "outline-btn small", inspector.loading ? t("nb.variables.loading") : t("nb.variables.refresh"));
+  refresh.setAttribute("data-action", "refresh-variables"); refresh.disabled = !!inspector.loading || !S.currentId; refresh.onclick = refreshVariableInspector; controls.appendChild(refresh);
+  head.appendChild(controls); panel.appendChild(head);
+  if (inspector.loading === language) { panel.appendChild(el("div", "nb-variables-empty", t("nb.variables.loading"))); return panel; }
+  if (inspector.error) { panel.appendChild(el("div", "timeline-error", t("nb.variables.error", inspector.error))); return panel; }
+  if (!data) { panel.appendChild(el("div", "nb-variables-empty", t("nb.variables.notLoaded"))); return panel; }
+  const meta = el("div", "nb-variables-meta");
+  if (data.generation_id) meta.appendChild(el("span", "timeline-pill", t("nb.variables.generation", shortRuntime(data.generation_id))));
+  meta.appendChild(el("span", "timeline-pill", t("nb.variables.revision", data.state_revision)));
+  const runtime = runtimeSummary(), runtimeGeneration = language === "r" ? runtime.r : runtime.python;
+  const stale = (Number(runtime.revision) > Number(data.state_revision)) || !!(runtimeGeneration && data.generation_id && runtimeGeneration !== data.generation_id);
+  if (stale) meta.appendChild(el("span", "timeline-pill variable-stale", t("nb.variables.stale")));
+  panel.appendChild(meta);
+  if (!data.available) {
+    const key = "nb.variables.state." + data.state;
+    panel.appendChild(el("div", "nb-variables-empty", t(key) === key ? (data.reason || t("nb.variables.state.failed")) : t(key)));
+    return panel;
+  }
+  if (!(data.variables || []).length) { panel.appendChild(el("div", "nb-variables-empty", t("nb.variables.empty"))); return panel; }
+  const list = el("div", "nb-variable-list");
+  data.variables.forEach(variable => {
+    const row = el("div", "nb-variable-row"), identity = el("div", "nb-variable-identity");
+    identity.appendChild(el("span", "nb-variable-name", variable.name)); identity.appendChild(el("span", "nb-variable-type", variable.type)); row.appendChild(identity);
+    const details = el("div", "nb-variable-details"), preview = variablePreviewText(variable.preview);
+    if (preview) details.appendChild(el("span", "nb-variable-preview", preview));
+    if (variable.length != null) details.appendChild(el("span", "timeline-pill", t("nb.variables.length", variable.length)));
+    if (variable.fingerprint) details.appendChild(el("span", "timeline-pill", t("nb.variables.fingerprint", shortRuntime(variable.fingerprint))));
+    row.appendChild(details); list.appendChild(row);
+  });
+  panel.appendChild(list);
+  if (data.truncated) panel.appendChild(el("div", "nb-variables-truncated", t("nb.variables.truncated", data.variables.length)));
+  return panel;
+}
 function renderNotebook() {
   const nb = $("#dock-notebook"); if (!nb) return;
   // Live-follow: if the user is already parked near the bottom, keep the newest
@@ -4661,7 +5758,7 @@ function renderNotebook() {
   // stop/start/restart/interrupt) is built ONLY when the server explicitly
   // enables it (developer flag repl_enabled). Otherwise render a passive,
   // non-interactive status strip. refreshKernelState runs in BOTH branches.
-  const replEnabled = !!(_kc && _kc.st && _kc.st.repl_enabled);
+  const replEnabled = !!(_kc && _kc.st && _kc.st.repl_enabled && !(_kc.st.view_only && _kc.st.trust_state === "quarantined"));
   if (replEnabled) {
   const repl = el("div", "nb-repl");
   const rh = el("div", "nb-repl-head");
@@ -4736,6 +5833,7 @@ function renderNotebook() {
     refreshKernelState({ strip: { line: sline }, badge: badgeEls });
     nb.appendChild(strip);
   }
+  nb.appendChild(renderVariableInspector());
   // Keep following the live output as new code/figures stream in.
   if (S.running && follow && body) requestAnimationFrame(() => { body.scrollTop = body.scrollHeight; });
 }
@@ -4792,10 +5890,10 @@ function notebookOutputBlock(cell, raw, isError) {
   cell.appendChild(details);
 }
 function notebookCellState(cell) {
+  if (cell.draft) return { key: "drafting", cls: "drafting" };
   if (String(cell.replay_policy || "").toLowerCase() === "never") return { key: "nonReplayable", cls: "non-replayable" };
   if (cell._historicalRevision) return { key: "historical", cls: "historical" };
-  const current = Number(runtimeSummary().revision), revision = Number(cell.state_revision);
-  if (current && revision && revision < current) return { key: "stale", cls: "stale" };
+  if (cell.stale === true) return { key: "stale", cls: "stale", reasons: Array.isArray(cell.stale_reasons) ? cell.stale_reasons : [] };
   return { key: "current", cls: "current" };
 }
 function notebookCellButton(label, iconName, enabled, action) {
@@ -4814,9 +5912,10 @@ async function copyNotebookCell(source) {
   }
 }
 async function forkNotebookCell(cell) {
-  if (!S.currentId || !branchCapability("fork_from_cell")) return;
+  const checkpointId = publicText(cell && cell.fork_checkpoint_id, 96);
+  if (!S.currentId || !branchCapability("fork_from_cell") || !checkpointId) return;
   try {
-    await api(`/frames/${S.currentId}/branches/fork`, { method: "POST", body: JSON.stringify({ from_cell_id: nbCellKey(cell), branch_id: (S.branchState || {}).branch_id }) });
+    await api(`/frames/${S.currentId}/branches/fork`, { method: "POST", body: JSON.stringify({ from_cell_id: nbCellKey(cell) }) });
     await loadWorkbenchState(S.currentId, true);
   } catch (error) { hint(t("nb.action.failed", error.message), true); }
 }
@@ -4827,7 +5926,7 @@ async function promoteNotebookCell(cell) {
 }
 function cellNode(e) {
   const k = e.kernel_id || "python";
-  const c = el("div", "notebook-cell" + (e.live ? " live" : ""));
+  const c = el("div", "notebook-cell" + (e.live ? " live" : "") + (e.draft ? " draft" : ""));
   c.setAttribute("data-cell", e.cell_index != null ? e.cell_index : "");
   c.setAttribute("data-kernel", k);
   c.setAttribute("data-producing-cell", e.producing_cell_id || "");
@@ -4842,7 +5941,9 @@ function cellNode(e) {
   const st = e.status || (e.live ? "running" : "ok");
   const idx = e.cell_index != null ? e.cell_index : "…";
   const cellState = notebookCellState(e), cellMeta = el("div", "nbc-cell-meta");
-  cellMeta.appendChild(el("span", "nbc-state " + cellState.cls, t("nb.cell." + cellState.key)));
+  const statePill = el("span", "nbc-state " + cellState.cls, t("nb.cell." + cellState.key));
+  if ((cellState.reasons || []).length) statePill.title = cellState.reasons.map(reason => publicText(reason, 240)).filter(Boolean).join("\n");
+  cellMeta.appendChild(statePill);
   if (e.state_revision != null) cellMeta.appendChild(el("span", "nbc-revision", "S" + e.state_revision));
   if (e.generation_id) { const generation = el("span", "nbc-generation", shortRuntime(e.generation_id)); generation.title = publicText(e.generation_id, 160); cellMeta.appendChild(generation); }
   c.appendChild(cellMeta);
@@ -4866,13 +5967,16 @@ function cellNode(e) {
   (e.files_written || []).forEach(f => { const s = el("span", "io-w"); s.appendChild(iconEl("pencil", 12)); s.appendChild(el("span", null, f)); io.appendChild(s); });
   (e.files_read || []).forEach(f => { const s = el("span", "io-r"); s.appendChild(iconEl("arrow-down", 12)); s.appendChild(el("span", null, f)); io.appendChild(s); });
   if (io.children.length) c.appendChild(io);
-  const actions = el("div", "nbc-actions");
-  actions.appendChild(notebookCellButton(t("nb.action.copy"), "copy", true, () => copyNotebookCell(e.source || "")));
-  const replEnabled = !!(_kc.st && _kc.st.repl_enabled), appendable = replEnabled && !e.live && !!String(e.source || "").trim();
-  actions.appendChild(notebookCellButton(t("nb.action.rerun"), "refresh", appendable, () => executeNotebookCode(e.source || "", e.language || "python")));
-  actions.appendChild(notebookCellButton(t("nb.action.fork"), "provenance", branchCapability("fork_from_cell"), () => forkNotebookCell(e)));
-  actions.appendChild(notebookCellButton(t("nb.action.promote"), "star", branchCapability("promote"), () => promoteNotebookCell(e)));
-  c.appendChild(actions);
+  if (!e.draft) {
+    const actions = el("div", "nbc-actions");
+    actions.appendChild(notebookCellButton(t("nb.action.copy"), "copy", true, () => copyNotebookCell(e.source || "")));
+    const replEnabled = !!(_kc.st && _kc.st.repl_enabled), appendable = replEnabled && !e.live && !!String(e.source || "").trim();
+    actions.appendChild(notebookCellButton(t("nb.action.rerun"), "refresh", appendable, () => executeNotebookCode(e.source || "", e.language || "python")));
+    const canForkCell = !e.live && branchCapability("fork_from_cell") && !!publicText(e.fork_checkpoint_id, 96);
+    if (canForkCell) actions.appendChild(notebookCellButton(t("nb.action.fork"), "provenance", true, () => forkNotebookCell(e)));
+    actions.appendChild(notebookCellButton(t("nb.action.promote"), "star", branchCapability("promote"), () => promoteNotebookCell(e)));
+    c.appendChild(actions);
+  }
   return c;
 }
 function scrollToCell(idx, kernel) {
@@ -5227,18 +6331,68 @@ async function custGeneral(c) {
   const kr = el("div", "cust-row"); const ki = el("div", "info"); ki.appendChild(el("div", "nm", t("cust.general.modelKeyName"))); ki.appendChild(el("div", "ds", conf.has_api_key ? (t("cust.general.apiKeyConfigured") + (conf.model ? "（" + conf.model + "）" : "")) : t("cust.models.key.missing"))); kr.appendChild(ki); const go = el("button", "outline-btn small", t("cust.general.configureBtn")); go.onclick = () => custTab("models"); kr.appendChild(go); c.appendChild(kr);
 }
 function setLayout(name) { localStorage.setItem("os-layout", name); applyLayout(name); hint(t("toast.layout", ({ comfortable: t("cust.general.layout.comfortable"), compact: t("cust.general.layout.compact"), wide: t("cust.general.layout.wide") }[name] || name))); }
-async function custSkills(c) { try { const d = await api("/skills/catalog"); const skills = (d && d.skills) || []; c.innerHTML = ""; c.appendChild(hdr(t("palette.group.skills"), t("cust.skills.desc", skills.length)));
-  const bar = el("div", "cust-row"); const bi = el("div", "info"); const acts = el("div", "cust-actrow");
-  const nb = el("button", "outline-btn small", t("cust.skills.newBtn")); nb.onclick = () => skillEditor(null);
-  const ib = el("button", "outline-btn small", t("cust.skills.importBtn")); ib.onclick = () => skillImport();
-  acts.appendChild(nb); acts.appendChild(ib); bi.appendChild(el("div", "nm", t("cust.skills.yourSkills"))); bi.appendChild(acts); bar.appendChild(bi); c.appendChild(bar);
-  skills.forEach(s => { const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm"); nm.appendChild(el("span", null, s.displayName || s.name)); if (s.origin === "user") { nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", "user")); } info.appendChild(nm); info.appendChild(el("div", "ds", s.description || "")); row.appendChild(info);
-    // "Use in chat" — insert /skillname into the composer so the skill can be
-    // invoked directly from Customize (previously there was no way to run one).
-    const useBtn = el("button", "icon-ghost"); useBtn.title = t("skill.useInChat"); useBtn.innerHTML = icon("message-square", 15); useBtn.onclick = () => insertSkillMention(s.name); row.appendChild(useBtn);
-    if (s.editable) { const eb = el("button", "icon-ghost"); eb.title = t("common.edit"); eb.innerHTML = icon("pencil", 15); eb.onclick = () => skillEditor(s.name); row.appendChild(eb); const db = el("button", "icon-ghost"); db.title = t("common.delete"); db.innerHTML = icon("trash-2", 15); db.onclick = async () => { if (!confirm(t("cust.skills.deleteConfirm", s.name))) return; try { await api(`/skills/${encodeURIComponent(s.name)}`, { method: "DELETE" }); S.skillsCatalog = null; custTab("skills"); } catch (e) { hint(t("toast.deleteFailed", e.message), true); } }; row.appendChild(db); }
-    const tg = el("button", "toggle" + (s.enabled !== false ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { await api(`/skills/catalog/${encodeURIComponent(s.name)}/enabled`, { method: "PUT", body: JSON.stringify({ enabled: on }) }); } catch {} }; row.appendChild(tg); c.appendChild(row); });
-} catch (e) { c.innerHTML = t("versions.load.err", e.message); } }
+async function custSkills(c) {
+  try {
+    const pid = (typeof effProject === "function" ? effProject() : S.project) || null;
+    const personalRequest = api("/skills/catalog");
+    const projectRequest = pid ? api(`/projects/${encodeURIComponent(pid)}/skills/catalog`).catch(() => ({ skills: [] })) : Promise.resolve({ skills: [] });
+    const [personalData, projectData] = await Promise.all([personalRequest, projectRequest]);
+    const personalSkills = Array.isArray(personalData && personalData.skills) ? personalData.skills : [];
+    const projectSkills = Array.isArray(projectData && projectData.skills) ? projectData.skills : [];
+    const skills = [...personalSkills, ...projectSkills];
+    c.innerHTML = "";
+    c.appendChild(hdr(t("palette.group.skills"), t("cust.skills.desc", skills.length)));
+    const bar = el("div", "cust-row"); const bi = el("div", "info"); const acts = el("div", "cust-actrow");
+    const nb = el("button", "outline-btn small", t("cust.skills.newBtn")); nb.onclick = () => skillEditor(null);
+    const ib = el("button", "outline-btn small", t("cust.skills.importBtn")); ib.onclick = () => skillImport();
+    acts.appendChild(nb); acts.appendChild(ib); bi.appendChild(el("div", "nm", t("cust.skills.yourSkills"))); bi.appendChild(acts); bar.appendChild(bi); c.appendChild(bar);
+    skills.forEach(s => {
+      const scope = s.scope === "project" ? "project" : (s.scope === "bundled" ? "bundled" : "personal");
+      const row = el("div", "cust-row"); const info = el("div", "info"); const nm = el("div", "nm");
+      nm.appendChild(el("span", null, s.displayName || s.name)); nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", t(`skill.scope.${scope}`)));
+      info.appendChild(nm); info.appendChild(el("div", "ds", s.description || "")); row.appendChild(info);
+      const useBtn = el("button", "icon-ghost"); useBtn.title = t("skill.useInChat"); useBtn.innerHTML = icon("message-square", 15); useBtn.onclick = () => insertSkillMention(s.name); row.appendChild(useBtn);
+      if (s.versioned) { const vb = el("button", "icon-ghost"); vb.title = t("skill.historyBtn"); vb.innerHTML = icon("clock", 15); vb.onclick = () => skillVersionHistory(s.name, scope, scope === "project" ? pid : null); row.appendChild(vb); }
+      if (s.editable && scope === "personal") { const eb = el("button", "icon-ghost"); eb.title = t("common.edit"); eb.innerHTML = icon("pencil", 15); eb.onclick = () => skillEditor(s.name); row.appendChild(eb); const db = el("button", "icon-ghost"); db.title = t("common.delete"); db.innerHTML = icon("trash-2", 15); db.onclick = async () => { if (!confirm(t("cust.skills.deleteConfirm", s.name))) return; try { await api(`/skills/${encodeURIComponent(s.name)}`, { method: "DELETE" }); S.skillsCatalog = null; custTab("skills"); } catch (e) { hint(t("toast.deleteFailed", e.message), true); } }; row.appendChild(db); }
+      if (scope !== "project") { const tg = el("button", "toggle" + (s.enabled !== false ? " on" : "")); tg.onclick = async () => { const on = tg.classList.toggle("on"); try { await api(`/skills/catalog/${encodeURIComponent(s.name)}/enabled`, { method: "PUT", body: JSON.stringify({ enabled: on }) }); } catch {} }; row.appendChild(tg); }
+      c.appendChild(row);
+    });
+  } catch (e) { c.innerHTML = t("versions.load.err", e.message); }
+}
+function skillVersionPath(name, scope, projectId) {
+  const encodedName = encodeURIComponent(name);
+  if (scope === "project") {
+    if (!projectId) throw new Error("project scope is unavailable");
+    return `/projects/${encodeURIComponent(projectId)}/skills/${encodedName}`;
+  }
+  return `/skills/${encodedName}`;
+}
+async function skillVersionHistory(name, scope, projectId) {
+  S._modalMode = "skill-history";
+  $("#modal-title").textContent = t("skill.historyTitle", name);
+  $("#modal-download").style.display = "none";
+  const body = $("#modal-body"); body.innerHTML = "";
+  body.appendChild(el("div", "subtle", t(`skill.scope.${scope}`)));
+  $("#modal").classList.remove("hidden");
+  let data;
+  try { data = await api(skillVersionPath(name, scope, projectId) + "/versions?limit=100"); }
+  catch (e) { body.appendChild(el("div", "empty", e.message)); return; }
+  const versions = Array.isArray(data && data.versions) ? data.versions : [];
+  if (!versions.length) { body.appendChild(el("div", "empty", t("skill.historyEmpty"))); return; }
+  const list = el("div", "skill-version-list");
+  versions.forEach(version => {
+    const versionId = String(version.version_id || ""); const manifest = version.manifest && typeof version.manifest === "object" ? version.manifest : {};
+    const card = el("div", "skill-version-card"), head = el("div", "skill-version-head"), meta = el("div", "info");
+    const title = el("div", "nm", versionId.slice(0, 20) + (versionId.length > 20 ? "…" : "")); title.title = versionId; meta.appendChild(title);
+    const when = Number(version.created_at || 0); meta.appendChild(el("div", "ds", when ? new Date(when).toLocaleString() : ""));
+    const sidecar = manifest.sidecar && manifest.sidecar.present ? String(manifest.sidecar.sha256 || "").slice(0, 12) : "—"; meta.appendChild(el("div", "ds", t("skill.versionSidecar", sidecar)));
+    head.appendChild(meta);
+    if (version.active) head.appendChild(el("span", "pill", t("skill.versionActive")));
+    else if (!(data.status && data.status.read_only)) { const rollback = el("button", "outline-btn small", t("skill.rollbackBtn")); rollback.onclick = async () => { if (!confirm(t("skill.rollbackConfirm", name, versionId.slice(0, 18)))) return; rollback.disabled = true; try { await api(skillVersionPath(name, scope, projectId) + "/rollback", { method: "POST", body: JSON.stringify({ version_id: versionId }) }); hint(t("skill.rollbackDone", name)); await skillVersionHistory(name, scope, projectId); custTab("skills"); } catch (e) { rollback.disabled = false; hint(t("toast.failed", e.message), true); } }; head.appendChild(rollback); }
+    card.appendChild(head); list.appendChild(card);
+  });
+  body.appendChild(list);
+}
 // Insert a "/skillname" mention into the composer from the Skills settings tab,
 // close settings, and focus the composer so the skill can be invoked directly.
 function insertSkillMention(name) {
@@ -5416,11 +6570,90 @@ async function custMemory(c) { try {
   });
   if (!(mem.memories || []).length) c.appendChild(el("div", "dock-empty", t("cust.memory.empty")));
 } catch (e) { c.innerHTML = t("versions.load.err", e.message); } }
+const LOCAL_MODEL_KINDS = new Set(["ollama", "lm_studio", "vllm", "llama_cpp"]);
+function loopbackModelBase(value) {
+  const text = publicText(value, 600);
+  try {
+    const parsed = new URL(text);
+    const host = parsed.hostname.toLowerCase();
+    const safeHost = host === "127.0.0.1" || host === "::1" || host === "[::1]";
+    return ["http:", "https:"].includes(parsed.protocol) && safeHost && !parsed.username && !parsed.password && !parsed.search && !parsed.hash ? parsed.toString().replace(/\/$/, "") : "";
+  } catch { return ""; }
+}
+function sanitizeLocalModelDiscovery(payload) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  const endpoints = [];
+  (Array.isArray(source.endpoints) ? source.endpoints : []).slice(0, 20).forEach(raw => {
+    if (!raw || typeof raw !== "object") return;
+    const kind = publicText(raw.kind, 32), baseUrl = loopbackModelBase(raw.base_url);
+    if (!LOCAL_MODEL_KINDS.has(kind) || !baseUrl || raw.local !== true || raw.provider !== "chatgpt") return;
+    const models = [];
+    (Array.isArray(raw.models) ? raw.models : []).slice(0, 500).forEach(value => {
+      if (typeof value !== "string") return;
+      const model = publicText(value, 512); if (model && !models.includes(model)) models.push(model);
+    });
+    endpoints.push({
+      kind, label: publicText(raw.label, 80) || kind, provider: "chatgpt", base_url: baseUrl,
+      models, default_model: models.includes(raw.default_model) ? raw.default_model : (models[0] || ""),
+      requires_api_key: false
+    });
+  });
+  return { endpoints, probed: Math.max(0, Math.min(20, Number(source.probed) || 0)), mutated_settings: false };
+}
+function renderLocalModelEndpoints(root, discovery, profiles) {
+  root.innerHTML = "";
+  const endpoints = discovery && discovery.endpoints || [];
+  if (!endpoints.length) { root.appendChild(el("div", "dock-empty", t("cust.models.local.none"))); return; }
+  endpoints.forEach(endpoint => {
+    const row = el("div", "cust-row local-model-row"), info = el("div", "info");
+    info.appendChild(el("div", "nm", endpoint.label));
+    info.appendChild(el("div", "ds", endpoint.base_url + " · " + t("cust.models.local.models", endpoint.models.length)));
+    row.appendChild(info);
+    const modelSelect = el("select", "cust-input local-model-select");
+    if (!endpoint.models.length) { const option = el("option", null, t("models.none")); option.value = ""; modelSelect.appendChild(option); }
+    endpoint.models.forEach(model => { const option = el("option", null, model); option.value = model; option.selected = model === endpoint.default_model; modelSelect.appendChild(option); });
+    row.appendChild(modelSelect);
+    const configured = () => (profiles || []).some(profile => loopbackModelBase(profile.base_url) === endpoint.base_url && profile.model === modelSelect.value);
+    const add = el("button", "outline-btn small", configured() ? t("cust.models.local.configured") : t("cust.models.local.add"));
+    add.disabled = configured() || !modelSelect.value;
+    modelSelect.onchange = () => { add.disabled = configured() || !modelSelect.value; add.textContent = configured() ? t("cust.models.local.configured") : t("cust.models.local.add"); };
+    add.onclick = async () => {
+      const model = publicText(modelSelect.value, 512); if (!model || configured()) return;
+      add.disabled = true;
+      try {
+        await api("/model-profiles", { method: "POST", body: JSON.stringify({
+          name: endpoint.label + " · " + model, provider: endpoint.provider,
+          base_url: endpoint.base_url, model
+        }) });
+        hint(t("cust.models.local.added", model)); custTab("models");
+      } catch (error) { add.disabled = false; hint(t("artifact.save.err", publicText(error && error.message, 240)), true); }
+    };
+    row.appendChild(add); root.appendChild(row);
+  });
+}
 async function custModels(c) {
   c.innerHTML = ""; c.appendChild(hdr(t("cust.tab.models"), t("cust.models.subtitle2")));
   let data = { profiles: [], active_id: "", known_providers: [] };
   try { data = await api("/model-profiles"); } catch (e) { c.appendChild(el("div", "dock-empty", t("versions.load.err", e.message))); return; }
   let editing = null;  // set to a profile object when editing that row
+
+  // Local discovery is a read-only, fixed-loopback scan. The endpoint must be
+  // explicitly added before it can affect model settings.
+  c.appendChild(el("div", "cust-subhead", t("cust.models.local.title")));
+  const localInfo = el("div", "cust-sub", t("cust.models.local.desc")), localActions = el("div", "form-actions");
+  const localResults = el("div", "local-model-results"), scanLocal = el("button", "outline-btn small", t("cust.models.local.scan"));
+  const runLocalScan = async force => {
+    scanLocal.disabled = true; scanLocal.textContent = t("cust.models.local.scanning");
+    localResults.innerHTML = ""; localResults.appendChild(el("div", "dock-empty", t("cust.models.local.scanning")));
+    try {
+      const result = sanitizeLocalModelDiscovery(await api("/model-endpoints/discover" + (force ? "?force=1" : "")));
+      renderLocalModelEndpoints(localResults, result, data.profiles || []);
+    } catch (error) {
+      localResults.innerHTML = ""; localResults.appendChild(el("div", "timeline-error", t("cust.models.local.error", publicText(error && error.message, 240))));
+    } finally { scanLocal.disabled = false; scanLocal.textContent = t("cust.models.local.scan"); }
+  };
+  scanLocal.onclick = () => runLocalScan(true); localActions.appendChild(scanLocal);
+  c.appendChild(localInfo); c.appendChild(localActions); c.appendChild(localResults); runLocalScan(false);
 
   // --- add / edit form ---
   const head = el("div", "cust-subhead", t("cust.models.addHeading"));
@@ -5468,7 +6701,7 @@ async function custModels(c) {
     const isActive = p.id === data.active_id;
     if (isActive) { nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "pill", t("cust.models.activePill"))); }
     info.appendChild(nm);
-    const bits = []; if (p.provider) bits.push(p.provider); if (p.model) bits.push(p.model); bits.push(p.has_api_key ? t("cust.models.hasKey") : t("cust.models.noKey"));
+    const bits = []; if (p.provider) bits.push(p.provider); if (p.model) bits.push(p.model); bits.push(p.has_api_key ? t("cust.models.hasKey") : (loopbackModelBase(p.base_url) ? t("cust.models.local.keyless") : t("cust.models.noKey")));
     info.appendChild(el("div", "ds", bits.join(" · ") + (p.base_url ? "  ·  " + p.base_url : "")));
     row.appendChild(info);
     if (!isActive) { const use = el("button", "outline-btn small", t("cust.models.setActive")); use.onclick = async () => { use.disabled = true; try { await api(`/model-profiles/${p.id}/activate`, { method: "POST" }); hint(t("toast.models.switched", (p.name || p.id))); S.defaultModel = p.model || S.defaultModel; await loadModels(); refreshKeyBanner(); custTab("models"); } catch (e) { use.disabled = false; hint(t("toast.switchFailed", e.message), true); } }; row.appendChild(use); } else { row.appendChild(el("div", "col-spacer")); }
@@ -5919,6 +7152,12 @@ async function init() {
   restoreColWidths(); initColResizers();
   connectWS(); await loadModels(); refreshKeyBanner();
   $("#dash-new-project").onclick = () => openProjectModal();
+  $("#dash-import-session").onclick = chooseSessionPackage;
+  $("#session-package-input").onchange = async (event) => {
+    const input = event.currentTarget, file = input.files && input.files[0];
+    input.value = "";
+    await importSessionPackage(file);
+  };
   $("#pm-delete").onclick = async () => {
     const id = S.editingProject;
     if (!id || !confirm(t("proj.delete.confirm"))) return;

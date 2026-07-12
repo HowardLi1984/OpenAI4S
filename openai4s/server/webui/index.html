@@ -21,6 +21,8 @@
           <button class="lang-btn" data-lang="en">EN</button>
         </div>
         <button id="dash-settings" class="icon-ghost lg" data-i18n-title="common.settings" title="设置" data-icon="settings" data-icon-size="20"></button>
+        <button id="dash-import-session" class="outline-btn"><span class="ic" data-icon="cloud-upload" data-icon-size="16"></span><span data-i18n="sessionPackage.import">Import session</span></button>
+        <input id="session-package-input" type="file" accept=".zip,.openai4s-session.zip,application/vnd.openai4s.session+zip" style="display:none" />
         <button id="dash-new-project" class="outline-btn"><span class="ic" data-icon="plus" data-icon-size="16"></span><span data-i18n="palette.action.newProject">New project</span></button>
       </div>
     </header>
@@ -148,6 +150,7 @@
   </div></div></div>
 
   <script src="/static/favicon.js"></script>
+  <script src="/static/scientific_renderers.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

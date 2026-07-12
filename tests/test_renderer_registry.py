@@ -11,6 +11,7 @@ from openai4s.server.renderers import Renderer, RendererRegistry
         ({"filename": "protein.pdb"}, "molecule-3d", "extension"),
         ({"filename": "variants.vcf"}, "genome-track", "extension"),
         ({"filename": "alignment.a3m"}, "msa", "extension"),
+        ({"content_type": "text/html; charset=utf-8"}, "html-preview", "content_type"),
         ({"content_type": "text/csv; charset=utf-8"}, "table", "content_type"),
         ({"metadata": {"kind": "protein_sequence"}}, "sequence", "kind"),
         ({"filename": "weights.unknown"}, "download", "fallback"),

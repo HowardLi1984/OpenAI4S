@@ -99,6 +99,15 @@ DEFAULT_RENDERERS: tuple[Renderer, ...] = (
         capabilities=("view", "search", "annotate"),
     ),
     Renderer(
+        "html-preview",
+        "Sandboxed HTML preview",
+        kinds=("html", "web_page"),
+        content_types=("text/html",),
+        extensions=(".html", ".htm"),
+        interactive=True,
+        capabilities=("view",),
+    ),
+    Renderer(
         "latex",
         "LaTeX source",
         kinds=("latex", "equation"),
