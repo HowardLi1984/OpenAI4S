@@ -471,7 +471,13 @@ class SkillLoader:
         return _parse_frontmatter(content)
 
     def discover(self) -> dict[str, Skill]:
-        self._skills = {}
+        # Build into a fresh local map and publish it with a single atomic
+        # reference swap at the end.  A concurrent reader (search()/get()/
+        # catalog(), or another discover() from a parallel skill-read tool)
+        # then observes either the complete old map or the complete new one —
+        # never a dict being cleared and repopulated in place, which raised
+        # "dictionary changed size during iteration".
+        discovered: dict[str, Skill] = {}
         # bundled skills first, then user-authored ones. A user skill must NOT
         # silently shadow a trusted BUNDLED skill by directory or declared
         # canonical name. Bundled wins on collision, otherwise the agent could
@@ -492,7 +498,7 @@ class SkillLoader:
                 md = child / "SKILL.md"
                 if not md.exists():
                     continue
-                if is_writable and child.name in self._skills:
+                if is_writable and child.name in discovered:
                     continue  # bundled skill already claimed this name — keep it
                 raw = md.read_text("utf-8")
                 meta, body = _parse_frontmatter(raw)
@@ -501,9 +507,7 @@ class SkillLoader:
                     # User-space files cannot claim a trusted bundled origin.
                     # Preserve the host lifecycle's draft -> personal states;
                     # Web-authored documents use the separate ``user`` state.
-                    origin = (
-                        origin if origin in {"draft", "personal"} else "user"
-                    )
+                    origin = origin if origin in {"draft", "personal"} else "user"
                 elif origin not in _VALID_ORIGINS:
                     origin = "unknown"
                 description = meta.get("description") or _first_paragraph(body)
@@ -527,7 +531,7 @@ class SkillLoader:
                 version = str(meta.get("version") or "").strip()
                 if not version:
                     version = (sidecar_sha256 or document_sha256)[:12]
-                self._skills[child.name] = Skill(
+                discovered[child.name] = Skill(
                     name=name,
                     root=child,
                     doc=body,
@@ -541,6 +545,7 @@ class SkillLoader:
                     sidecar_sha256=sidecar_sha256,
                 )
                 claimed_names.add(canonical_name)
+        self._skills = discovered
         return self._skills
 
     def bundled_name_collision(self, name: str) -> Skill | None:

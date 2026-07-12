@@ -41,6 +41,19 @@ class SkillService:
         self.project_id = str(project_id or "").strip() or None
         self.session_id = str(session_id or "").strip() or None
 
+    def _writable_scope(self, skill: Any) -> tuple[str, str | None]:
+        """Return the (scope, project_id) that owns a discovered skill on disk.
+
+        ``discover()`` gives project skills precedence over personal ones, so a
+        project-scoped edit/delete must target the project scope.  Hardcoding
+        ``personal`` here would write to (or look up) a shadowed personal copy
+        the loader never surfaces, leaving the real project skill untouched.
+        """
+
+        if getattr(skill, "source", "") == "project" and self.project_id:
+            return "project", self.project_id
+        return "personal", None
+
     def load(self, name: str | dict) -> dict:
         """Load full guidance, with the historical fuzzy-name fallback."""
         if isinstance(name, dict):
@@ -123,11 +136,7 @@ class SkillService:
                 raise ValueError(f"unsafe skill name: {name!r}")
 
         target = self._safe_path(root, relative)
-        files = (
-            self.versions.read_package(root)
-            if (root / "SKILL.md").exists()
-            else {}
-        )
+        files = self.versions.read_package(root) if (root / "SKILL.md").exists() else {}
         if "SKILL.md" not in files and relative != "SKILL.md":
             files["SKILL.md"] = (
                 f"---\nname: {name}\ndescription: (draft)\norigin: draft\n---\n"
@@ -138,9 +147,7 @@ class SkillService:
             mode = "overwrite"
         else:
             if relative not in files:
-                raise FileNotFoundError(
-                    f"{relative} does not exist for str_replace"
-                )
+                raise FileNotFoundError(f"{relative} does not exist for str_replace")
             current = files[relative].decode("utf-8")
             if old_string not in current:
                 raise ValueError("old_string not found in file")
@@ -153,11 +160,14 @@ class SkillService:
                 fallback=existing.name if existing is not None else name,
             )
         files[relative] = updated_content.encode("utf-8")
+        scope, project_id = self._writable_scope(existing)
         self.versions.install(
             existing.name if existing is not None else name,
             files,
             event="upgraded" if existing is not None else "installed",
             slug=root.name,
+            scope=scope,
+            project_id=project_id,
             require_sidecar_gate=False,
             metadata={"source": "host_skills_edit", "path": relative},
         )
@@ -171,9 +181,7 @@ class SkillService:
             self.loader.discover()
             skill = self.loader.get(name, include_disabled=True)
             result["sidecar_gate"] = (
-                skill.sidecar_gate()
-                if skill
-                else {"ok": True, "error": None}
+                skill.sidecar_gate() if skill else {"ok": True, "error": None}
             )
         return result
 
@@ -194,13 +202,14 @@ class SkillService:
             raise KeyError(f"no such skill: {name!r}")
         if skill.read_only:
             raise PermissionError(f"skill {name!r} is read-only")
+        scope, project_id = self._writable_scope(skill)
         installation = self.versions.repository.get_installation(
             skill.name,
-            scope="personal",
-            scope_id="",
+            scope=scope,
+            scope_id=str(project_id or "") if scope == "project" else "",
         )
         if installation is not None and installation.get("active_version_id"):
-            self.versions.delete(skill.name)
+            self.versions.delete(skill.name, scope=scope, project_id=project_id)
         else:
             shutil.rmtree(skill.root)
         return {"ok": True, "deleted": name}
