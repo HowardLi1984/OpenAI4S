@@ -28,6 +28,7 @@ def _import_skill():
         build_pubchem_query_url,
         build_pubchem_structure_image_url,
         collect_molecule_briefs,
+        collect_reaction_briefs,
         command_to_shell,
         normalize_routes,
         parse_llm_annotations,
@@ -45,6 +46,7 @@ def _import_skill():
         "build_pubchem_structure_image_url": build_pubchem_structure_image_url,
         "command_to_shell": command_to_shell,
         "collect_molecule_briefs": collect_molecule_briefs,
+        "collect_reaction_briefs": collect_reaction_briefs,
         "normalize_routes": normalize_routes,
         "parse_llm_annotations": parse_llm_annotations,
         "rank_routes": rank_routes,
@@ -333,6 +335,58 @@ def test_rdkit_structure_depiction_when_available():
     )
     assert "structure renderer fallback" not in svg
     assert "#FFFFFF" not in svg.upper()
+
+
+def test_route_step_evidence_cards_are_source_backed_and_graph_visible():
+    funcs = _import_skill()
+    ranked = funcs["rank_routes"](funcs["normalize_routes"](ROUTE_PAYLOAD))
+    briefs = funcs["collect_reaction_briefs"](ranked)
+
+    assert len(briefs) == 2
+    assert briefs[0]["reaction_key"].startswith("rxn:")
+
+    evidence = {
+        "reactions": {
+            briefs[0]["reaction_key"]: [
+                {
+                    "source_type": "literature",
+                    "title": "Verified O-acylation precedent",
+                    "identifier": "DOI:10.0000/example",
+                    "url": "https://example.org/precedent",
+                    "match_level": "exact_substrate",
+                    "verified": True,
+                    "conditions": {"solvent": "ethyl acetate", "temperature": "20 C"},
+                    "yield_range": "82-88%",
+                    "risk_flags": ["controlled quench required"],
+                    "notes": "Evidence record supplied by the reviewer.",
+                }
+            ]
+        }
+    }
+    html = funcs["render_route_tree_html"](
+        ranked,
+        target_smiles="CC(=O)Oc1ccccc1C(=O)O",
+        reaction_evidence=evidence,
+    )
+
+    assert "Step Evidence" in html
+    assert "Verified exact-substrate evidence" in html
+    assert "88/100 coverage" in html
+    assert "Verified O-acylation precedent" in html
+    assert 'href="https://example.org/precedent"' in html
+    assert "No external evidence attached for this step." in html
+
+    graph = _graph_payload(html)
+    reaction_nodes = [node for node in graph["nodes"] if node.get("kind") == "reaction"]
+    matched = next(
+        node
+        for node in reaction_nodes
+        if node["details"].get("Evidence status") == "Verified exact-substrate evidence"
+    )
+    assert matched["details"]["Evidence coverage"] == "88/100 heuristic coverage"
+    assert matched["details"]["Supporting evidence"][0]["Identifier"] == (
+        "DOI:10.0000/example"
+    )
 
 
 def test_llm_annotations_drive_reaction_and_molecule_html():

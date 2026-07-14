@@ -101,6 +101,7 @@ def render_route_tree_html(
     target_smiles: str | None = None,
     max_routes: int = 10,
     annotations: dict[str, Any] | None = None,
+    reaction_evidence: dict[str, Any] | list[dict[str, Any]] | None = None,
     llm: Any | None = None,
 ) -> str:
     """Render a self-contained, figure-style-inspired route dashboard."""
@@ -110,6 +111,7 @@ def render_route_tree_html(
         annotations = annotate_routes_with_llm(
             route_list, llm=llm, target_smiles=target_smiles, max_routes=max_routes
         )
+    normalized_evidence = normalize_reaction_evidence(reaction_evidence)
     molecule_briefs = collect_molecule_briefs(route_list, target_smiles=target_smiles)
     title = "Retrosynthesis route analysis"
     if target_smiles:
@@ -126,7 +128,10 @@ def render_route_tree_html(
         default="n/a",
     )
     interactive_panel = _render_interactive_andor_tree(
-        route_list, target_smiles=target_smiles, annotations=annotations
+        route_list,
+        target_smiles=target_smiles,
+        annotations=annotations,
+        reaction_evidence=normalized_evidence,
     )
 
     cards: list[str] = []
@@ -136,6 +141,9 @@ def render_route_tree_html(
         materials_block = material_html or '<span class="muted">Not detected</span>'
         diagram_html = _render_svg_tree(route.get("tree"), route.get("rank", "?"))
         analysis_html = _render_route_analysis(route, annotations)
+        evidence_html = _render_route_step_evidence(
+            route, annotations, normalized_evidence
+        )
         outline_html = _render_outline_tree(route.get("tree"))
         solved_class = "ok" if route.get("solved") else "warn"
         cards.append(
@@ -155,6 +163,7 @@ def render_route_tree_html(
                     diagram_html,
                     "</div>",
                     analysis_html,
+                    evidence_html,
                     "<h3>Starting materials</h3>",
                     f'<div class="chips">{materials_block}</div>',
                     "<details>",
@@ -247,6 +256,19 @@ def render_route_tree_html(
     .mini-kv {{ display: grid; grid-template-columns: minmax(86px, 0.34fr) 1fr; gap: 4px 9px; margin: 0; }}
     .mini-kv dt {{ color: var(--muted); text-transform: none; font-size: 12px; }}
     .mini-kv dd {{ margin: 0; }}
+    .step-evidence {{ margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }}
+    .step-evidence h3 {{ margin: 0 0 10px; color: #20313f; }}
+    .evidence-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 10px; }}
+    .evidence-card {{ border: 1px solid var(--line); border-radius: 7px; background: #fbfcfe; padding: 12px; min-width: 0; }}
+    .evidence-card header {{ display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }}
+    .evidence-card h4 {{ margin: 0; font-size: 14px; color: #20313f; }}
+    .evidence-score {{ flex: 0 0 auto; border-radius: 999px; background: rgba(47, 111, 143, 0.10); color: #25566f; font-size: 11px; font-weight: 750; padding: 3px 7px; }}
+    .evidence-status {{ color: var(--muted); font-size: 12px; margin: 7px 0; }}
+    .evidence-record {{ border-top: 1px solid rgba(220, 228, 236, 0.9); margin-top: 8px; padding-top: 8px; font-size: 12px; }}
+    .evidence-record strong {{ display: block; color: #334155; }}
+    .evidence-record p {{ margin: 4px 0 0; color: #4d5b68; overflow-wrap: anywhere; }}
+    .evidence-record a {{ color: #2563eb; }}
+    .evidence-caveat {{ color: var(--muted); font-size: 11px; margin: 9px 0 0; }}
     .andor-panel {{ background: var(--panel); border-color: var(--line-strong); box-shadow: 0 20px 48px rgba(23, 33, 43, 0.11); }}
     .andor-panel h2 {{ color: #14202b; border-bottom-color: var(--line); background: #fbfcfd; letter-spacing: 0; }}
     .andor-shell {{ display: grid; grid-template-columns: minmax(0, 1fr) 380px; min-height: 740px; }}
@@ -502,6 +524,87 @@ def collect_molecule_briefs(
             stacklevel=2,
         )
     return briefs[:max_molecules]
+
+
+def collect_reaction_briefs(
+    routes: Iterable[dict[str, Any]], max_reactions: int = 48
+) -> list[dict[str, Any]]:
+    """Collect stable reaction keys and backend metadata for evidence retrieval.
+
+    The returned ``reaction_key`` is the preferred key for the ``reaction_evidence``
+    input accepted by :func:`render_route_tree_html`. Template, mapped-reaction,
+    and backend-class aliases are also accepted for integrations that cannot retain
+    this generated key.
+    """
+    records: dict[str, dict[str, Any]] = {}
+    for route in routes:
+        rank = route.get("rank", "?")
+        for node in _iter_reaction_nodes(route.get("tree")):
+            details = _reaction_info(node)["details"]
+            reaction_key = _reaction_annotation_key(details)
+            record = records.setdefault(
+                reaction_key,
+                {
+                    "reaction_key": reaction_key,
+                    "template": str(details.get("Template") or ""),
+                    "mapped_reaction": str(details.get("Mapped reaction") or ""),
+                    "backend_class": str(details.get("Reaction class") or ""),
+                    "conditions_in_export": str(details.get("Conditions") or ""),
+                    "route_ranks": set(),
+                },
+            )
+            record["route_ranks"].add(rank)
+
+    briefs = []
+    for record in records.values():
+        record = dict(record)
+        record["route_ranks"] = sorted(record["route_ranks"], key=str)
+        briefs.append(record)
+    briefs.sort(key=lambda item: (item["route_ranks"], item["reaction_key"]))
+    return briefs[:max_reactions]
+
+
+def normalize_reaction_evidence(
+    evidence: dict[str, Any] | list[dict[str, Any]] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Normalize source-backed reaction evidence into a reaction-keyed mapping.
+
+    Each record may include ``source_type``, ``title``, ``identifier``, ``url``,
+    ``match_level``, ``verified``, ``conditions``, ``yield_range``, ``risk_flags``,
+    ``notes``, and ``retrieved_at``. Entries are evidence claims supplied by a
+    database, ELN, literature workflow, or reviewer; LLM annotations are never
+    converted into evidence records automatically.
+    """
+    if not evidence:
+        return {}
+    source: Any = evidence
+    if isinstance(evidence, dict) and "reactions" in evidence:
+        source = evidence["reactions"]
+
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(source, dict):
+        pairs = source.items()
+    elif isinstance(source, list):
+        pairs = (
+            (
+                str(item.get("reaction_key") or item.get("key") or ""),
+                item.get("records") or item.get("evidence") or item,
+            )
+            for item in source
+            if isinstance(item, dict)
+        )
+    else:
+        return {}
+
+    for key, raw_entries in pairs:
+        key = str(key or "").strip()
+        if not key:
+            continue
+        entries = raw_entries if isinstance(raw_entries, list) else [raw_entries]
+        records = [dict(entry) for entry in entries if isinstance(entry, dict)]
+        if records:
+            normalized[key] = records
+    return normalized
 
 
 def build_pubchem_query_url(smiles: str) -> str:
@@ -897,6 +1000,88 @@ def _render_route_analysis(
     )
 
 
+def _render_route_step_evidence(
+    route: dict[str, Any],
+    annotations: dict[str, Any] | None,
+    reaction_evidence: dict[str, list[dict[str, Any]]],
+) -> str:
+    cards = []
+    for index, node in enumerate(_iter_reaction_nodes(route.get("tree")), start=1):
+        raw_details = _reaction_info(node)["details"]
+        annotation = _annotation_record_for_reaction(annotations or {}, raw_details)
+        backend_class = str(raw_details.get("Reaction class") or "")
+        reaction_type = _annotation_reaction_type(annotation) or _display_reaction_type(
+            backend_class, raw_details
+        )
+        summary = _reaction_evidence_summary(
+            _reaction_evidence_for_details(reaction_evidence, raw_details)
+        )
+        records_html = (
+            "".join(_render_evidence_record(record) for record in summary["records"])
+            or '<p class="muted">No external evidence attached for this step.</p>'
+        )
+        cards.append(
+            "\n".join(
+                [
+                    '<article class="evidence-card">',
+                    "<header>",
+                    f"<h4>Step {index}: {html.escape(_short_label(reaction_type, 46))}</h4>",
+                    f'<span class="evidence-score">{summary["coverage"]}/100 coverage</span>',
+                    "</header>",
+                    f'<p class="evidence-status">{html.escape(summary["status"])}</p>',
+                    records_html,
+                    '<p class="evidence-caveat">Coverage is a transparent retrieval heuristic, not an experimental success probability. Verify cited records before execution.</p>',
+                    "</article>",
+                ]
+            )
+        )
+    if not cards:
+        return ""
+    return "\n".join(
+        [
+            '<section class="step-evidence">',
+            "<h3>Step Evidence</h3>",
+            '<div class="evidence-grid">',
+            "\n".join(cards),
+            "</div>",
+            "</section>",
+        ]
+    )
+
+
+def _render_evidence_record(record: dict[str, Any]) -> str:
+    title = html.escape(str(record["title"]))
+    identifier = html.escape(str(record["identifier"]))
+    heading = title or identifier or "Untitled evidence record"
+    url = _safe_http_url(str(record["url"]))
+    if url:
+        heading = f'<a href="{html.escape(url, quote=True)}">{heading}</a>'
+    fields = [
+        f"{html.escape(str(record['source_type']))} | {html.escape(str(record['match_level']))} match | {'verified' if record['verified'] else 'not verified'}"
+    ]
+    if record["yield_range"]:
+        fields.append(f"Yield: {html.escape(str(record['yield_range']))}")
+    if record["conditions"]:
+        fields.append(
+            f"Conditions: {html.escape(_compact_evidence_value(record['conditions']))}"
+        )
+    if record["risk_flags"]:
+        fields.append(
+            "Risks: "
+            + html.escape(", ".join(str(value) for value in record["risk_flags"]))
+        )
+    if record["notes"]:
+        fields.append(html.escape(str(record["notes"])))
+    return "\n".join(
+        [
+            '<div class="evidence-record">',
+            f"<strong>{heading}</strong>",
+            f"<p>{' | '.join(fields)}</p>",
+            "</div>",
+        ]
+    )
+
+
 def _render_rich_value_html(value: Any) -> str:
     if value is None or value == "":
         return "n/a"
@@ -970,9 +1155,13 @@ def _render_interactive_andor_tree(
     routes: list[dict[str, Any]],
     target_smiles: str | None = None,
     annotations: dict[str, Any] | None = None,
+    reaction_evidence: dict[str, list[dict[str, Any]]] | None = None,
 ) -> str:
     payload = _interactive_andor_payload(
-        routes, target_smiles=target_smiles, annotations=annotations
+        routes,
+        target_smiles=target_smiles,
+        annotations=annotations,
+        reaction_evidence=reaction_evidence,
     )
     # Escaping only "</" would still let a "<!--<script" sequence in LLM-authored
     # annotation text push the parser into the double-escaped state, where the
@@ -1009,10 +1198,12 @@ def _interactive_andor_payload(
     routes: list[dict[str, Any]],
     target_smiles: str | None = None,
     annotations: dict[str, Any] | None = None,
+    reaction_evidence: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     nodes: dict[str, dict[str, Any]] = {}
     edges: dict[tuple[str, str], set[str]] = {}
     annotations = annotations or {}
+    reaction_evidence = reaction_evidence or {}
 
     def add_node(node: dict[str, Any]) -> dict[str, Any]:
         existing = nodes.get(node["id"])
@@ -1107,6 +1298,9 @@ def _interactive_andor_payload(
         raw_details = dict(reaction_info["details"])
         annotation = _annotation_record_for_reaction(annotations, raw_details)
         annotation_key = _reaction_annotation_key(raw_details)
+        evidence_summary = _reaction_evidence_summary(
+            _reaction_evidence_for_details(reaction_evidence, raw_details)
+        )
         backend_class = str(raw_details.pop("Reaction class", ""))
         llm_type = _annotation_reaction_type(annotation)
         display_type = llm_type or _display_reaction_type(backend_class, raw_details)
@@ -1164,6 +1358,19 @@ def _interactive_andor_payload(
         if validation_plan:
             details["Validation plan"] = validation_plan
         details["Annotation key"] = annotation_key
+        details["Evidence status"] = evidence_summary["status"]
+        details[
+            "Evidence coverage"
+        ] = f"{evidence_summary['coverage']}/100 heuristic coverage"
+        if evidence_summary["records"]:
+            details["Supporting evidence"] = [
+                _evidence_detail_record(record)
+                for record in evidence_summary["records"]
+            ]
+        else:
+            details[
+                "Evidence caveat"
+            ] = "No external evidence record is attached. LLM-generated conditions or yields remain hypotheses."
         note = _unrecognized_reaction_note(backend_class)
         if note:
             details["Backend caveat"] = note
@@ -1360,6 +1567,155 @@ def _reaction_annotation_keys(details: dict[str, Any]) -> list[str]:
         str(details.get("Backend class") or ""),
     ]
     return [key for key in keys if key]
+
+
+def _iter_reaction_nodes(item: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(item, list):
+        for child in item:
+            yield from _iter_reaction_nodes(child)
+        return
+    if not isinstance(item, dict):
+        return
+    if _is_reaction_node(item):
+        yield item
+    for child in _children(item):
+        yield from _iter_reaction_nodes(child)
+
+
+def _reaction_evidence_for_details(
+    evidence: dict[str, list[dict[str, Any]]], details: dict[str, Any]
+) -> list[dict[str, Any]]:
+    for key in _reaction_annotation_keys(details):
+        records = evidence.get(key)
+        if records:
+            return records
+    return []
+
+
+def _reaction_evidence_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    normalized = [_normalize_evidence_record(record) for record in records]
+    if not normalized:
+        return {
+            "coverage": 0,
+            "status": "No external evidence attached",
+            "records": [],
+        }
+
+    source_points = {
+        "internal_eln": 30,
+        "literature": 25,
+        "patent": 25,
+        "reaction_database": 20,
+        "vendor": 12,
+    }
+    match_points = {
+        "exact_substrate": 35,
+        "close_analog": 25,
+        "reaction_class": 12,
+        "unknown": 0,
+    }
+    record_scores = []
+    for record in normalized:
+        score = source_points.get(record["source_type"], 8)
+        score += match_points.get(record["match_level"], 0)
+        score += 10 if record["verified"] else 0
+        score += 10 if record["conditions"] else 0
+        score += 8 if record["yield_range"] else 0
+        record_scores.append(min(100, score))
+    unique_sources = len({record["source_type"] for record in normalized})
+    coverage = min(100, max(record_scores) + max(0, unique_sources - 1) * 4)
+    has_verified_exact = any(
+        record["verified"] and record["match_level"] == "exact_substrate"
+        for record in normalized
+    )
+    has_verified = any(record["verified"] for record in normalized)
+    status = (
+        "Verified exact-substrate evidence"
+        if has_verified_exact
+        else "Verified analogue or class evidence"
+        if has_verified
+        else "Unverified evidence supplied"
+    )
+    return {"coverage": coverage, "status": status, "records": normalized}
+
+
+def _normalize_evidence_record(record: dict[str, Any]) -> dict[str, Any]:
+    source = record.get("source") if isinstance(record.get("source"), dict) else {}
+    source_type = (
+        str(record.get("source_type") or source.get("type") or "unspecified")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    match_level = (
+        str(record.get("match_level") or record.get("substrate_match") or "unknown")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    aliases = {
+        "exact": "exact_substrate",
+        "exact_match": "exact_substrate",
+        "analogue": "close_analog",
+        "analog": "close_analog",
+        "class": "reaction_class",
+    }
+    return {
+        "source_type": aliases.get(source_type, source_type),
+        "match_level": aliases.get(match_level, match_level),
+        "verified": bool(record.get("verified", False)),
+        "title": str(record.get("title") or source.get("title") or ""),
+        "identifier": str(record.get("identifier") or source.get("identifier") or ""),
+        "url": str(record.get("url") or source.get("url") or ""),
+        "conditions": record.get("conditions") or "",
+        "yield_range": record.get("yield_range") or record.get("yield") or "",
+        "risk_flags": _as_string_list(record.get("risk_flags") or record.get("risks")),
+        "notes": str(record.get("notes") or ""),
+        "retrieved_at": str(record.get("retrieved_at") or ""),
+    }
+
+
+def _evidence_detail_record(record: dict[str, Any]) -> dict[str, Any]:
+    detail = {
+        "Source": record["source_type"],
+        "Match": record["match_level"],
+        "Verified": "yes" if record["verified"] else "no",
+    }
+    for label, value in (
+        ("Title", record["title"]),
+        ("Identifier", record["identifier"]),
+        ("Yield", record["yield_range"]),
+        ("Conditions", record["conditions"]),
+        ("Risks", record["risk_flags"]),
+        ("Notes", record["notes"]),
+        ("Retrieved", record["retrieved_at"]),
+        ("Link", _safe_http_url(record["url"])),
+    ):
+        if value:
+            detail[label] = value
+    return detail
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item not in (None, "")]
+    if value in (None, ""):
+        return []
+    return [str(value)]
+
+
+def _compact_evidence_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return "; ".join(f"{key}: {nested}" for key, nested in value.items())
+    if isinstance(value, list):
+        return "; ".join(str(item) for item in value)
+    return str(value)
+
+
+def _safe_http_url(value: str) -> str:
+    return value if value.startswith(("https://", "http://")) else ""
 
 
 def _annotation_description(item: dict[str, Any] | str) -> str:
