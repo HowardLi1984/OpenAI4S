@@ -6,7 +6,7 @@
   openai4s url      print the local web UI url
   openai4s run "<task>"   run one Code-as-Action task (in-process, no daemon)
   openai4s init     guided first-run model configuration
-  openai4s setup    create the four default conda envs from envs/*.yml
+  openai4s setup    create/update conda envs from envs/*.yml
   openai4s jupyter  describe/export/install the optional Jupyter bridge
 """
 from __future__ import annotations
@@ -316,6 +316,13 @@ def cmd_jupyter_install(args) -> int:
 # default kernel env). Names must match the `name:` in each envs/<name>.yml.
 _DEFAULT_ENVS = ["python", "phylo", "r", "struct"]
 
+# Named setup profiles. The standard profile is the broad, everyday Python/R
+# stack used by setup.sh; full preserves the historical four-env setup.
+_ENV_PROFILES = {
+    "standard": ["python", "r"],
+    "full": list(_DEFAULT_ENVS),
+}
+
 # Conda-family tools we know how to drive, fastest first.
 _CONDA_TOOLS = ["micromamba", "mamba", "conda"]
 
@@ -333,41 +340,48 @@ def _find_conda_tool() -> str | None:
     return None
 
 
-def _existing_env_names() -> set[str]:
-    """Names of conda envs that already exist.
+def _existing_envs() -> dict[str, Path]:
+    """Existing conda envs, mapped name → prefix.
 
     Prefers the daemon's own discovery (:mod:`openai4s.kernel.environments`,
     which honours ``OPENAI4S_ENV_ROOTS`` and the reference-daemon envs dir);
-    falls back to ``conda env list`` parsing if that import isn't available."""
+    falls back to ``conda env list`` parsing if that import isn't available.
+
+    The prefix matters: we decide create-vs-update from *these* roots, so an
+    update has to name the very prefix we found. Passing only the spec file
+    would make the conda tool re-resolve the yml's ``name:`` inside its own
+    root prefix, which is a different namespace — see :func:`_update_cmd`."""
     try:
         from openai4s.kernel.environments import discover_environments
 
-        return {e.name for e in discover_environments(force=True)}
+        return {e.name: e.root for e in discover_environments(force=True) if e.is_conda}
     except Exception:  # noqa: BLE001 — fall back to CLI probing
         pass
     tool = _find_conda_tool()
     if not tool:
-        return set()
+        return {}
     try:
         out = subprocess.run(
             [tool, "env", "list"], capture_output=True, text=True, timeout=30
         )
     except Exception:  # noqa: BLE001
-        return set()
-    names: set[str] = set()
+        return {}
+    envs: dict[str, Path] = {}
     for line in out.stdout.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         # rows look like:  "python   *  /path/to/envs/python"
-        first = line.split()[0]
+        fields = line.split()
+        path = fields[-1]
+        if os.sep not in path:
+            continue
+        prefix = Path(path)
+        envs.setdefault(prefix.name, prefix)
+        first = fields[0]
         if first and first != "*":
-            names.add(first)
-        # also take the leaf dir of the prefix path, if any
-        path = line.split()[-1]
-        if os.sep in path:
-            names.add(Path(path).name)
-    return names
+            envs.setdefault(first, prefix)
+    return envs
 
 
 def _create_cmd(tool: str, name: str, yml: Path) -> list[str]:
@@ -376,6 +390,22 @@ def _create_cmd(tool: str, name: str, yml: Path) -> list[str]:
     micromamba/mamba/conda all accept ``env create -f <file>``; conda derives
     the env name from the file's ``name:`` field."""
     return [tool, "env", "create", "-f", str(yml)]
+
+
+def _update_cmd(tool: str, prefix: Path, yml: Path) -> list[str]:
+    """Non-destructively update the env at ``prefix`` from ``yml``.
+
+    ``-p`` is not optional. Without it, micromamba/mamba/conda resolve the
+    yml's ``name:`` against *their own* root prefix — but we chose "update"
+    because :func:`_existing_envs` found the env somewhere else (a second conda
+    root, ``OPENAI4S_ENV_ROOTS``, …). conda would then happily build a brand-new
+    env under its own root and report success while the env the agent actually
+    runs in stays untouched; micromamba would abort with "Prefix does not exist".
+
+    ``--prune`` is deliberately omitted so setup never removes packages the user
+    installed after the initial environment creation.
+    """
+    return [tool, "env", "update", "-p", str(prefix), "-f", str(yml)]
 
 
 def cmd_setup(args) -> int:
@@ -402,16 +432,21 @@ def cmd_setup(args) -> int:
             )
             return 1
         wanted = [args.only]
+    elif getattr(args, "profile", None):
+        wanted = list(_ENV_PROFILES[args.profile])
     else:
         wanted = list(_DEFAULT_ENVS)
 
-    existing = set() if args.dry_run else _existing_env_names()
+    existing = _existing_envs()
+    update_existing = bool(getattr(args, "update", False))
 
     print(
-        f"using '{tool}' to create envs from {envs_dir}"
+        f"using '{tool}' to manage envs from {envs_dir}"
         + (" (dry-run)" if args.dry_run else "")
     )
     created = 0
+    updated = 0
+    skipped = 0
     failed = 0
     for name in wanted:
         yml = envs_dir / f"{name}.yml"
@@ -419,14 +454,21 @@ def cmd_setup(args) -> int:
             print(f"  [{name}] skip: spec file missing ({yml})")
             failed += 1
             continue
-        if name in existing:
-            print(f"  [{name}] already exists — skipping")
+        prefix = existing.get(name)
+        if prefix is not None and not update_existing:
+            print(f"  [{name}] already exists — skipping (use --update to sync)")
+            skipped += 1
             continue
-        cmd = _create_cmd(tool, name, yml)
+        cmd = (
+            _update_cmd(tool, prefix, yml)
+            if prefix is not None
+            else _create_cmd(tool, name, yml)
+        )
+        action = "update" if prefix is not None else "create"
         if args.dry_run:
-            print(f"  [{name}] would run: {' '.join(cmd)}")
+            print(f"  [{name}] would {action}: {' '.join(cmd)}")
             continue
-        print(f"  [{name}] creating… ({' '.join(cmd)})")
+        print(f"  [{name}] {action}… ({' '.join(cmd)})")
         try:
             rc = subprocess.run(cmd).returncode
         except Exception as exc:  # noqa: BLE001
@@ -434,15 +476,21 @@ def cmd_setup(args) -> int:
             failed += 1
             continue
         if rc == 0:
-            print(f"  [{name}] created")
-            created += 1
+            print(f"  [{name}] {action}d")
+            if prefix is not None:
+                updated += 1
+            else:
+                created += 1
         else:
             print(f"  [{name}] FAILED (exit {rc})", file=sys.stderr)
             failed += 1
 
     if args.dry_run:
         return 0
-    print(f"done: {created} created, {failed} failed")
+    print(
+        f"done: {created} created, {updated} updated, "
+        f"{skipped} skipped, {failed} failed"
+    )
     return 1 if failed else 0
 
 
@@ -485,19 +533,28 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--json", action="store_true", help="emit secret-free JSON")
     pi.set_defaults(fn=cmd_init)
 
-    pu = sub.add_parser(
-        "setup", help="create the four default conda envs from envs/*.yml"
-    )
-    pu.add_argument(
+    pu = sub.add_parser("setup", help="create or update conda envs from envs/*.yml")
+    setup_selection = pu.add_mutually_exclusive_group()
+    setup_selection.add_argument(
         "--only",
         metavar="NAME",
         choices=_DEFAULT_ENVS,
         help="create just one env (%(choices)s)",
     )
+    setup_selection.add_argument(
+        "--profile",
+        choices=tuple(_ENV_PROFILES),
+        help="environment profile: standard=python+r, full=all four",
+    )
     pu.add_argument(
         "--dry-run",
         action="store_true",
         help="print the commands that would run, without executing",
+    )
+    pu.add_argument(
+        "--update",
+        action="store_true",
+        help="update existing envs without pruning user-installed packages",
     )
     pu.set_defaults(fn=cmd_setup)
 
