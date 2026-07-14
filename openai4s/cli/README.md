@@ -13,7 +13,7 @@ The CLI composes; it does not orchestrate. `openai4s run` builds the local outer
 | File | Responsibility |
 | --- | --- |
 | [`__init__.py`](./__init__.py) | Re-exports `main`, so the package itself is the CLI entry point. |
-| [`main.py`](./main.py) | One argparse tree plus its handlers: `serve`, `status`, `stop`, `url`, `run`, `init`, `setup`, and the Jupyter describe/export/install subcommands. It also owns the daemon pidfile and statefile, and drives conda when creating the environments. |
+| [`main.py`](./main.py) | One argparse tree plus its handlers: `serve`, `status`, `stop`, `url`, `run`, `init`, `setup`, and the Jupyter describe/export/install subcommands. It also owns the daemon pidfile and statefile, and drives conda when building environments — `setup --profile standard` for the everyday Python and R pair, `full` for all four, or `--only <name>` for one. An existing environment is left alone unless `--update` says otherwise, and an update never prunes what you installed yourself. |
 
 ## Operational contract
 

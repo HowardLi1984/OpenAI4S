@@ -13,7 +13,7 @@ CLI 只负责组合，不负责编排。`openai4s run` 用 [`../agent/`](../agen
 | 文件 | 职责 |
 | --- | --- |
 | [`__init__.py`](./__init__.py) | 重新导出 `main`，包本身就是 CLI 入口。 |
-| [`main.py`](./main.py) | 一棵 argparse 树和它的 handler：`serve`、`status`、`stop`、`url`、`run`、`init`、`setup`，以及 Jupyter 的 describe/export/install 子命令。daemon 的 pidfile 与 statefile 也归它管，创建 conda 环境时同样是它在调 conda。 |
+| [`main.py`](./main.py) | 一棵 argparse 树和它的 handler：`serve`、`status`、`stop`、`url`、`run`、`init`、`setup`，以及 Jupyter 的 describe/export/install 子命令。daemon 的 pidfile 与 statefile 也归它管；建环境时也是它在调 conda —— `setup --profile standard` 建日常用的 Python 与 R 这一对，`full` 建全部四个，`--only <name>` 只建一个。已有的环境除非加 `--update`，否则不动它；而更新绝不会 prune 掉你自己装的包。 |
 
 ## 运维契约
 
