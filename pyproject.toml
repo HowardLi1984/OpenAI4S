@@ -37,6 +37,12 @@ science = [
     "pandas>=2.0",
     "matplotlib>=3.7",
 ]
+# Optional cheminformatics support is kept separate because RDKit does not
+# publish wheels for every platform supported by the core/science environment.
+# Install where available with: uv sync --extra chemistry
+chemistry = [
+    "rdkit>=2024.9",
+]
 
 [dependency-groups]
 # Dev/test tooling (uv installs these by default with `uv sync`).
