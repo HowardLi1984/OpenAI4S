@@ -18,7 +18,7 @@ import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Protocol
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 DEFAULT_DECISION_WEIGHTS = {
     "backend_score": 25,
@@ -26,6 +26,16 @@ DEFAULT_DECISION_WEIGHTS = {
     "precursor_availability": 20,
     "evidence_coverage": 25,
     "constraint_fit": 10,
+}
+
+_ROUTE_CONSTRAINT_KEYS = {
+    "max_steps",
+    "max_precursors",
+    "require_solved",
+    "require_all_leaves_in_stock",
+    "minimum_evidence_coverage",
+    "forbidden_starting_materials",
+    "forbidden_templates",
 }
 
 
@@ -72,9 +82,10 @@ class OpenAI4SLLMReactionEvidenceProvider:
 
     Returned records are deliberately marked as ``candidate`` and remain
     unverified until a chemist, ELN integration, or dedicated source-review
-    workflow confirms the precedent. An optional ``doi_verifier`` (for example
-    the ``verify_dois`` function exposed by the literature-review skill) checks
-    that a DOI resolves, but DOI resolution alone never verifies reaction scope.
+    workflow confirms the precedent. An optional ``doi_verifier`` built with
+    ``build_host_web_fetch_doi_verifier(host.web_fetch)`` checks that a DOI
+    resolves on the audited Host path, but DOI resolution alone never verifies
+    reaction scope.
     """
 
     name = "openai4s_llm_research"
@@ -146,9 +157,20 @@ class OpenAI4SLLMReactionEvidenceProvider:
                 _fallback_reaction_evidence_query(brief)
             ]
             for query in queries[: self.max_queries_per_reaction]:
-                response = _call_openai4s_search(
-                    self.search, query, results_per_query=self.results_per_query
-                )
+                try:
+                    response = _call_openai4s_search(
+                        self.search, query, results_per_query=self.results_per_query
+                    )
+                    if isinstance(response, dict) and response.get("error"):
+                        raise RuntimeError(str(response["error"]))
+                except Exception as exc:
+                    warnings.warn(
+                        f"reaction-evidence search failed for {query!r} ({exc}); "
+                        "continuing with the remaining queries.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
                 for index, result in enumerate(_search_result_items(response)):
                     url = _safe_http_url(str(result.get("url") or ""))
                     if not url:
@@ -163,13 +185,80 @@ class OpenAI4SLLMReactionEvidenceProvider:
                         "query": query,
                         "rank": index + 1,
                     }
+                    for field in ("doi", "DOI", "identifier"):
+                        if result.get(field) not in (None, ""):
+                            source[field] = result[field]
+                    metadata = result.get("metadata")
+                    if isinstance(metadata, dict):
+                        source["metadata"] = dict(metadata)
                     if self.fetch is not None and index < self.fetch_top_results:
-                        fetched = _call_openai4s_fetch(self.fetch, url)
-                        source["excerpt"] = _truncate_source_text(
-                            _web_fetch_text(fetched), 5000
-                        )
+                        try:
+                            fetched = _call_openai4s_fetch(self.fetch, url)
+                            if isinstance(fetched, dict) and fetched.get("error"):
+                                raise RuntimeError(str(fetched["error"]))
+                            excerpt = _truncate_source_text(
+                                _web_fetch_text(fetched), 5000
+                            )
+                            if excerpt:
+                                source["excerpt"] = excerpt
+                        except Exception as exc:
+                            warnings.warn(
+                                f"reaction-evidence fetch failed for {url!r} ({exc}); "
+                                "keeping the search result without a fetched excerpt.",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
                     sources.append(source)
         return sources
+
+
+def build_host_web_fetch_doi_verifier(web_fetch: Any) -> Any:
+    """Build a DOI verifier that uses the injected ``host.web_fetch`` callable.
+
+    Kernel sandboxes intentionally deny direct network access.  This adapter
+    keeps DOI resolution on the audited Host RPC path and returns the mapping
+    shape accepted by :class:`OpenAI4SLLMReactionEvidenceProvider`.
+    """
+    if not callable(web_fetch):
+        raise TypeError("web_fetch must be callable, for example host.web_fetch")
+
+    def verify(dois: Iterable[str]) -> dict[str, dict[str, Any]]:
+        values = [dois] if isinstance(dois, str) else list(dois or [])
+        results: dict[str, dict[str, Any]] = {}
+        for value in values:
+            supplied = str(value or "").strip()
+            doi = _normalize_doi(supplied)
+            result_key = doi or supplied
+            if not doi:
+                results[result_key] = {"ok": False, "error": "invalid DOI"}
+                continue
+            url = "https://doi.org/" + quote(doi, safe="/")
+            try:
+                response = _call_openai4s_fetch(web_fetch, url)
+                if isinstance(response, dict):
+                    error = response.get("error")
+                    fetched = bool(
+                        response.get("url")
+                        or response.get("content")
+                        or response.get("text")
+                        or response.get("markdown")
+                        or response.get("html")
+                    )
+                    ok = None if error or not fetched else True
+                    result = {
+                        "ok": ok,
+                        "url": str(response.get("url") or url),
+                    }
+                    if error:
+                        result["error"] = str(error)
+                else:
+                    result = {"ok": True if response else None, "url": url}
+            except Exception as exc:
+                result = {"ok": None, "url": url, "error": str(exc)}
+            results[doi] = result
+        return results
+
+    return verify
 
 
 def canonicalize_smiles(smiles: str) -> str:
@@ -264,7 +353,7 @@ def rank_routes(
                 bool(route.get("constraint_violations")),
                 -_as_float(route.get("decision_score"), default=-math.inf),
                 -_as_float(route.get("score"), default=-math.inf),
-                route.get("steps", 10**6),
+                _execution_step_sort_value(route.get("steps")),
             )
         )
         for idx, route in enumerate(route_list, start=1):
@@ -293,18 +382,47 @@ def normalize_route_constraints(constraints: dict[str, Any] | None) -> dict[str,
     ``forbidden_starting_materials``, and ``forbidden_templates``. An omitted
     constraint never filters a route.
     """
-    raw = constraints if isinstance(constraints, dict) else {}
+    if constraints is None:
+        return {}
+    if not isinstance(constraints, dict):
+        raise TypeError("constraints must be a mapping or None")
+    raw = constraints
+    unknown = set(raw) - _ROUTE_CONSTRAINT_KEYS
+    if unknown:
+        names = ", ".join(sorted((repr(key) for key in unknown)))
+        raise ValueError(f"unsupported route constraint(s): {names}")
+
     normalized: dict[str, Any] = {}
-    for key in ("max_steps", "max_precursors", "minimum_evidence_coverage"):
-        if raw.get(key) not in (None, ""):
-            value = _as_float(raw.get(key))
-            if value is not None:
-                normalized[key] = max(0, value)
+    for key in ("max_steps", "max_precursors"):
+        if raw.get(key) in (None, ""):
+            continue
+        value = _parse_finite_constraint_number(raw[key], key)
+        if value < 0 or not value.is_integer():
+            raise ValueError(f"{key} must be a non-negative integer")
+        normalized[key] = int(value)
+
+    key = "minimum_evidence_coverage"
+    if raw.get(key) not in (None, ""):
+        value = _parse_finite_constraint_number(raw[key], key)
+        if not 0 <= value <= 100:
+            raise ValueError(f"{key} must be between 0 and 100")
+        normalized[key] = value
+
     for key in ("require_solved", "require_all_leaves_in_stock"):
-        if key in raw:
-            normalized[key] = bool(raw[key])
+        if key in raw and raw[key] not in (None, ""):
+            normalized[key] = _parse_explicit_bool(raw[key], key)
     for key in ("forbidden_starting_materials", "forbidden_templates"):
-        values = _as_string_list(raw.get(key))
+        value = raw.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, str):
+            values = [value]
+        elif isinstance(value, (list, tuple, set)) and all(
+            isinstance(item, str) for item in value
+        ):
+            values = list(value)
+        else:
+            raise ValueError(f"{key} must be a string or a list of strings")
         if values:
             normalized[key] = {
                 value.strip().lower() for value in values if value.strip()
@@ -542,10 +660,7 @@ def _source_linked_evidence_candidates(
         notes = "LLM-screened source candidate; chemist review is required before use."
         if rationale:
             notes += f" Screening note: {rationale}"
-        source_text = "\n".join(
-            str(source.get(key) or "") for key in ("title", "url", "snippet", "excerpt")
-        )
-        identifier = _source_identifier(source_text, str(source.get("url") or ""))
+        identifier = _source_identifier(source)
         output.setdefault(reaction_key, []).append(
             {
                 "source_type": _source_type_from_url(str(source.get("url") or "")),
@@ -608,6 +723,8 @@ def _public_reaction_brief(brief: dict[str, Any]) -> dict[str, Any]:
         "template": _truncate_source_text(brief.get("template"), 1000),
         "mapped_reaction": _truncate_source_text(brief.get("mapped_reaction"), 1800),
         "backend_class": _truncate_source_text(brief.get("backend_class"), 300),
+        "product_smiles": _truncate_source_text(brief.get("product_smiles"), 600),
+        "precursor_smiles": _as_string_list(brief.get("precursor_smiles")),
         "conditions_in_export": _truncate_source_text(
             brief.get("conditions_in_export"), 500
         ),
@@ -618,7 +735,13 @@ def _fallback_reaction_evidence_query(brief: dict[str, Any]) -> str:
     template = " ".join(str(brief.get("template") or "").split())
     backend_class = " ".join(str(brief.get("backend_class") or "").split())
     mapped = re.sub(r":\d+(?=\])", "", str(brief.get("mapped_reaction") or ""))
-    terms = [term for term in (backend_class, template, mapped[:180]) if term]
+    product = " ".join(str(brief.get("product_smiles") or "").split())
+    precursors = ".".join(_as_string_list(brief.get("precursor_smiles")))
+    terms = [
+        term
+        for term in (backend_class, template, mapped[:180], product, precursors)
+        if term
+    ]
     return " synthesis reaction precedent " + " ".join(terms)
 
 
@@ -639,17 +762,72 @@ def _candidate_match_level(value: Any) -> str:
     )
 
 
-def _source_identifier(text: str, url: str) -> str:
-    match = re.search(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", text, flags=re.IGNORECASE)
-    if match:
-        return match.group(0).rstrip(".,;:)]}")
+def _source_identifier(source: dict[str, Any]) -> str:
+    """Return a structured identifier without mining incidental prose for DOIs.
+
+    Search snippets and fetched excerpts commonly contain bibliography entries
+    for papers other than the retrieved result.  Treat only explicit identifier
+    fields and canonical doi.org URLs as DOI-bearing inputs.
+    """
+    metadata = source.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    explicit_dois = [source.get("doi"), source.get("DOI")]
+    explicit_dois.extend([metadata.get("doi"), metadata.get("DOI")])
+    for value in explicit_dois:
+        doi = _normalize_doi(value)
+        if doi:
+            return doi
+
+    identifiers = [source.get("identifier"), metadata.get("identifier")]
+    for value in identifiers:
+        doi = _normalize_doi(value)
+        if doi:
+            return doi
+
+    url = str(source.get("url") or "").strip()
+    doi = _doi_from_canonical_url(url)
+    if doi:
+        return doi
+
+    for value in identifiers:
+        identifier = str(value or "").strip()
+        if identifier:
+            return identifier
     return url
 
 
+def _normalize_doi(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    url_doi = _doi_from_canonical_url(candidate)
+    if url_doi:
+        return url_doi
+    candidate = re.sub(r"^doi\s*:\s*", "", candidate, flags=re.IGNORECASE)
+    candidate = unquote(candidate).strip()
+    return candidate if _looks_like_doi(candidate) else ""
+
+
+def _doi_from_canonical_url(url: str) -> str:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    if (parsed.hostname or "").lower() not in {"doi.org", "dx.doi.org"}:
+        return ""
+    candidate = unquote(parsed.path.lstrip("/")).strip()
+    return candidate if _looks_like_doi(candidate) else ""
+
+
 def _looks_like_doi(value: str) -> bool:
-    return bool(
-        re.fullmatch(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", value, flags=re.IGNORECASE)
-    )
+    decoded = unquote(str(value or ""))
+    if not re.fullmatch(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", decoded, flags=re.IGNORECASE):
+        return False
+    # Reject empty and dot path segments before doi.org/CDNs can normalize a
+    # fabricated identifier into a different, resolving path.
+    return not any(segment in {"", ".", ".."} for segment in decoded.split("/")[1:])
 
 
 def _source_type_from_url(url: str) -> str:
@@ -704,22 +882,32 @@ def score_routes_for_execution(
     scored = []
     for route in routes:
         candidate = dict(route)
+        reaction_contexts = list(_iter_reaction_contexts(candidate.get("tree")))
         evidence_coverages = [
             _reaction_evidence_summary(
-                _reaction_evidence_for_details(
-                    evidence, _reaction_info(node)["details"]
-                )
+                _reaction_evidence_for_details(evidence, details)
             )["coverage"]
-            for node in _iter_reaction_nodes(candidate.get("tree"))
+            for _node, details in reaction_contexts
         ]
-        evidence_coverage = (
-            round(sum(evidence_coverages) / len(evidence_coverages), 1)
-            if evidence_coverages
-            else 0.0
+        is_complete_zero_step = not reaction_contexts and _flag_is_true(
+            candidate.get("solved")
         )
+        if evidence_coverages:
+            evidence_coverage = round(
+                sum(evidence_coverages) / len(evidence_coverages), 1
+            )
+        elif is_complete_zero_step:
+            # A directly purchasable/stock target has no reaction step for which
+            # precedent could be attached. Do not penalize it as if evidence were
+            # missing for an unverified transformation.
+            evidence_coverage = 100.0
+        else:
+            evidence_coverage = 0.0
         components = {
             "backend_score": _backend_score_percent(candidate.get("score")),
-            "step_efficiency": _step_efficiency_percent(candidate.get("steps")),
+            "step_efficiency": _step_efficiency_percent(
+                candidate.get("steps"), complete_zero_step=is_complete_zero_step
+            ),
             "precursor_availability": _precursor_availability_percent(candidate),
             "evidence_coverage": evidence_coverage,
         }
@@ -735,6 +923,13 @@ def score_routes_for_execution(
             key: {"value": round(value, 1), "weight": weights[key]}
             for key, value in components.items()
         }
+        if is_complete_zero_step:
+            candidate["decision_breakdown"]["evidence_coverage"].update(
+                {
+                    "applicable": False,
+                    "note": "not applicable because the route has no reaction steps",
+                }
+            )
         candidate["constraint_violations"] = violations
         candidate["execution_status"] = "constrained" if violations else "eligible"
         scored.append(candidate)
@@ -743,34 +938,75 @@ def score_routes_for_execution(
 
 def _normalize_decision_weights(weights: dict[str, float] | None) -> dict[str, float]:
     """Return non-negative component weights normalized to a 100-point scale."""
-    raw = weights if isinstance(weights, dict) else {}
+    if weights is None:
+        raw: dict[str, Any] = {}
+    elif isinstance(weights, dict):
+        raw = weights
+    else:
+        raise TypeError("decision_weights must be a mapping or None")
+    unknown = set(raw) - set(DEFAULT_DECISION_WEIGHTS)
+    if unknown:
+        names = ", ".join(sorted((repr(key) for key in unknown)))
+        raise ValueError(f"unsupported decision weight(s): {names}")
+
     merged = dict(DEFAULT_DECISION_WEIGHTS)
     for key in DEFAULT_DECISION_WEIGHTS:
         if key not in raw:
             continue
+        if isinstance(raw[key], bool):
+            raise ValueError(
+                f"decision weight {key!r} must be a finite number, not a boolean"
+            )
         value = _as_float(raw[key])
-        if value is not None:
-            merged[key] = max(0.0, value)
-    total = sum(merged.values())
-    if total <= 0:
+        if value is None or not math.isfinite(value):
+            raise ValueError(f"decision weight {key!r} must be a finite number")
+        merged[key] = max(0.0, value)
+
+    largest = max(merged.values(), default=0.0)
+    if largest <= 0:
         merged = dict(DEFAULT_DECISION_WEIGHTS)
-        total = float(sum(merged.values()))
-    return {key: round(value * 100 / total, 2) for key, value in merged.items()}
+        largest = max(merged.values())
+
+    # Scale before summing so even individually finite values near float max do
+    # not overflow the normalization total. Allocate integer hundredths by the
+    # largest-remainder method, then make the final insertion the exact binary
+    # complement so ``sum(result.values())`` is exactly 100.0 as well.
+    scaled = {key: value / largest for key, value in merged.items()}
+    total = sum(scaled.values())
+    exact_units = {key: value * 10000 / total for key, value in scaled.items()}
+    units = {key: math.floor(value) for key, value in exact_units.items()}
+    remaining = 10000 - sum(units.values())
+    by_remainder = sorted(
+        DEFAULT_DECISION_WEIGHTS,
+        key=lambda key: (-(exact_units[key] - units[key]), key),
+    )
+    for key in by_remainder[:remaining]:
+        units[key] += 1
+    normalized = {key: units[key] / 100 for key in DEFAULT_DECISION_WEIGHTS}
+    final_key = next(reversed(normalized))
+    normalized[final_key] = 100.0 - sum(
+        value for key, value in normalized.items() if key != final_key
+    )
+    return normalized
 
 
 def _backend_score_percent(score: Any) -> float:
     """Map common AiZynthFinder-style scores to an auditable 0-100 scale."""
     value = _as_float(score, default=0.0) or 0.0
-    if 0.0 <= value <= 1.0:
-        value *= 100
+    if not math.isfinite(value):
+        return 0.0
+    if 0.0 <= value <= 1.0 or (
+        value > 1.0 and math.isclose(value, 1.0, rel_tol=1e-9, abs_tol=1e-12)
+    ):
+        value = min(value, 1.0) * 100
     return round(min(100.0, max(0.0, value)), 1)
 
 
-def _step_efficiency_percent(steps: Any) -> float:
+def _step_efficiency_percent(steps: Any, *, complete_zero_step: bool = False) -> float:
     """Use an explicit 12-point penalty for every step after a one-step route."""
     count = _as_int(steps, default=0)
     if count <= 0:
-        return 0.0
+        return 100.0 if count == 0 and complete_zero_step else 0.0
     return float(max(0, 100 - (count - 1) * 12))
 
 
@@ -783,10 +1019,7 @@ def _precursor_availability_percent(route: dict[str, Any]) -> float:
     ]
     if not leaves:
         return 0.0
-    in_stock = sum(
-        bool(leaf.get("in_stock") or leaf.get("is_in_stock") or leaf.get("stock"))
-        for leaf in leaves
-    )
+    in_stock = sum(_node_in_stock(leaf) for leaf in leaves)
     return round(100.0 * in_stock / len(leaves), 1)
 
 
@@ -797,7 +1030,7 @@ def _route_constraint_violations(
     violations = []
     steps = _as_int(route.get("steps"), default=0)
     materials = [str(item) for item in route.get("starting_materials") or []]
-    if constraints.get("require_solved") and not route.get("solved"):
+    if constraints.get("require_solved") and not _flag_is_true(route.get("solved")):
         violations.append("route is not solved")
     if constraints.get("max_steps") is not None and steps > constraints["max_steps"]:
         violations.append(f"steps {steps} exceed maximum {constraints['max_steps']:g}")
@@ -859,7 +1092,18 @@ def render_route_tree_html(
     llm: Any | None = None,
 ) -> str:
     """Render a self-contained, figure-style-inspired route dashboard."""
-    all_routes = list(routes)
+    # External route annotations are keyed by the rank that was visible when
+    # they were generated. Preserve that identity before an optional execution
+    # rerank rewrites the display rank below.
+    all_routes = []
+    for index, route in enumerate(routes, start=1):
+        candidate = dict(route)
+        if annotations is not None:
+            candidate.setdefault("_annotation_rank", candidate.get("rank", index))
+        else:
+            # LLM annotations generated below use the post-rerank display rank.
+            candidate.pop("_annotation_rank", None)
+        all_routes.append(candidate)
     normalized_evidence = normalize_reaction_evidence(reaction_evidence)
     if constraints is not None or decision_weights is not None:
         all_routes = rank_routes(
@@ -1310,8 +1554,7 @@ def collect_reaction_briefs(
     records: dict[str, dict[str, Any]] = {}
     for route in routes:
         rank = route.get("rank", "?")
-        for node in _iter_reaction_nodes(route.get("tree")):
-            details = _reaction_info(node)["details"]
+        for _node, details in _iter_reaction_contexts(route.get("tree")):
             reaction_key = _reaction_annotation_key(details)
             record = records.setdefault(
                 reaction_key,
@@ -1321,6 +1564,10 @@ def collect_reaction_briefs(
                     "mapped_reaction": str(details.get("Mapped reaction") or ""),
                     "backend_class": str(details.get("Reaction class") or ""),
                     "conditions_in_export": str(details.get("Conditions") or ""),
+                    "product_smiles": str(details.get("Product SMILES") or ""),
+                    "precursor_smiles": _as_string_list(
+                        details.get("Precursor SMILES")
+                    ),
                     "route_ranks": set(),
                 },
             )
@@ -1354,12 +1601,20 @@ def normalize_reaction_evidence(
 
     normalized: dict[str, list[dict[str, Any]]] = {}
     if isinstance(source, dict):
-        pairs = source.items()
+        pairs = (
+            (
+                key,
+                _evidence_entries_from_item(value)
+                if isinstance(value, dict)
+                else value,
+            )
+            for key, value in source.items()
+        )
     elif isinstance(source, list):
         pairs = (
             (
                 str(item.get("reaction_key") or item.get("key") or ""),
-                item.get("records") or item.get("evidence") or item,
+                _evidence_entries_from_item(item),
             )
             for item in source
             if isinstance(item, dict)
@@ -1376,6 +1631,16 @@ def normalize_reaction_evidence(
         if records:
             normalized[key] = records
     return normalized
+
+
+def _evidence_entries_from_item(item: dict[str, Any]) -> Any:
+    # Presence matters here: an explicitly empty wrapper is an assertion that
+    # no records exist, not an evidence record in its own right.
+    if "records" in item:
+        return item.get("records")
+    if "evidence" in item:
+        return item.get("evidence")
+    return item
 
 
 def build_pubchem_query_url(smiles: str) -> str:
@@ -1474,15 +1739,8 @@ def build_llm_annotation_prompt(
     molecules = collect_molecule_briefs(route_list, target_smiles=target_smiles)
     reactions = []
 
-    def walk(node: Any) -> None:
-        if isinstance(node, list):
-            for child in node:
-                walk(child)
-            return
-        if not isinstance(node, dict):
-            return
-        if _is_reaction_node(node):
-            details = _reaction_info(node)["details"]
+    for route in route_list:
+        for _node, details in _iter_reaction_contexts(route.get("tree")):
             reactions.append(
                 {
                     "reaction_key": _reaction_annotation_key(details),
@@ -1492,13 +1750,12 @@ def build_llm_annotation_prompt(
                     "template": details.get("Template", ""),
                     "mapped_reaction": details.get("Mapped reaction", ""),
                     "conditions_in_export": details.get("Conditions", ""),
+                    "product_smiles": details.get("Product SMILES", ""),
+                    "precursor_smiles": _as_string_list(
+                        details.get("Precursor SMILES")
+                    ),
                 }
             )
-        for child in _children(node):
-            walk(child)
-
-    for route in route_list:
-        walk(route.get("tree"))
 
     payload = {
         "target_smiles": target_smiles,
@@ -1777,8 +2034,8 @@ def _render_route_step_evidence(
     reaction_evidence: dict[str, list[dict[str, Any]]],
 ) -> str:
     cards = []
-    for index, node in enumerate(_iter_reaction_nodes(route.get("tree")), start=1):
-        raw_details = _reaction_info(node)["details"]
+    contexts = _iter_reaction_contexts(route.get("tree"))
+    for index, (_node, raw_details) in enumerate(contexts, start=1):
         annotation = _annotation_record_for_reaction(annotations or {}, raw_details)
         backend_class = str(raw_details.get("Reaction class") or "")
         reaction_type = _annotation_reaction_type(annotation) or _display_reaction_type(
@@ -1837,10 +2094,13 @@ def _render_execution_assessment(route: dict[str, Any]) -> str:
         item = breakdown.get(key)
         if not isinstance(item, dict):
             continue
+        value_text = f"{_format_score(item.get('value'))} / 100"
+        if item.get("applicable") is False:
+            value_text = "Not applicable (no reaction steps)"
         rows.append(
             '<div class="analysis-field"><dt>'
-            f"{html.escape(label)} ({html.escape(str(item.get('weight', 0)))}%)</dt>"
-            f"<dd>{html.escape(_format_score(item.get('value')))} / 100</dd></div>"
+            f"{html.escape(label)} ({_format_weight(item.get('weight'))}%)</dt>"
+            f"<dd>{html.escape(value_text)}</dd></div>"
         )
     violations = _as_string_list(route.get("constraint_violations"))
     status = str(route.get("execution_status") or "eligible")
@@ -2118,7 +2378,10 @@ def _interactive_andor_payload(
                 ".".join(child_smiles),
             ]
         )
-        raw_details = dict(reaction_info["details"])
+        product_smiles = (
+            parent_id.removeprefix("mol:") if parent_id.startswith("mol:") else ""
+        )
+        raw_details = _reaction_details_with_context(item, product_smiles)
         annotation = _annotation_record_for_reaction(annotations, raw_details)
         annotation_key = _reaction_annotation_key(raw_details)
         evidence_summary = _reaction_evidence_summary(
@@ -2322,12 +2585,12 @@ def _annotation_record_for_route(
     annotations: dict[str, Any], route: dict[str, Any]
 ) -> dict[str, Any] | str:
     routes = annotations.get("routes") if isinstance(annotations, dict) else None
-    rank = route.get("rank", "")
+    annotation_rank = route.get("_annotation_rank", route.get("rank", ""))
+    ranks = [annotation_rank]
     key_candidates = [
-        str(rank),
-        f"Route {rank}",
-        f"route_{rank}",
-        f"rank_{rank}",
+        key
+        for rank in ranks
+        for key in (str(rank), f"Route {rank}", f"route_{rank}", f"rank_{rank}")
     ]
     if isinstance(routes, dict):
         for key in key_candidates:
@@ -2339,7 +2602,7 @@ def _annotation_record_for_route(
             if not isinstance(item, dict):
                 continue
             item_rank = item.get("rank") or item.get("route") or item.get("route_rank")
-            if str(item_rank) == str(rank):
+            if str(item_rank) in {str(rank) for rank in ranks}:
                 return item
     return {}
 
@@ -2370,6 +2633,26 @@ def _annotation_record_for_reaction(
 
 
 def _reaction_annotation_key(details: dict[str, Any]) -> str:
+    core = _legacy_reaction_key_core(details)
+    if not core["mapped_reaction"]:
+        product = str(details.get("Product SMILES") or "").strip()
+        precursor_values = _as_string_list(details.get("Precursor SMILES"))
+        precursors = sorted(
+            {value.strip() for value in precursor_values if value.strip()}
+        )
+        if product or precursors:
+            core["product_smiles"] = product
+            core["precursor_smiles"] = precursors
+    return "rxn:" + _stable_id(json.dumps(core, ensure_ascii=False, sort_keys=True))
+
+
+def _legacy_reaction_annotation_key(details: dict[str, Any]) -> str:
+    """Return the pre-context key retained as a read compatibility alias."""
+    core = _legacy_reaction_key_core(details)
+    return "rxn:" + _stable_id(json.dumps(core, ensure_ascii=False, sort_keys=True))
+
+
+def _legacy_reaction_key_core(details: dict[str, Any]) -> dict[str, Any]:
     core = {
         "mapped_reaction": str(details.get("Mapped reaction") or ""),
         "template": str(details.get("Template") or ""),
@@ -2377,19 +2660,62 @@ def _reaction_annotation_key(details: dict[str, Any]) -> str:
             details.get("Backend class") or details.get("Reaction class") or ""
         ),
     }
-    return "rxn:" + _stable_id(json.dumps(core, ensure_ascii=False, sort_keys=True))
+    return core
 
 
 def _reaction_annotation_keys(details: dict[str, Any]) -> list[str]:
     keys = [
         str(details.get("Annotation key") or ""),
         _reaction_annotation_key(details),
+        _legacy_reaction_annotation_key(details),
         str(details.get("Mapped reaction") or ""),
         str(details.get("Template") or ""),
         str(details.get("Reaction class") or ""),
         str(details.get("Backend class") or ""),
     ]
-    return [key for key in keys if key]
+    return list(dict.fromkeys(key for key in keys if key))
+
+
+def _reaction_details_with_context(
+    node: dict[str, Any], product_smiles: str = ""
+) -> dict[str, Any]:
+    details = dict(_reaction_info(node)["details"])
+    product = str(product_smiles or "").strip()
+    precursors = sorted(
+        {
+            smiles
+            for child in _children(node)
+            if isinstance(child, dict)
+            for smiles in [str(_node_smiles(child) or "").strip()]
+            if smiles
+        }
+    )
+    if product:
+        details["Product SMILES"] = product
+    if precursors:
+        details["Precursor SMILES"] = precursors
+    return details
+
+
+def _iter_reaction_contexts(
+    item: Any, product_smiles: str = ""
+) -> Iterable[tuple[dict[str, Any], dict[str, Any]]]:
+    """Yield reaction nodes with the molecule context required for stable keys."""
+    if isinstance(item, list):
+        for child in item:
+            yield from _iter_reaction_contexts(child, product_smiles)
+        return
+    if not isinstance(item, dict):
+        return
+    if _is_reaction_node(item):
+        yield item, _reaction_details_with_context(item, product_smiles)
+        for child in _children(item):
+            child_product = _node_smiles(child) if isinstance(child, dict) else ""
+            yield from _iter_reaction_contexts(child, child_product or "")
+        return
+    current_product = _node_smiles(item) or product_smiles
+    for child in _children(item):
+        yield from _iter_reaction_contexts(child, current_product)
 
 
 def _iter_reaction_nodes(item: Any) -> Iterable[dict[str, Any]]:
@@ -2451,6 +2777,11 @@ def _reaction_evidence_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         record_scores.append(min(100, score))
     unique_sources = len({record["source_type"] for record in normalized})
     coverage = min(100, max(record_scores) + max(0, unique_sources - 1) * 4)
+    if all(record["candidate"] for record in normalized):
+        # Source diversity does not turn an unreviewed candidate set into
+        # reviewed precedent.  Keep the final, aggregate score within the same
+        # ceiling applied to each individual candidate.
+        coverage = min(30, coverage)
     has_verified_exact = any(
         record["verified"] and record["match_level"] == "exact_substrate"
         for record in normalized
@@ -2492,12 +2823,14 @@ def _normalize_evidence_record(record: dict[str, Any]) -> dict[str, Any]:
         "analog": "close_analog",
         "class": "reaction_class",
     }
+    candidate = _explicit_bool(record.get("candidate", False))
+    verified = _explicit_bool(record.get("verified", False)) and not candidate
     return {
         "source_type": aliases.get(source_type, source_type),
         "match_level": aliases.get(match_level, match_level),
-        "verified": bool(record.get("verified", False)),
-        "candidate": bool(record.get("candidate", False)),
-        "identifier_verified": bool(record.get("identifier_verified", False)),
+        "verified": verified,
+        "candidate": candidate,
+        "identifier_verified": _explicit_bool(record.get("identifier_verified", False)),
         "title": str(record.get("title") or source.get("title") or ""),
         "identifier": str(record.get("identifier") or source.get("identifier") or ""),
         "url": str(record.get("url") or source.get("url") or ""),
@@ -2507,6 +2840,19 @@ def _normalize_evidence_record(record: dict[str, Any]) -> dict[str, Any]:
         "notes": str(record.get("notes") or ""),
         "retrieved_at": str(record.get("retrieved_at") or ""),
     }
+
+
+def _explicit_bool(value: Any) -> bool:
+    """Parse only explicit boolean spellings; unknown/truthy values are false."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes"}:
+            return True
+        if normalized in {"false", "no", ""}:
+            return False
+    return False
 
 
 def _evidence_detail_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -2735,14 +3081,14 @@ def _extract_solved(route: dict[str, Any], tree: Any) -> bool:
     if isinstance(metadata, dict):
         for key in ("solved", "is_solved", "all_precursors_in_stock"):
             if key in metadata:
-                return bool(metadata[key])
+                return _flag_is_true(metadata[key])
     for key in ("solved", "is_solved", "all_precursors_in_stock"):
         if key in route:
-            return bool(route[key])
+            return _flag_is_true(route[key])
     # A target root can have in_stock=False even when all leaves are stock
     # precursors, so only use in_stock as a direct answer for leaf-like routes.
     if "in_stock" in route and not _children(route):
-        return bool(route["in_stock"])
+        return _flag_is_true(route["in_stock"])
     materials = _collect_starting_materials(tree)
     return bool(materials) and _all_leaves_in_stock(tree)
 
@@ -2809,9 +3155,7 @@ def _molecule_role(
         return "target"
     if target_smiles and _canonical_key(smiles) == _canonical_key(target_smiles):
         return "target"
-    if not children and (
-        node.get("in_stock") or node.get("is_in_stock") or node.get("stock")
-    ):
+    if not children and _node_in_stock(node):
         return "stock precursor"
     if not children:
         return "unresolved precursor"
@@ -2830,7 +3174,7 @@ def _role_sort_key(role: str) -> tuple[int, str]:
 
 
 def _stock_status_value(node: dict[str, Any]) -> str:
-    if node.get("in_stock") or node.get("is_in_stock") or node.get("stock"):
+    if _node_in_stock(node):
         return "in stock"
     if not _children(node):
         return "not in stock"
@@ -2920,10 +3264,7 @@ def _all_leaves_in_stock(node: Any) -> bool:
     walk(node)
     if not leaves:
         return False
-    return all(
-        bool(leaf.get("in_stock") or leaf.get("is_in_stock") or leaf.get("stock"))
-        for leaf in leaves
-    )
+    return all(_node_in_stock(leaf) for leaf in leaves)
 
 
 def _render_route_table(routes: list[dict[str, Any]]) -> str:
@@ -3144,11 +3485,7 @@ def _render_outline_tree(node: Any) -> str:
                 or kind
             )
         )
-        stock = (
-            " stock"
-            if item.get("in_stock") or item.get("is_in_stock") or item.get("stock")
-            else ""
-        )
+        stock = " stock" if _node_in_stock(item) else ""
         return f'<code>{html.escape(str(text))}</code><span class="tag">{kind}{stock}</span>'
 
     def walk(item: Any) -> str:
@@ -3207,7 +3544,7 @@ def _node_meta_label(node: dict[str, Any], depth: int) -> str:
         return "reaction"
     if depth == 0:
         return "target"
-    if node.get("in_stock") or node.get("is_in_stock") or node.get("stock"):
+    if _node_in_stock(node):
         return "stock precursor"
     if not _children(node):
         return "not in stock"
@@ -3221,7 +3558,7 @@ def _node_visual_class(
         return "reaction"
     if is_target or depth == 0:
         return "target"
-    if node.get("in_stock") or node.get("is_in_stock") or node.get("stock"):
+    if _node_in_stock(node):
         return "stock"
     if not has_children:
         return "missing"
@@ -3291,18 +3628,87 @@ def _looks_like_route(value: dict[str, Any]) -> bool:
     )
 
 
+def _parse_finite_constraint_number(value: Any, name: str) -> float:
+    """Parse an explicit numeric constraint, rejecting booleans and sentinels."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number, not a boolean")
+    parsed = _as_float(value)
+    if parsed is None or not math.isfinite(parsed):
+        raise ValueError(f"{name} must be a finite number")
+    return parsed
+
+
+def _parse_explicit_bool(value: Any, name: str) -> bool:
+    """Parse JSON-like booleans without treating every non-empty string as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = _as_float(value)
+        if numeric is not None and math.isfinite(numeric) and numeric in (0.0, 1.0):
+            return numeric == 1.0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    raise ValueError(f"{name} must be an explicit boolean")
+
+
+def _flag_is_true(value: Any) -> bool:
+    """Interpret permissive backend flags conservatively and deterministically."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = _as_float(value)
+        return numeric is not None and math.isfinite(numeric) and numeric != 0.0
+    if isinstance(value, str):
+        normalized = " ".join(value.strip().lower().replace("_", " ").split())
+        return normalized in {
+            "true",
+            "1",
+            "yes",
+            "y",
+            "on",
+            "in stock",
+            "available",
+        }
+    return False
+
+
+def _node_in_stock(node: dict[str, Any]) -> bool:
+    """Return true only when a stock flag has an explicitly true value."""
+    return any(
+        _flag_is_true(node.get(key))
+        for key in ("in_stock", "is_in_stock", "stock")
+        if key in node
+    )
+
+
+def _execution_step_sort_value(value: Any) -> float:
+    """Return a total-order key for backend step counts of mixed quality."""
+    parsed = _as_float(value)
+    if parsed is None or not math.isfinite(parsed) or parsed < 0:
+        return math.inf
+    return parsed
+
+
 def _as_float(value: Any, default: float | None = None) -> float | None:
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def _as_int(value: Any, default: int = 0) -> int:
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
         return default
+    # Route counts ultimately participate in float-based scoring/sorting. Treat
+    # integers outside that representable domain as malformed input rather than
+    # letting later formatting or arithmetic fail on an unbounded backend value.
+    return parsed if _as_float(parsed) is not None else default
 
 
 _ANDOR_TREE_SCRIPT = r"""
@@ -3700,3 +4106,10 @@ def _format_score(value: Any) -> str:
     if score is None:
         return "n/a"
     return f"{score:.3f}"
+
+
+def _format_weight(value: Any) -> str:
+    weight = _as_float(value)
+    if weight is None or not math.isfinite(weight):
+        return "0"
+    return f"{weight:.2f}".rstrip("0").rstrip(".")

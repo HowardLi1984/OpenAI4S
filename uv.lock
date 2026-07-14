@@ -975,6 +975,9 @@ version = "0.1.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
+chemistry = [
+    { name = "rdkit" },
+]
 science = [
     { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "matplotlib", version = "3.11.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -983,7 +986,6 @@ science = [
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "rdkit" },
 ]
 
 [package.dev-dependencies]
@@ -998,9 +1000,9 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'science'", specifier = ">=3.7" },
     { name = "numpy", marker = "extra == 'science'", specifier = ">=1.24" },
     { name = "pandas", marker = "extra == 'science'", specifier = ">=2.0" },
-    { name = "rdkit", marker = "extra == 'science'", specifier = ">=2024.9" },
+    { name = "rdkit", marker = "extra == 'chemistry'", specifier = ">=2024.9" },
 ]
-provides-extras = ["science"]
+provides-extras = ["science", "chemistry"]
 
 [package.metadata.requires-dev]
 dev = [

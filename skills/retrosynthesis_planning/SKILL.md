@@ -12,12 +12,17 @@ lookup, or a medicinal chemistry synthesis feasibility summary.
 
 The recommended backend is AiZynthFinder running in a separate environment. This
 skill keeps OpenAI4S core dependency-free: the helper module is pure stdlib and
-uses RDKit from the optional science environment for transparent-background 2D
-molecule depictions. Install the science extra before generating visual reports:
+uses RDKit from the optional chemistry environment for transparent-background
+2D molecule depictions. On a platform with an RDKit wheel, install both optional
+environments before generating visual reports:
 
 ```bash
-uv sync --extra science
+uv sync --extra science --extra chemistry
 ```
+
+RDKit is not required to plan, rank, or review routes. If the chemistry extra is
+unavailable on the current platform, omit it; the dashboard falls back to
+transparent local SVG placeholders while the rest of the skill remains usable.
 
 ## Capability summary
 
@@ -83,6 +88,7 @@ files out of git.
 from retrosynthesis_planning.kernel import (
     annotate_routes_with_llm,
     build_aizynth_command,
+    build_host_web_fetch_doi_verifier,
     build_llm_annotation_prompt,
     build_markdown_report,
     build_molecule_structure_src,
@@ -228,21 +234,21 @@ pass can select **only** returned source IDs. This is intentionally not an
 implicit tool-call: `host.llm` is a text-completion API, so the provider keeps
 all network activity observable and auditable.
 
-If the `literature-review` skill is active in the same kernel, pass its
-`verify_dois` helper as shown below. It verifies whether a DOI resolves, but it
-does not prove that the paper supports the proposed substrate scope. The output
-is therefore marked as a *retrieved source candidate*, receives capped coverage,
-and never becomes verified exact-substrate precedent without reviewer or ELN
-confirmation.
+Use `build_host_web_fetch_doi_verifier(...)` when DOI resolution checks are
+appropriate. The adapter routes requests through the auditable
+`host.web_fetch` capability instead of opening raw worker-network connections.
+A resolving DOI does not prove that the paper supports the proposed substrate
+scope. The output is therefore marked as a *retrieved source candidate*,
+receives capped coverage, and never becomes verified exact-substrate precedent
+without reviewer or ELN confirmation.
 
 ```python
-# Load/use the literature-review skill first when DOI verification is needed;
-# its kernel makes verify_dois available in the active science environment.
+doi_verifier = build_host_web_fetch_doi_verifier(host.web_fetch)
 provider = OpenAI4SLLMReactionEvidenceProvider(
     llm=host.llm,
     search=host.web_search,
     fetch=host.web_fetch,
-    doi_verifier=verify_dois,  # optional; omit when literature-review is not active
+    doi_verifier=doi_verifier,  # optional; omit when DOI checks are not needed
     max_reactions=10,
     max_queries_per_reaction=2,
     results_per_query=5,
@@ -315,7 +321,7 @@ uv run python skills/retrosynthesis_planning/examples/build_example.py
 `aspirin_routes.json` holds the route trees and `aspirin_annotations.json` the
 deterministic demonstration annotations. The committed dashboard is rendered
 with RDKit depictions. To regenerate it with the same molecule rendering, first
-install the science extra and then run the build command above.
+install the science and chemistry extras and then run the build command above.
 
 Open it directly in a browser, or serve the skill directory locally:
 

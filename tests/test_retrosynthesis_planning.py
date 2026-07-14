@@ -73,18 +73,20 @@ def _svg_source_text(source):
     return base64.b64decode(source.removeprefix(prefix)).decode("utf-8")
 
 
-def _assert_no_duplicate_structure_uris(html):
+def _assert_no_duplicate_structure_uris(html, *, check_runtime=True):
     """An `onerror` fallback is emitted only when it differs from its own primary.
 
     Without RDKit the primary *is* the placeholder, so carrying a fallback would
-    embed the identical base64 payload twice on every molecule.
+    embed the identical base64 payload twice on every molecule. Runtime checks
+    apply only to HTML rendered in this test environment; committed examples may
+    have been generated in a different optional-dependency environment.
     """
     tags = re.findall(r"<(?:img|image)\b[^>]*?data-fallback-src[^>]*?>", html)
     for tag in tags:
         primary = re.search(r'(?:^|\s)(?:src|href)="([^"]+)"', tag).group(1)
         fallback = re.search(r'data-fallback-src="([^"]+)"', tag).group(1)
         assert fallback != primary, "fallback duplicates the primary structure URI"
-    if importlib.util.find_spec("rdkit") is None:
+    if check_runtime and importlib.util.find_spec("rdkit") is None:
         assert not tags, "without RDKit no fallback should be emitted at all"
 
 
@@ -211,7 +213,7 @@ def test_aspirin_example_dashboard_is_documented():
         "structure renderer fallback" not in _svg_source_text(source)
         for source in molecule_sources
     )
-    _assert_no_duplicate_structure_uris(html)
+    _assert_no_duplicate_structure_uris(html, check_runtime=False)
 
 
 def test_normalize_and_rank_routes():
@@ -331,7 +333,7 @@ def test_molecule_briefs_and_query_urls():
 
 def test_rdkit_structure_depiction_when_available():
     if importlib.util.find_spec("rdkit") is None:
-        pytest.skip("RDKit is an optional science dependency")
+        pytest.skip("RDKit is an optional chemistry dependency")
 
     funcs = _import_skill()
     svg = _svg_source_text(
