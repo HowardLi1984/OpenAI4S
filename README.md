@@ -249,5 +249,5 @@ Released under the **MIT License** — see [`LICENSE`](LICENSE).
 ---
 
 <div align="center">
-<sub><b>OpenAI4S</b> · code is the action, the kernel is the environment. · <a href="README_zh.md">简体中文</a></sub>
+<sub><b>OpenAI4S</b> · code is the action, the kernel is the environment. · <a href="README_zh.md">简体中文 </a> · Friend Link https://linux.do </sub>
 </div>
